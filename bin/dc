@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+{ # 整檔包成一個複合指令：bash 先讀完整段才執行，執行中被改寫（git pull、dc 改自己）不會用舊偏移讀到碎片（fix 9499）
+# dc <task.md> [cwd] [-- <opencode run 原生旗標>...] — 派工給 opencode，完成定義＝wo-verify 通過。
+#
+# 就是 opencode run 的薄封裝。不另建工具鏈，不做 deep-run 那套：
+# 不需要 tmux detach、不需要 sandbox proxy 偵測、不需要獨立 CLAUDE_CONFIG_DIR ——
+# 那些都是 deep-run 為了「沙箱外執行」付的代價，dc 走 opencode 客戶端路徑沒這些問題。
+#
+# 計費分級（見 tier()）：非免費照派但發 TG。做在這裡而不是 opencode config：config 是共用的，
+# 且登入後 opencode models 會連付費模型一起列。
+#
+# 三個原生旗標是實測必要的，不是包裝癖：
+#   --auto   config 的 permission.bash="ask" 在 headless 下會被自動拒絕 —— 沒有 --auto
+#           模型一跑 bash 就死（連 ls 都過不了），只能靠 write/edit 硬寫，實際上等於廢。
+#           執行人本來就要能跑 bash 與驗收，故預設開；DC_NO_AUTO=1 可關（會嚴重降能）。
+#   --pure   同一模型 4.5s vs 16s（agentpet.js 外掛佔 ~11s）
+#   --dir/-f 任務檔常在專案外，用 --dir 指定工作目錄並以 -f 附加，否則模型讀不到任務內容
+set -u
+
+# dc 認可的免費模型。suffix 規則（*-free）自動涵蓋未來新增的免費模型；
+# big-pickle 無 -free 後綴故明列。DC_FREE_EXTRA 可補白名單。
+DC_FREE_UNLISTED="big-pickle"
+# 2026-10-09 依 gaps.tsv（75 筆真實工單）改：longcat 19 跑 9 停滯（40%）、471 s/pass，
+# 是池裡最差的一隻；space-bunny 25 跑 21 PASS（84%）、85 s/pass，為當日 dcq autorank 首位。
+# dc 單張沒有池也沒有 fallback，預設挑錯等於四成機率白等 STALL_S。
+DEFAULT_FREE="space-bunny-free"  # Zen 免費池（Go 版 2026-10-07 改付費，故不帶 opencode-go/ 前綴）
+is_free() {
+  case "$1" in big-pickle) return 0 ;; esac
+  case "$1" in *-free) return 0 ;; esac
+  for e in ${DC_FREE_EXTRA:-}; do [ "$e" = "$1" ] && return 0; done
+  return 1
+}
+# 計費分級跟 provider 無關：free / sub（扣訂閱額度）/ metered（按量計費，或沒查過的組合）。
+# 只分級不擋：非 free 照派，但先發 TG 警示，讓花錢這件事一定有人看到。
+# *-free 只在 opencode 系才算數——別家路由器的組合名帶 -free（omniroute/auto/best-free）不保證成員全免費。
+tier() {
+  case "$1" in
+    # 成員 big-pickle→agnes→openrouter/free 全免費（2026-10-02 查 omniroute combos 表；
+    # nim-pool 卡死已移出；建置見 fix 0432）。組合改了要重查。
+    omniroute/free-tools) echo free ;;
+    # dcq 兜底層：OpenRouter 免費池與 Agnes 免費帳號（2026-10-07 查 omniroute connections）。
+    omniroute/or-free|omniroute/openai-compatible-chat-agnes/agnes-2.0-flash) echo free ;;
+    opencode/*|opencode-go/*) if is_free "${1#*/}"; then echo free; elif [ "${1%%/*}" = opencode-go ]; then echo sub; else echo metered; fi ;;
+    */*) echo metered ;;
+    *) if is_free "$1"; then echo free; else echo metered; fi ;;
+  esac
+}
+
+f=""; d="$PWD"; agent=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) agent="${2:?--agent 需要值}"; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "dc: 未知選項 ${1}（要傳給 opencode run 的用 -- 隔開）" >&2; exit 2 ;;
+    *) [ -z "$f" ] && f="$1" || d="$1"; shift ;;
+  esac
+done
+case "$f" in /*) ;; *) echo "dc: task 路徑必須是絕對路徑：${f}" >&2; exit 2 ;; esac
+[ -f "$f" ] || { echo "dc: task 檔不存在：${f}" >&2; exit 2; }
+[ -d "$d" ] || { echo "dc: cwd 不存在：${d}" >&2; exit 2; }
+# 正規化成和 dcq 的 CWD= 同一寫法（cd+pwd），否則 hash 不同＝鎖不到同一把
+d="$(cd "$d" && pwd)"
+command -v opencode >/dev/null || { echo "dc: opencode 不在 PATH" >&2; exit 2; }
+# provider.opencode 覆寫 baseURL → 全模型 405（fixindex 9775）；rc=2 讓 dcq 不空轉整條模型階梯
+OCJ="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
+if [ -f "$OCJ" ] && command -v jq >/dev/null && jq -e '.provider.opencode.options.baseURL?' "$OCJ" >/dev/null 2>&1; then
+  echo "dc: 中止——${OCJ} 有 provider.opencode.options.baseURL 覆寫，會 405（fixindex 9775），刪掉該 provider 區塊" >&2; exit 2
+fi
+
+OCBIN="${DC_BIN:-$HOME/.deepclaude/deep-agent/bin}"
+WV="$(command -v wo-verify || true)"; [ -x "${WV:-/nonexistent}" ] || WV="$OCBIN/wo-verify"
+[ -x "$WV" ] || { echo "dc: 找不到 wo-verify（可設 DC_BIN=<dir>）" >&2; exit 2; }
+DL="$(command -v deep-lint || true)"; [ -x "${DL:-/nonexistent}" ] || DL="$OCBIN/deep-lint"
+
+# 沒有可跑的驗收區塊就不派工：模型做完也無法判定成敗，等於燒時間換一個不知道對不對的結果。
+if [ "${DC_SKIP_LINT:-0}" != 1 ] && [ -x "$DL" ]; then
+  "$DL" "$f" || { echo "dc: deep-lint 未過（DC_SKIP_LINT=1 可強制派工）" >&2; exit 1; }
+fi
+"$WV" "$f" --dry >/dev/null 2>&1 || { echo "dc: 驗收區塊語法錯，wo-verify --dry 失敗" >&2; exit 2; }
+
+# --- 評分器釘住（pin）：派工前先把驗收腳本抽出來存一份 ------------------------
+# 工單檔在執行人手上，驗收區塊也在裡面：他改得到的評分器，他早晚會改到過關
+# （fixindex 0372 §4 偽造 git status、0373 在 fixsnap 植入刪檔後門 + 偽造註解）。
+# executor-rules.md 第 8 條「不修改驗收區塊」是提示詞，本機實測 Documentation 層
+# 符合率 ≈ 0%。這裡改成機械偵測：驗收跑 pin 這份，並比對工單當下的版本，不一致 exit 3。
+pin="$(mktemp)" || { echo "dc: mktemp 失敗（pin）" >&2; exit 2; }
+trap 'rm -f "$pin"' EXIT
+"$WV" "$f" --dump > "$pin" || { echo "dc: 抽不出驗收區塊（wo-verify --dump 失敗）" >&2; exit 2; }
+
+# --- do-nothing 負向對照：驗收必須在未動工前失敗 -----------------------------
+# 一個「什麼都不做也會通過」的驗收不是驗收。派工前在同一個 cwd 跑一次 pin，
+# 預期非零；若此刻就通過，代表驗收是空包彈或工單本身是 no-op，派下去只會
+# 拿到一個不知道對不對的 PASS。驗收規則本來就要求唯讀，所以提前跑是安全的。
+# 逃生門：確認既有狀態型的工單寫一行 `NEG-CONTROL: n/a`，或 DC_NEGCTL=0。
+if [ "${DC_NEGCTL:-1}" = 1 ] && ! grep -q '^NEG-CONTROL: *n/a' "$f"; then
+  if ( cd "$d" && WO_VERIFY_TIMEOUT="${DC_NEGCTL_TIMEOUT:-120}" "$WV" "$f" --pinned "$pin" >/dev/null 2>&1 ); then
+    echo "dc: 中止——驗收在未動工前就通過（do-nothing 對照失敗）。" >&2
+    echo "    驗收是空包彈、或工單要求的狀態已經存在。確認既有狀態型的工單請加一行 NEG-CONTROL: n/a；" >&2
+    echo "    要強制派工用 DC_NEGCTL=0。cwd=${d} task=${f}" >&2
+    exit 2
+  fi
+fi
+
+# 未指定模型就釘死預設免費模型（不讓 opencode config 的 per-agent 付費 model 生效）；
+# 有指定則沿用（已驗證是免費）。
+# DC_FREE_MODEL 含 "/" 時當完整 provider/model 用（例如 opencode-go/space-bunny-free），
+# 否則補預設 provider 前綴。Go lane 的免費模型走前者。
+have_m=0; m=""
+prev=""
+for a in "$@"; do
+  case "$prev" in -m|--model) m="$a" ;; esac
+  case "$a" in
+    -m|--model) have_m=1; prev="$a" ;;
+    --model=*)  have_m=1; m="${a#--model=}"; prev="" ;;
+    *) prev="" ;;
+  esac
+done
+if [ "$have_m" != 1 ]; then
+  m="${DC_FREE_MODEL:-$DEFAULT_FREE}"
+  case "$m" in */*) ;; *) m="opencode/$m" ;; esac
+  set -- -m "$m" "$@"
+fi
+t="$(tier "$m")"
+if [ "$t" != free ]; then
+  msg="⚠️ dc 派工用到非免費模型：${m}（${t}）task=$(basename "$f") cwd=${d}"
+  echo "dc: WARN ${msg}" >&2
+  # TG 可能送不出去（hpush 失敗只會默默消失），所以一定先落一行本機帳
+  BL="${DCQ_HOME:-$HOME/.dcq}/logs"
+  mkdir -p "$BL" && printf '%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$t" "$m" "$f" >> "$BL/billing.tsv"
+  # TG 限流：DC_TG_EVERY 秒（預設 600）內只發一則，其餘只落帳；下一則附上期間被壓掉的筆數。
+  # 戳記檔記上次發送時 billing.tsv 的行數。
+  # ponytail: 併發 dc 讀同一戳記有競態，最壞多發一則，不值得上鎖
+  ST="$BL/.billing-tg-last"; now=$(date +%s); n=$(wc -l < "$BL/billing.tsv" | tr -d ' ')
+  last=$(stat -f %m "$ST" 2>/dev/null || echo 0)
+  if [ $((now - last)) -ge "${DC_TG_EVERY:-600}" ]; then
+    prev=$(cat "$ST" 2>/dev/null || echo "$((n - 1))"); skipped=$((n - 1 - prev))
+    [ "$skipped" -gt 0 ] && msg="${msg}（另有 ${skipped} 筆被限流，見 billing.tsv）"
+    echo "$n" > "$ST"
+    # 背景送：TG 慢或掛了都不該拖住派工
+    command -v hpush >/dev/null && { hpush "$msg" >/dev/null 2>&1 & }
+  fi
+fi
+
+# opencode-go 要兩樣東西才會出現：本機 opencode.json 的 enabled_providers 有列它、
+# 以及 env 的 OPENCODE_API_KEY（它不沿用 auth.json 裡 opencode 的憑證，2026-10-02 實測）。
+# 只在這次呼叫臨時注入，不改使用者的 config —— 改了的話所有工具都會看到付費模型。
+case "$m" in opencode-go/*)
+  ep="$(opencode debug config 2>/dev/null | jq -c '(.enabled_providers // empty) + ["opencode-go"] | unique' 2>/dev/null)"
+  [ -n "$ep" ] && export OPENCODE_CONFIG_CONTENT="{\"enabled_providers\":${ep}}"
+  [ -n "${OPENCODE_API_KEY:-}" ] || OPENCODE_API_KEY="$(jq -r '.opencode.key // empty' "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json" 2>/dev/null)"
+  export OPENCODE_API_KEY
+  [ -n "$OPENCODE_API_KEY" ] || { echo "dc: opencode-go 需要 OPENCODE_API_KEY，auth.json 也沒有 opencode 憑證" >&2; exit 2; }
+esac
+
+# 執行人不讀主 session 的 ~/.claude（CLAUDE.md ＋ skills）：每輪多讀約 1.08 萬 token，那套規則又是寫給主 session 的，會誤導執行人。
+# 實測同一句 prompt 輸入 21.6k → 7.2k token（關讀 ＋ permission.skill=deny 一起上）。官方文件：https://opencode.ai/docs/rules 、https://opencode.ai/docs/cli
+# $0 可能是 symlink（install.sh link 到 ~/.local/bin/dc），readlink -f 跟到 repo 實體路徑。
+export OPENCODE_DISABLE_CLAUDE_CODE=1
+_cc="${OPENCODE_CONFIG_CONTENT:-}"; [ -n "$_cc" ] || _cc='{}'
+# 用 jq 深度合併（*）而不是整份覆蓋：opencode-go 分支剛設進來的 enabled_providers 不能被蓋掉。
+_cc="$(printf '%s' "$_cc" | jq -c --arg f "$(dirname "$(dirname "$(readlink -f "$0")")")/executor-rules.md" '. * {permission:{skill:"deny"}, instructions:[$f]}' 2>/dev/null)"
+[ -n "$_cc" ] || { echo "dc: OPENCODE_CONFIG_CONTENT 不是合法 JSON，無法合併 permission.skill=deny 與 executor-rules.md" >&2; exit 2; }
+export OPENCODE_CONFIG_CONTENT="$_cc"
+
+# opencode.json 的 omniroute apiKey 是 {env:OMNIROUTE_API_KEY}，沒設就送空 key → 401（fix 9775 §12）
+case "$m" in omniroute/*)
+  [ -n "${OMNIROUTE_API_KEY:-}" ] || OMNIROUTE_API_KEY="$(cat "$HOME/.creds/kv/OMNIROUTE_API_KEY.txt" 2>/dev/null)"
+  export OMNIROUTE_API_KEY
+  [ -n "$OMNIROUTE_API_KEY" ] || { echo "dc: omniroute 需要 OMNIROUTE_API_KEY，~/.creds/kv 也沒有" >&2; exit 2; }
+esac
+
+# 名字有 -free 不代表還免費（Go 的免費是限時的）。派工前查一次真實計費狀態，
+# 停止免費就終止並跳警報，不讓它默默轉成付費額度。
+FCK="$(dirname "$0")/freecheck"
+if [ -x "$FCK" ]; then
+  "$FCK" "${m#*/}" || { echo "dc: 中止——freecheck 警報（DC_FREECHECK=off 可強制）" >&2; exit 2; }
+fi
+
+# 上游停滯時 opencode 預設乾等 chunkTimeout（官方 300000ms）。沒設或設太長＝一次停滯
+# 燒 5 分鐘還看不出是卡死還是在想，故派工前先唸一次合併後的 config 並出聲。
+# 只 WARN 不擋：這是使用者的 config，dc 無權改。
+if [ "${DC_NO_TIMEOUT_WARN:-0}" != 1 ] && command -v jq >/dev/null; then
+  case "$m" in */*) prov="${m%%/*}" ;; *) prov="opencode" ;; esac
+  ct="$(opencode debug config 2>/dev/null | jq -r --arg p "$prov" '.provider[$p].options.chunkTimeout // empty' 2>/dev/null)"
+  case "$ct" in
+    ''|*[!0-9]*) echo "dc: WARN provider.${prov} 沒設 chunkTimeout，上游停滯可能乾等很久（5 分鐘預設 v1.18.27 才有）。建議在 opencode.json 設 provider.${prov}.options.chunkTimeout: 120000" >&2 ;;
+    *) [ "$ct" -gt 180000 ] && echo "dc: WARN provider.${prov}.options.chunkTimeout=${ct}ms 偏長（>180000），上游停滯會乾等這麼久" >&2 ;;
+  esac
+fi
+
+# --- cwd 互斥鎖 ---------------------------------------------------------------
+# 鎖在 dc 而不只在 dcq：直接呼叫 dc 會完全繞過 dcq 的鎖，兩個 agent 寫同一目錄
+# 互相覆蓋（issue #1）。鎖路徑與 hash 算法與 dcq 的 .cwdlock 完全一致，所以
+# dc 和 dcq 搶的是同一把——換個目錄名就等於兩把獨立的鎖，等於沒修。
+# dcq 已在 claim 時持鎖，會帶 DC_LOCK_HELD=1 進來，這裡不重複拿（否則自己卡自己）。
+# 用 inline 不用 function：trap 字串在 EXIT 時才展開，lockdir 若是 local 就已出
+# 作用域，變成 rm -rf "" 的 no-op，鎖永遠不釋放。
+LOCKROOT="${DCQ_HOME:-$HOME/.dcq}/.cwdlock"
+LOCKDIR=""
+release_lock() { [ -n "$LOCKDIR" ] && rm -rf "$LOCKDIR"; }
+# git-bash 只有 sha1sum，macOS/Linux 只有 shasum；兩者同為 SHA-1，鎖 key 跨平台一致
+_sha1() { if command -v shasum >/dev/null 2>&1; then shasum; else sha1sum; fi; }
+if [ "${DC_LOCK_HELD:-0}" != 1 ]; then
+  h="$(printf '%s' "$d" | _sha1 | cut -c1-12)"
+  mkdir -p "$LOCKROOT" || { echo "dc: 無法建立鎖目錄 ${LOCKROOT}" >&2; exit 2; }
+  L="$LOCKROOT/$h"
+  waited=0; WAIT_MAX="${DC_LOCK_WAIT:-0}"
+  while :; do
+    if mkdir "$L" 2>/dev/null; then echo $$ > "$L/pid"; LOCKDIR="$L"; break; fi
+    holder="$(cat "$L/pid" 2>/dev/null || true)"
+    # ponytail: mkdir 與寫 pid 之間有窗，pid 還沒出現時再看一眼才判孤兒；
+    # 要完全消掉這個窗得換 flock(1)（macOS 沒有）或 C 小工具，不值得。
+    [ -z "$holder" ] && { sleep 1; holder="$(cat "$L/pid" 2>/dev/null || true)"; }
+    if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+      echo "dc: 清掉孤兒鎖（持有者 pid=${holder:-?} 已不存在）：$L" >&2
+      rm -rf "$L"; continue
+    fi
+    # 預設不等：併發撞上就讓呼叫端決定要不要排隊，乾等 30 分鐘是最糟的預設
+    if [ "$waited" -ge "$WAIT_MAX" ]; then
+      echo "dc: 拒絕——cwd 已被 pid ${holder} 佔用：${d}（DC_LOCK_WAIT=<秒> 可改成等待）" >&2
+      exit 75
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  trap 'release_lock; rm -f "$pin"' EXIT
+fi
+# INT/TERM 只負責退出，清理交給 EXIT trap。handler 裡不 exit 的話 bash 跑完清理會「繼續往下」，
+# 拿半成品去跑 wo-verify：被殺的工單可能被判 PASS 或算成模型做錯（2026-10-03 實證）。
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+[ -n "$agent" ] && set -- --agent "$agent" "$@"
+[ "${DC_NO_AUTO:-0}" = 1 ] || set -- --auto "$@"
+
+# message 放最前面：-f 是陣列旗標，會把後續位置參數一起當附件路徑吞掉。
+# 輸出多留一份在暫存檔：模型可能回報工單瑕疵，那行字是唯一認得懂的線索。
+# mktemp 不可帶空模板（macOS 會 mkstemp failed on : Invalid argument）。
+out="$(mktemp)" || { echo "dc: mktemp 失敗" >&2; exit 2; }
+# opencode 1.18.x 遇 429 只記一行 ERROR log 就在程序內重試：最多 5 次、每次照上游 retry-after 等，
+# Zen 額度用完時會卡好幾分鐘，官方沒有設定可關（experimental.retry PR #44517 未合併）。不攔的話 dcq 要等 STALL_S 才換模型，期間背後還在一直重打同一份免費額度。
+# 所以開 --print-logs 讓 ERROR log 進 ${out}，看到主 agent（small=false，排除取標題的小模型）
+# 被限流就殺掉，以 rc=1 快速失敗。
+# bash 3.2 不能 wait process substitution，所以照舊 | tee，靠 pid 檔／rc 檔拿 opencode 的 pid 與退出碼；
+# wait 的是 tee，它結束時 $out 已寫完，後面 grep DC_TASK_DEFECT 不會讀到半截。
+# --- 越界偵測：同 repo 其他 worktree 不得被改 ---------------------------------
+# --dir 只定 opencode 的起始目錄；模型照工單裡的絕對路徑 Write、bash 帶 workdir，
+# 照樣寫進主 checkout（2026-10-08 實證：worktree 派工，3 個 commit 落在 main）。
+# 前後各拍一次：其他 worktree 的 HEAD＋status 摘要。正被別的 dc 持鎖的 worktree
+# 本來就會變（dcq 併發派同 repo 不同 worktree），跳過不比。
+# ponytail: 只看 git 追蹤得到的變化、路徑含空白會誤判；要更嚴就改 fs 快照。
+_wt_snap() {
+  local top w
+  top="$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  git -C "$d" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | while IFS= read -r w; do
+    [ "$w" = "$top" ] && continue
+    [ -d "$LOCKROOT/$(printf '%s' "$w" | _sha1 | cut -c1-12)" ] && continue
+    printf '%s %s %s\n' "$w" "$(git -C "$w" rev-parse HEAD 2>/dev/null)" \
+      "$(git -C "$w" status --porcelain 2>/dev/null | _sha1 | cut -c1-12)"
+  done
+}
+wt_before="$(_wt_snap)"
+
+RL_RE='small=false.*(Rate limit exceeded|FreeUsageLimitError)'
+# 上游不可用（Model/Endpoint is unavailable、已下架）opencode 一樣在程序內重試約 67s 才 rc=1（2026-10-11 實測），提早結束讓 dcq 換模型。
+UA_RE='small=false.*(Upstream request failed|has been deprecated)'
+# opencode 開工就印「> <agent> · <model>」，在模型回應之前（上游不可用時也照印）。
+# DC_START_S 秒內沒出現＝卡在送出請求前，ERROR log 也是空的（2026-10-11 實證：400s 零輸出）。
+# 首輸出之後的停滯歸 dcq 的 STALL_S 管（fix 9775 §23），這裡不重複。
+START_RE='> [^ ]+ · '
+START_S="${DC_START_S:-60}"
+pidf="$out.pid"; rcf="$out.rc"
+# --title：沒給標題時 opencode 會另叫 small model（nemotron-3-ultra-free）產標題，每張工單白吃一份免費額度
+# 連子程序一起殺：子程序（MCP／LSP 等）還握著 stdout 的話，tee 不會結束，wait 會卡住。
+kill_oc() { local p; p=$(cat "$pidf" 2>/dev/null) || return 0; pkill -TERM -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; return 0; }
+trap 'release_lock; kill_oc; rm -f "$out" "$pidf" "$rcf" "$pin"' EXIT
+{ sh -c 'echo $$ > "$0"; exec "$@"' "$pidf" opencode run \
+  "你是執行人。任務與驗收都在附加的檔案裡，先完整讀完再動手。
+驗收由外部 wo-verify 機械執行，你的自述不影響成敗判定。
+驗收區塊在派工前已被複製釘住並逐行比對：改它只會判 exit 3 篡改，不可能讓你過關。
+驗收區塊本身有誤（怎麼做都不可能通過）時，保留驗收原樣，輸出一行 DC_TASK_DEFECT: <驗收行號> <理由> 後立即結束。" \
+  --pure --print-logs --log-level ERROR --dir "$d" -f "$f" --title "dc: $(basename "$f")" "$@"
+  echo $? > "$rcf"; } 2>&1 | tee "$out" &
+teepid=$!
+rl=0; started=0; ts=$(date +%s)
+while kill -0 "$teepid" 2>/dev/null; do
+  if grep -q -E "$RL_RE" "$out" 2>/dev/null; then
+    rl=1; kill_oc; break
+  fi
+  if grep -q -E "$UA_RE" "$out" 2>/dev/null; then
+    rl=2; kill_oc; break
+  fi
+  if [ "$started" = 0 ]; then
+    if grep -q -E "$START_RE" "$out" 2>/dev/null; then started=1
+    elif [ $(( $(date +%s) - ts )) -ge "$START_S" ]; then rl=3; kill_oc; break; fi
+  fi
+  sleep 1
+done
+wait "$teepid"
+rc=$(cat "$rcf" 2>/dev/null || echo 1)
+# 比在所有其他判定之前：越界與成敗無關，PASS 的工單一樣可能寫壞別的 worktree。
+# exit 2 讓 dcq 走 FATAL 不重試——換模型重跑只會再污染一次。
+drift="$(_wt_snap | while read -r w rest; do
+  b="$(printf '%s\n' "$wt_before" | awk -v w="$w" '$1==w {print $2" "$3}')"
+  [ -n "$b" ] && [ "$b" != "$rest" ] && echo "$w"
+done)"
+if [ -n "$drift" ]; then
+  echo "dc: 越界——opencode 改動了同 repo 其他 worktree（工單 cwd=${d}）：" >&2
+  printf '  %s\n' $drift >&2
+  echo "dc: 判 FATAL，不跑驗收；請主 session 檢查並還原上列 worktree" >&2
+  exit 2
+fi
+[ "$rl" = 1 ] && { echo "dc: 上游限流（429），opencode 會照 retry-after 久等重試，已提早結束" >&2; exit 1; }
+[ "$rl" = 2 ] && { echo "dc: 上游不可用（$(grep -m1 -oE '(Upstream request failed[^"]*|Model [^ ]+ has been deprecated)' "$out")），已提早結束" >&2; exit 1; }
+[ "$rl" = 3 ] && { echo "dc: opencode ${START_S}s 內沒開工（無「> agent · model」行），判定卡住，已結束" >&2; exit 1; }
+[ "$rc" -eq 0 ] || { echo "dc: opencode run rc=${rc}（常見：上游掛=1、逾時=124、權限拒絕）" >&2; exit "$rc"; }
+# 模型回報工單瑕疵（issue #4）：不跑驗收，直接 exit 2 走既有的契約錯分支 ——
+# dcq 的 exit:2 是 FATAL、不重試、不罰模型，工單的錯不會算到模型頭上。
+# 錨行首：模型引用工單原文或印出程式碼時不能誤判。
+if grep -q '^DC_TASK_DEFECT:' "$out"; then
+  echo "dc: 模型回報工單瑕疵（DC_TASK_DEFECT），不跑驗收" >&2
+  exit 2
+fi
+
+# 完成定義在這裡，不在模型的自述。務必在 $d 底下跑 —— 驗收斷言用的是相對路徑，
+# 在呼叫端的 cwd 跑會全部找不到檔案而誤判 FAIL。
+# 跑 pin 那份而不是工單當下那份（篡改即 exit 3），並重跑 K 次全過才算 PASS：
+# 單次通過只告訴你「至少成功過一次」，重跑才抓得到時好時壞的驗收與副作用。
+K="${DC_VERIFY_K:-2}"
+echo "dc: 驗收 → ${WV} --pinned (cwd=$d, K=$K)" >&2
+i=1
+while [ "$i" -le "$K" ]; do
+  [ "$K" -gt 1 ] && echo "dc: 驗收第 ${i}/${K} 次" >&2
+  ( cd "$d" && "$WV" "$f" --pinned "$pin" ) || {
+    vrc=$?
+    [ "$vrc" = 3 ] && echo "dc: 驗收區塊被改動（exit 3）—— 這是紅旗，不是工單瑕疵，請主 session 看 diff" >&2
+    [ "$i" -gt 1 ] && echo "dc: 驗收第 ${i} 次才失敗 —— 驗收或改動不穩定（flaky），不要只憑第一次通過結案" >&2
+    exit "$vrc"
+  }
+  i=$((i + 1))
+done
+exit 0
+}

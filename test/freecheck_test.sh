@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# freecheck 判準自檢：假 curl 回指定 usage，不打上游、不發推播。
+# 斷言加白語意：percent>0 只 WARN 不停單；額度窗受限仍警報；全 0 放行。
+set -u
+cd "$(dirname "$0")/.."
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+mkdir "$T/bin"
+cat > "$T/bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in *usage*) printf '%s' "$FAKE_USAGE" ;; *) echo '["longcat-2.5-preview-free","space-bunny-free"]' ;; esac
+EOF
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/hpush"
+chmod +x "$T/bin/"*
+export OPENCODE_GO_API_KEY=fake DCQ_HOME="$T/q" PATH="$T/bin:$PATH"
+
+fail=0
+chk() { # name usage want_rc want_alarm
+  rm -f "$T/q/.ALARM"
+  FAKE_USAGE="$2" bin/freecheck longcat-2.5-preview-free >/dev/null 2>&1; rc=$?
+  a=N; [ -e "$T/q/.ALARM" ] && a=Y
+  if [ "$rc" = "$3" ] && [ "$a" = "$4" ]; then echo "PASS $1"; else echo "FAIL $1: rc=$rc alarm=$a want rc=$3 alarm=$4"; fail=1; fi
+}
+chk "percent>0 加白只 WARN" '{"usage":{"weekly":{"status":"ok","percent":5}}}' 0 N
+chk "額度窗受限仍警報"      '{"usage":{"weekly":{"status":"limited","percent":100}}}' 3 Y
+chk "全 0 放行"             '{"usage":{"weekly":{"status":"ok","percent":0}}}' 0 N
+exit $fail
