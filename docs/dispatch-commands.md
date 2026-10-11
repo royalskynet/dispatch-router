@@ -77,7 +77,13 @@ launchctl bootstrap "gui/$(id -u)" ~/.deepclaude/launchd/local.deepclaude.proxy.
 ```
 
 `launchctl disable` 的旗標跨重開機持久存在，所以**先 `enable` 再 `bootstrap`**；
-還在 disable 狀態下 bootstrap 不會把 job 載起來。
+還在 disable 狀態下 bootstrap 不會把 job 載起來。`enable` 之後先 `launchctl print` 確認舊 job
+已消失、等數秒再 `bootstrap`，否則 error 5（fixindex 0277）。指令本體復活：`~/.local/bin/<name>.disabled`
+改回原名。
+
+2026-10-12 瘦身：`~/.local/bin/deepclaude-happy`（直接 exec `~/.deepclaude/bin/deepclaude --happy`，
+繞過停用 stub）與 `~/Library/LaunchAgents/local.deepclaude.happy.plist.disabled` 已移到
+`~/.Trash/zombie-cleanup-20261011/deepclaude/`。
 
 ## 已知失效的文件指令
 
