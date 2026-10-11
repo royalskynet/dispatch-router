@@ -1,0 +1,637 @@
+#!/usr/bin/env bash
+{ # 整檔包成一個複合指令：bash 先讀完整段才執行，執行中被改寫（git pull、dc 改自己）不會用舊偏移讀到碎片（fix 9499）
+# dcq — dc 的並發佇列跑者。工單進，成敗總表出。
+#
+# 為什麼不是 HTTP 客戶端：Go 的 /zen/go/v1 給的是推理，不是 agent。要改檔案的派工
+# 仍得跑 opencode 的 agentic loop，所以並發＝開 N 個 dc 進程，不是開 N 條 HTTP 連線。
+# Go 的價值在模型那一側（∞ 免費額度、不吃 free-tier 閘、更穩），設 DCQ_MODELS 即可用。
+#
+# 不自造的部分（照抄本機既有前案，避免雙抄漂移）：
+#   佇列骨架  = wo-runner 的 pending/→running/→done|failed/ 檔案系統狀態機
+#   准入閘    = dc 自己的 deep-lint + wo-verify --dry（dcq add 只是提前跑一次）
+#   成敗判定  = dc 的 exit code，不另發明狀態機
+#
+# 自造的三件（並發才需要，既有前案都沒有）：
+#   1. slot 分配（wo-runner 是全域單鎖，一次只跑一張）
+#   2. per-job cwd 互斥 —— 唯一會讓並發出「錯誤結果」而非只是變慢的項目：
+#      opencode 會對工作目錄做 snapshot，wo-verify 的斷言又是相對路徑，
+#      兩張工單共用 cwd 會互相汙染（A 的產物讓 B 假過、B 的改動讓 A 假失敗）
+#   3. 模型池 + per-model 冷卻／併發槽（借鏡 LiteLLM Router）
+#   4. watchdog：.out 停滯與總時限（opencode 的 chunkTimeout 不可靠，見 issue #43519）
+set -u
+
+Q="${DCQ_HOME:-$HOME/.dcq}"
+# 模型池：Go 的兩隻限時無限免費（CLI 走 opencode/ 前綴，2026-09-30 實測可用）為主，
+# Zen 免費池殿後。訂閱沒了就清空 DCQ_POOL_GO。兩池只是依序串接——「池」的意義在
+# 於冷卻與併發上限是 per-model 的，一隻忙或掛不會拖住同池其他隻、更不會停全隊。
+# DCQ_MODELS 有設就整條覆寫（舊介面相容）。
+# ponytail: 2026-10-03 對調成 space-bunny 先（扣掉本機錯誤與壞驗收後 space-bunny 2/2、無停滯；
+# longcat 4/5、1 次 300s 停滯原因未查）。樣本各 <6，累積 20 筆再依通過率與停滯數重排。
+POOL_GO="${DCQ_POOL_GO-longcat-2.5-preview-free}"  # space-bunny-free 2026-10-07 從 Go 下架（改付費 space-bunny）
+# 2026-10-07 同一張修 bug 工單重測：longcat 30s → nemotron-3-ultra 45s → nemotron-3.5-lightning 151s 過；
+# muse-spark-1.3-contributor／mimo-v2.6-flash／big-pickle／space-bunny-free 420s 無產出，移出池。
+# ponytail: 移出的幾隻沒有自動回測，要恢復得手動重跑同一張工單再加回來。
+# 2026-10-09 同一張 slugify 工單 7 隻並跑（每隻 1 樣本）：space-bunny 20s → longcat 28s → mimo 44s
+# → step-5 55s → nemotron-3-ultra 71s → ling-3.1-flash 77s 過；nemotron-3.5-lightning 100s 自稱過但驗收 FAIL。
+# step-5／ling 過程中有 "Endpoint is unavailable" 重試。space-bunny／mimo 10-07 的 420s 無產出今天沒重現，加回。
+# 排序：真實工單 0 停滯的 nemotron-3-ultra 打頭，其餘依今天秒數；會謊報的 lightning 墊底。
+# ponytail: 每隻累積 10 筆真實工單（gaps.tsv）就依停滯率與通過率重排；樣本少，排序只當暫定。
+# nemotron-3.5-lightning-free 留在手排裡，但 2026-10-09 起由 RANK_ZERO_N 短路自動墊底
+# （5 跑 0 PASS、1 停滯，且有一次自稱完成而驗收 FAIL）。先前是直接從這行移出，改回來的理由：
+# 寫死移出的不會自動回測，而短路只是降到懲罰層（訂閱層之後）——它仍會被試到，7 天沒新樣本還會假釋回免費層。
+POOL_ZEN="${DCQ_POOL_ZEN-nemotron-3-ultra-free space-bunny-free step-5-preview-free ling-3.1-flash-free mimo-v2.6-flash-free nemotron-3.5-lightning-free}"
+# 2026-10-09 依 gaps.tsv＋runner.log 重排：longcat 20 跑 8 停滯（40%）、PASS 3；nemotron-3-ultra
+# 11 跑 0 停滯、PASS 4，最大靜默 153s。longcat 移到整個免費層最後，仍排在付費層之前（免費優先）。
+MODELS="${DCQ_MODELS:-$POOL_ZEN $POOL_GO}"
+# 自動重排免費層（每次 dcq 啟動都算，零 token）：讀 gaps.tsv 每隻最近 RANK_WIN 筆，扣掉 rc=2
+# （工單契約錯，不算模型的帳）。樣本 ≥RANK_MIN 的才算「合格」：
+#   - 停滯率 ≥RANK_STALL_PCT% → 降到懲罰層 POOL_PEN（訂閱層之後、兜底層之前；2026-10-09 起，原本在免費層最後）
+#   - 其餘合格的在「合格者原本占的位置」裡依「每 PASS 一張平均花幾秒」重排（越少越前）：
+#     分子＝這些嘗試的總秒數（含卡住、失敗白等的時間），分母＝PASS 數。等待時間和通過率一起算。
+#     舊紀錄沒有秒數欄（第 6 欄），用最大靜默秒數代替（偏低，但卡住那筆≈STALL_S，白等的時間有算到）
+#   - 樣本不夠的留在手排的位置不動
+# 短路（2026-10-09 加）：樣本 ≥RANK_ZERO_N 但 PASS 數為 0 的，不等 RANK_MIN 就直接降級。
+# 起因是 nemotron-3.5-lightning 5 跑 0 PASS 還賴在手排第 6 位白等 337s：RANK_MIN=10 的本意是
+# 避免小樣本亂排順序，但「連一張都沒過」不需要排序精度就能判定，兩者不衝突。3 是最小的
+# 「不像巧合」樣本數；全 0 PASS 的 s/pass 是無限大，所以在 demoted 組內自動墊底。
+# DCQ_MODELS 有設、或 DCQ_AUTORANK=0 就不排。
+# ponytail: 不分工單難易；簡單工單多的模型會被高估。要更準得記工單大小再加權。
+RANK_MIN="${DCQ_RANK_MIN:-10}"; RANK_WIN="${DCQ_RANK_WIN:-30}"; RANK_STALL_PCT="${DCQ_RANK_STALL_PCT:-30}"
+RANK_ZERO_N="${DCQ_RANK_ZERO_N:-3}"   # 設 0＝停用短路
+# 每日探測（launchd 06:00 跑 oc-free-check --tsv，見 launchd/）：只用最新一批、且 ≤PROBE_MAX_H 小時。
+#   - 探測非 OK → 移到免費層最後（比 zero/demoted 更後；明天探測回 OK 就自己回來）
+#   - 樣本不足（manual）的位置裡依探測秒數排序，沒探測資料的排在有資料的後面
+# 真實工單的每 PASS 秒數仍是主排序：探測只送「回 ok」，量得到活著與反應快慢，量不到寫碼能力。
+PROBE_MAX_H="${DCQ_PROBE_MAX_H:-36}"
+# 累犯（zero／demoted）不留在免費層尾巴，而是放進懲罰層 POOL_PEN，排在訂閱層之後、兜底層之前：
+# 免費層有 FREE_ROUNDS 輪重試，累犯留在免費層等於每張工單白等它卡兩次（longcat 471 s/pass）。
+# 假釋：最近一筆樣本超過 RANK_PAROLE_D 天就回免費層 manual 位置重給機會——放到訂閱層後面
+# 幾乎不會被試到，不假釋就永遠累積不到新樣本翻身。
+RANK_PAROLE_D="${DCQ_RANK_PAROLE_D:-7}"
+rank_free() {  # $1=手排順序（空白分隔）；mode=table 時印統計表
+  local f="$Q/logs/gaps.tsv"; [ -s "$f" ] || f=/dev/null
+  local pf="$Q/logs/probe.tsv"; [ -s "$pf" ] || pf=/dev/null
+  local cut; cut="$(date -v-"${PROBE_MAX_H}"H +%F_%T 2>/dev/null || date -d "-${PROBE_MAX_H} hours" +%F_%T)"
+  local pc; pc="$(date -v-"${RANK_PAROLE_D}"d +%F_%T 2>/dev/null || date -d "-${RANK_PAROLE_D} days" +%F_%T)"
+  awk -F'\t' -v order="$1" -v min="$RANK_MIN" -v win="$RANK_WIN" -v sp="$RANK_STALL_PCT" \
+      -v zn="$RANK_ZERO_N" -v mode="${2:-order}" -v pf="$pf" -v cut="$cut" -v pc="$pc" -v stall="${STALL_S:-200}" '
+    FILENAME==pf { if ($1>=cut) { if ($1>pl) pl=$1; PT[$1,$3]=PT[$1,$3] (PT[$1,$3]=="" ? "" : ",") $4 ":" $5 } next }
+    $4==0 && $3+0>pgmax { pgmax=$3+0; pgm=$2 }
+    { m=$2; LT[m]=$1; k=++cnt[m]; R[m,k]=$4; W[m,k]=$5; D[m,k]=($6!="" ? $6 : $3) }
+    END {
+      nm=split(order, L, " ")
+      for (i=1; i<=nm; i++) {
+        m=L[i]; n=0; p=0; s=0; d=0; st=cnt[m]-win+1; if (st<1) st=1
+        for (k=st; k<=cnt[m]; k++) { if (R[m,k]==2) continue; n++; d+=D[m,k]; if (R[m,k]==0) p++; if (W[m,k]=="stall") s++ }
+        N[i]=n; P[i]=p; S[i]=s; pr[i]=(n ? p/n : 0)
+        sp_[i]=(p ? d/p : 1e9); sc[i]=-sp_[i]   # 分數越大越前：每 PASS 秒數取負
+        st_="manual"
+        if (zn>0 && n>=zn && p==0) st_="zero"   # 短路：一張都沒過，不等 RANK_MIN
+        else if (n>=min) { if (s*100>=sp*n) st_="demoted"; else { st_="ranked"; q[++nq]=i } }
+        if ((st_=="zero" || st_=="demoted") && LT[m]<pc) st_="manual"   # 假釋
+        if (st_=="zero" || st_=="demoted") dm[++nd]=i
+        # 探測：同一 model 多 provider 時任一 OK 就算活著，秒數取最小
+        ps[i]=""; pok[i]=1e8
+        if (pl!="" && (pl,m) in PT) { ps[i]="down"; np=split(PT[pl,m], pp, ",")
+          for (z=1; z<=np; z++) { split(pp[z], kv, ":"); if (kv[1]=="OK") { ps[i]="ok"; if (kv[2]+0<pok[i]) pok[i]=kv[2]+0 } } }
+        if (ps[i]=="down" && st_!="zero" && st_!="demoted") { st_="probe-down"; pd[++npd]=i }
+        else if (st_=="manual") mq[++nmq]=i
+        tag[i]=st_
+      }
+      # manual 位置依探測秒數升冪（無資料＝1e8，同分維持手排順序）
+      for (a=2; a<=nmq; a++) { x=mq[a]; b2=a-1; while (b2>=1 && pok[mq[b2]]>pok[x]) { mq[b2+1]=mq[b2]; b2-- } mq[b2+1]=x }
+      # 合格者依每 PASS 秒數升冪（同分維持手排順序；插入排序，n 很小）
+      for (a=2; a<=nq; a++) { x=q[a]; b=a-1; while (b>=1 && sc[q[b]]<sc[x]) { q[b+1]=q[b]; b-- } q[b+1]=x }
+      for (a=2; a<=nd; a++) { x=dm[a]; b=a-1; while (b>=1 && sc[dm[b]]<sc[x]) { dm[b+1]=dm[b]; b-- } dm[b+1]=x }
+      out=""; j=0; jm=0
+      for (i=1; i<=nm; i++) {
+        if (tag[i]=="demoted" || tag[i]=="zero" || tag[i]=="probe-down") continue
+        out=out (out?" ":"") (tag[i]=="ranked" ? L[q[++j]] : L[mq[++jm]])
+      }
+      for (a=1; a<=npd; a++) out=out (out?" ":"") L[pd[a]]
+      pen=""; for (a=1; a<=nd; a++) pen=pen (pen?" ":"") L[dm[a]]
+      if (mode=="table") {
+        printf "%-34s %4s %4s %4s %6s %8s %7s  %s\n", "model", "n", "pass", "stall", "pass%", "s/pass", "probe", "狀態"
+        for (i=1; i<=nm; i++) printf "%-34s %4d %4d %4d %5.0f%% %8s %7s  %s\n", L[i], N[i], P[i], S[i], pr[i]*100, (P[i] ? sprintf("%.0f", sp_[i]) : "-"), (ps[i]=="ok" ? sprintf("%.0fs", pok[i]) : (ps[i]=="" ? "-" : "down")), tag[i]
+        if (pl!="") print "探測批次：" pl
+        print "順序：" out
+        print "懲罰層（訂閱層之後）：" pen
+        if (pgmax >= 0.9*stall) printf "⚠ 成功工單最大靜默 %ds（%s）已逼近 STALL_S=%d，門檻可能太緊會誤殺\n", pgmax, pgm, stall
+      } else print out "|" pen
+    }' "$pf" "$f"
+}
+POOL_PEN="${DCQ_POOL_PEN-}"   # 手動指定只在不自動排名時有效（測試用）；自動排名會覆寫
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
+  MODELS_MANUAL="$MODELS"; _r="$(rank_free "$MODELS")"; MODELS="${_r%%|*}"; POOL_PEN="${_r#*|}"
+fi
+# 權重：免費層優先。只有免費模型整輪試過 FREE_ROUNDS 次都失敗，或免費模型全部在冷卻
+# （＝免費掛了），才 fallback 到訂閱層。訂閱層只准 opencode-go/（扣 Go 訂閱額度）——
+# 走到這層 dc 會發 TG 警示。設空字串＝永不動用訂閱。
+# 收錄：Go 額度 per-model 各自計（opencode.ai/docs/go），多放幾隻＝容量相加；跳過與 Zen
+# 免費池同底模的（免費版掛了它多半也掛）、額度 <1k/月的（kimi-k3、qwen3.8-max、grok）與慢的
+# （gpt-6-luna 114s、hy4 222s）。
+# 排序（各組通用）：能正確寫對＞反應快。依 2026-10-03 同一張修 bug 工單實測秒數：
+# Zen nemotron-3-ultra 12s → muse 17s → big-pickle（4 次中卡住 1、假扮工具 1）
+# → nemotron-3.5-lightning（94s 且改錯）→ mimo → free-tools 兜底；
+# mimo 實測 28s 過，但社群報真實工單會無限重複 Glob/Read（opencode#50678），有輸出不觸發 stall，只能撞 JOB_MAX，故殿後。
+# 付費 glm-5.3-flash 12s → deepseek-v4.1-flash 20s → v4-pro 24s → minimax-m3 27s
+# → qwen3.8-flash 28s → kimi-k2.7-code／glm-5.3（未計時，原有的放最後）。
+# deepseek-v4-flash 已移除：上游退役只剩轉址（hermes-agent#131254），長 session 必 400（opencode#48093）。
+# ponytail: 單一簡單工單、每隻 1 樣本，只分得出快慢和明顯壞的；真實工單累積後再依通過率重排。
+# 額度用完的模型會連敗進冷卻，自動跳下一隻，所以排序不必顧額度。
+POOL_PAID="${DCQ_POOL_PAID-opencode-go/glm-5.3-flash opencode-go/deepseek-v4.1-flash opencode-go/deepseek-v4-pro opencode-go/minimax-m3 opencode-go/qwen3.8-flash opencode-go/kimi-k2.7-code opencode-go/glm-5.3}"
+# 兜底層：訂閱層也用盡才用。免費但品質不穩（or-free 隨機分配 OpenRouter 免費模型；
+# agnes 免費帳號常 429，2026-10-07 實測 225s 過），所以排在訂閱之後——使用者定的順序。
+# 走 OmniRoute（dc 從 ~/.creds/kv 帶 OMNIROUTE_API_KEY）。設空字串＝不用。
+POOL_TAIL="${DCQ_POOL_TAIL-omniroute/or-free omniroute/openai-compatible-chat-agnes/agnes-2.0-flash}"
+FREE_ROUNDS="${DCQ_FREE_ROUNDS:-2}"
+JOBS="${DCQ_JOBS:-4}"
+JOBS_MAX=8
+# 借鏡 LiteLLM Router 的 allowed_fails / cooldown_time 語意（舊名 DCQ_BREAK_* 相容）
+ALLOW="${DCQ_ALLOWED_FAILS:-${DCQ_BREAK_N:-2}}"
+COOL_S="${DCQ_COOLDOWN_S:-${DCQ_BREAK_S:-120}}"
+MODEL_MAX="${DCQ_MODEL_MAX:-3}"      # 單一模型同時最多幾張；滿了就分給下一隻，不在忙的模型上排隊
+# watchdog：opencode 的 chunkTimeout 有洞（#43519 keepalive 歸零、#48675 零 chunk 卡住不報錯），
+# 所以外面再看一層「.out 多久沒長」。事件是 step 級不是 token 級（2026-10-02 實測），
+# 長推理的正常 step 本來就會靜默數分鐘 —— 門檻太緊會誤殺。2026-10-04 用 opencode.db 量過 longcat
+# 376 個正常 step：靜默 >300s 約 1%、>180s 3.5%，降門檻誤殺重跑比省下的等待貴，維持 300。
+# 2026-10-09 改 200（≈PASS 最大靜默 162×1.25，留 25% 餘量）：gaps.tsv 工單層級 39 張 PASS 最大靜默 p95=159、max=162，沒有一張落在
+# 163–299；13 次停滯全部撞滿 300 才殺（合計 65 分白等）。分布是兩群，200 切在中間。10-04 的
+# step 數據主要來自 longcat，它已進懲罰層。每次停滯省 100s。180 試過：162 只差 18s，近邊警告會一直亮，餘量太薄。
+# ponytail: 全域單一門檻；dcq rank 會在 PASS 最大靜默 ≥ 0.9×STALL_S 時警告——出現就是門檻太緊，
+# 再改 per-model 門檻（該模型 PASS 最大靜默 ×1.3）。
+STALL_S="${DCQ_STALL_S:-200}"
+JOB_MAX="${DCQ_JOB_MAX:-2700}"       # 整張工單（含所有模型）的總時限，防失控迴圈燒 Go 額度（#52092）
+POLL_S="${DCQ_POLL_S:-5}"
+# .out 是模型 transcript 原文，可能有憑證：先建 600 空檔、跑完遮罩、過期刪除（issue #5）
+MASK="${DCQ_MASK-$HOME/.claude/tools/fi-mask-transcript.mjs}"
+LOG_DAYS="${DCQ_LOG_DAYS:-14}"
+
+die() { echo "dcq: $*" >&2; exit 2; }
+init() { mkdir -p "$Q"/{pending,running,done,failed,logs} "$Q/.cwdlock" "$Q/.cancel" "$Q/.health" "$Q/.inuse"; }
+# git-bash 只有 sha1sum，macOS/Linux 只有 shasum；兩者同為 SHA-1，鎖 key 跨平台一致
+_sha1() { if command -v shasum >/dev/null 2>&1; then shasum; else sha1sum; fi; }
+hash12() { printf '%s' "$1" | _sha1 | cut -c1-12; }
+now() { date +%s; }
+fk() { printf '%s' "${1//\//_}"; }   # 模型名當檔名用：opencode-go/x 的斜線會被當成子目錄
+
+# --- per-model 健康：連續 ALLOW 次上游失敗就冷卻 COOL_S 秒 ------------------------
+# 跨進程共享計數但不用鎖：計數＝目錄裡的檔案數，bump 是 touch、reset 是 rm，
+# 沒有 read-modify-write 就沒有 critical section 可搶。
+# （更早一版用 mkdir 當全域鎖包住讀寫，worker 之間互相卡死——多餘的同步本身才是 bug。）
+bump_fail() {
+  local m="$1" d="$Q/.health/$(fk "$1").fails" n
+  mkdir -p "$d"; : > "$d/$$.$RANDOM"
+  n=$(ls -1 "$d" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$n" -ge "$ALLOW" ]; then
+    echo $(( $(now) + COOL_S )) > "$Q/.health/$(fk "$m").cool"
+    rm -f "$d"/* 2>/dev/null
+    echo "dcq: 冷卻 $m —— 連續 ${ALLOW} 次上游失敗，${COOL_S}s 內不派" >&2
+  fi
+}
+reset_fail() { rm -rf "$Q/.health/$(fk "$1").fails" "$Q/.health/$(fk "$1").cool"; }
+# 錯誤簽章：.out 去掉 dc:/dcq 開頭的行後取最後 3 行。真 dc 每次都印
+# "dc: opencode run rc=1"，不排除的話任何上游失敗都會撞成同簽章。
+err_sig() { grep -v -e '^dc:' -e '^dcq' "$1" 2>/dev/null | tail -3; }
+cool_left() { local u; u=$(cat "$Q/.health/$(fk "$1").cool" 2>/dev/null || echo 0); echo $(( u > $(now) ? u - $(now) : 0 )); }
+
+# per-model 併發槽：mkdir 原子搶 .inuse/<model>.<k>，k=1..MODEL_MAX
+take_slot() {
+  local k
+  for k in $(seq 1 "$MODEL_MAX"); do
+    mkdir "$Q/.inuse/$(fk "$1").$k" 2>/dev/null && { echo "$Q/.inuse/$(fk "$1").$k"; return 0; }
+  done
+  return 1
+}
+
+# 從 $2 這個池挑下一隻：依序跳過「本單試過的」「冷卻中的」「槽滿的」。印：
+#   PICK <model> <slot>
+#   BUSY        有沒試過的但槽滿 —— 只是忙，等它讓出來
+#   COOL <秒>   沒試過的全在冷卻 —— 這個池現在是掛的
+#   NONE        全試過了
+pick_model() {
+  local tried=" $1 " m left soonest=0 any=0 busy=0 slot
+  for m in $2; do
+    case "$tried" in *" $m "*) continue ;; esac
+    any=1
+    left=$(cool_left "$m")
+    if [ "$left" -gt 0 ]; then
+      { [ "$soonest" -eq 0 ] || [ "$left" -lt "$soonest" ]; } && soonest=$left
+      continue
+    fi
+    slot=$(take_slot "$m") && { echo "PICK $m $slot"; return 0; }
+    busy=1
+  done
+  if [ "$busy" = 1 ]; then echo BUSY
+  elif [ "$any" = 1 ]; then echo "COOL $soonest"
+  else echo NONE; fi
+}
+
+# --- add ---------------------------------------------------------------------
+cmd_add() {
+  local task="${1:-}" cwd="${2:-$PWD}"
+  [ -n "$task" ] || die "用法：dcq add <task.md 絕對路徑> [cwd]"
+  case "$task" in /*) ;; *) die "task 路徑必須是絕對路徑：$task" ;; esac
+  [ -f "$task" ] || die "task 檔不存在：$task"
+  [ -d "$cwd" ] || die "cwd 不存在：$cwd"
+  cwd="$(cd "$cwd" && pwd)"
+
+  # 准入閘：沒有可跑的驗收區塊的工單不該佔 slot。用 dc 自己的閘，不另寫一套。
+  local ocbin="${DC_BIN:-$HOME/.deepclaude/deep-agent/bin}" dl wv
+  dl="$(command -v deep-lint || echo "$ocbin/deep-lint")"
+  wv="$(command -v wo-verify || echo "$ocbin/wo-verify")"
+  [ -x "$dl" ] && { "$dl" "$task" || die "deep-lint 未過，拒絕入列：$task"; }
+  [ -x "$wv" ] && { "$wv" "$task" --dry >/dev/null 2>&1 || die "驗收區塊語法錯，拒絕入列：$task"; }
+
+  local id="$(date +%s)-$$-$(basename "${task%.md}")"
+  printf 'TASK=%s\nCWD=%s\n' "$task" "$cwd" > "$Q/pending/$id.job"
+  echo "$id"
+}
+
+# --- 單一 job 執行：挑模型 + 盯梢 + exit code 分流 ----------------------------------
+# dc 的 exit code 契約（不另發明）：
+#   0   驗收全過
+#   1   deep-lint 未過（add 時已擋）／上游掛 —— 執行期視為上游，可換模型重試
+#   2   參數或契約錯 —— 工單本身壞掉，重試無意義
+#   124 逾時 —— 可換模型重試
+#   其他 驗收失敗行的 rc —— 模型做錯了，換模型再給一次機會
+mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || now; }
+
+# 停滯時殺之前先匯出 opencode session（只診斷，不改判定）。STALL_S 調門檻只是止血（fix 10309）：
+# 停滯都停在連續數個 Read 之後、log 無 ERROR、chunkTimeout=120s 也沒觸發，兩個假設待分辨——
+# ① 隱藏 reasoning 持續送 chunk（最後一則 assistant 有 reasoning part、沒有 running 的 tool）
+# ② 多工具呼叫漏派發（opencode#36804 變體：tool part 停在 running/pending）。
+# 存 <out 去掉 .out>.stall.json（遮罩、600）並把一行摘要印到 stderr 與 stalls.tsv。
+# 找不到 session、opencode 失敗都只略過：診斷不能拖累派工。
+stall_dump() {
+  local out="$1" cwd="$2" ta="$3" model="$4" sid js sum
+  [ "${DCQ_STALL_DUMP:-1}" = 1 ] || return 0
+  js="${out%.out}.stall.json"
+  sid=$(cd "$cwd" 2>/dev/null && timeout 20 opencode session list --format json -n 10 2>/dev/null \
+    | jq -r --arg d "$(cd "$cwd" && pwd)" --argjson t "$(( ta * 1000 ))" \
+      '[.[] | select(.directory == $d and .created >= $t)] | sort_by(.created) | last | .id // empty' 2>/dev/null)
+  [ -n "$sid" ] || { echo "dcq: stall_dump 找不到 session（${model}）" >&2; return 0; }
+  ( umask 077; cd "$cwd" && timeout 30 opencode export "$sid" > "$js" 2>/dev/null ) || { rm -f "$js"; return 0; }
+  sum=$(jq -r '.messages[-1] as $m | [
+      $m.info.role, ($m.info.time.completed != null),
+      ([$m.parts[] | select(.type == "tool") | "\(.tool):\(.state.status)"] | join(",")),
+      ([$m.parts[] | select(.type == "reasoning") | (.text // "" | length)] | add // 0)
+    ] | @tsv' "$js" 2>/dev/null) || sum="unparsable"
+  node "$MASK" "$js" "$js" >/dev/null 2>&1 || true
+  printf '%s\t%s\t%s\t%s\n' "$(date +%F_%T)" "$model" "$sid" "$sum" >> "$Q/logs/stalls.tsv"
+  echo "dcq: stall_dump $model $sid 最後一則[role done tools reasoning字數]=${sum}" >&2
+}
+
+# 跑一隻模型並盯著它。印 "<rc> <why>"，why ∈ exit|stall|jobmax。
+# 判活看 .out 的 mtime：opencode 每完成一個 part 就寫一行。dc 收尾的 wo-verify 期間
+# 也算在內——驗收指令本身若靜默超過 STALL_S 會被誤判，STALL_S 要比最慢的驗收寬。
+watch_oc() {
+  local id="$1" model="$2" task="$3" cwd="$4" t0="$5" paid="$6" out pid rc why=exit gap maxgap=0 t ta
+  ta=$(now)  # 這次嘗試的起點（t0 是整張工單的起點），算每隻模型實際花的秒數
+  out="$Q/logs/$id.$(fk "$model").out"
+  # 先建 600 空檔：底下的 `> "$out"` 只截斷不改權限，沒先建的話 .out 會吃預設 umask（644）
+  ( umask 077; : > "$out" )
+  # 鎖已由 claim_one 持有，告訴 dc 不要再拿一次。
+  DC_FREE_MODEL="$model" DC_LOCK_HELD=1 dc "$task" "$cwd" > "$out" 2>&1 &
+  pid=$!
+  echo "$pid" > "$Q/running/$id.pid"
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$POLL_S"
+    t=$(now); gap=$(( t - $(mtime "$out") ))
+    [ "$gap" -gt "$maxgap" ] && maxgap=$gap
+    if [ "$gap" -ge "$STALL_S" ]; then why=stall
+    elif [ $(( t - t0 )) -ge "$JOB_MAX" ]; then why=jobmax
+    else continue; fi
+    echo "dcq[$id] watchdog: $model ${why}（${gap}s 無輸出／已跑 $(( t - t0 ))s），殺掉" >&2
+    [ "$why" = stall ] && stall_dump "$out" "$cwd" "$ta" "$model"
+    killtree "$pid"; break
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  rm -f "$Q/running/$id.pid"
+  # 每次都記最大靜默間隔（STALL_S 的唯一校準依據）與這次嘗試的總秒數（自動重排的時間成本）
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%F_%T)" "$model" "$maxgap" "$rc" "$why" "$(( $(now) - ta ))" >> "$Q/logs/gaps.tsv"
+  # 模型標了工單瑕疵卻沒自己收手（多半又卡回去硬做），被 watchdog 殺掉：認那行走
+  # 工單契約錯 rc=2，不 bump_fail、不換模型。gaps.tsv 照記 stall —— 停滯真的發生了，
+  # 而且正是收緊 STALL_S 的校準依據，不該被這裡改寫掉。
+  if [ "$why" = stall ] && grep -q '^DC_TASK_DEFECT:' "$out" 2>/dev/null; then rc=2; why=exit; fi
+  # 跑完遮罩 .out（issue #5）。遮罩器會 console.log，stdout 必須丟掉——watch_oc 的
+  # stdout 被 $(...) 收成 "<rc> <why>"，漏出來會打壞 run_job 的解析。
+  # 遮罩不在或失敗只警告不中斷：fail loud，不 fail closed。
+  node "$MASK" "$out" "$out" >/dev/null 2>&1 || echo "dcq[$id] 警告：遮罩失敗，$out 保留原文" >&2
+  echo "$rc $why"
+}
+
+run_job() {
+  local jobfile="$1" id task cwd rc=0 why model slot tried="" n=0 t0 pick sig prevsig prevmodel
+  local pool="$MODELS" paid=0 pen=0 tail=0 round=1 left
+  id="$(basename "$jobfile" .job)"
+  task="$(sed -n 's/^TASK=//p' "$jobfile")"
+  cwd="$(sed -n 's/^CWD=//p' "$jobfile")"
+  t0=$(now)
+
+  while true; do
+    # 人工中止不是模型失敗：沒有這個檢查，kill 掉 dc 只會讓階梯換下一個模型重跑
+    # 同一張工單，工單永遠停不下來（issue #2）。
+    [ -e "$Q/.cancel/$id" ] && { rc=130; break; }
+    [ $(( $(now) - t0 )) -ge "$JOB_MAX" ] && { rc=124; echo "dcq[$id] 超過總時限 ${JOB_MAX}s" >&2; break; }
+    pick=$(pick_model "$tried" "$pool")
+    case "$pick" in
+      BUSY) sleep 2; continue ;;
+      NONE|COOL*)
+        # 免費層整輪試完：還有輪次就清空 tried 再來一輪（冷卻中的那幾隻會自動跳過）
+        if [ "$paid" = 0 ] && [ "$pick" = NONE ] && [ "$round" -lt "$FREE_ROUNDS" ]; then
+          round=$((round + 1)); tried=""
+          echo "dcq[$id] 免費層第 ${round} 輪重試" >&2; continue
+        fi
+        # 免費輪次用完，或免費模型全在冷卻 → 才動用訂閱層
+        if [ "$paid" = 0 ] && [ -n "$POOL_PAID" ]; then
+          paid=1; pool="$POOL_PAID"; tried=""; echo 'PAID=1' >> "$jobfile"
+          echo "dcq[$id] 免費層用盡（${pick%% *}），fallback 訂閱層：${POOL_PAID}" >&2; continue
+        fi
+        if [ "$pen" = 0 ] && [ -n "${POOL_PEN:-}" ]; then
+          pen=1; paid=1; pool="$POOL_PEN"; tried=""
+          echo "dcq[$id] 訂閱層用盡（${pick%% *}），fallback 懲罰層（免費累犯）：${POOL_PEN}" >&2; continue
+        fi
+        if [ "$tail" = 0 ] && [ -n "$POOL_TAIL" ]; then
+          tail=1; paid=1; pool="$POOL_TAIL"; tried=""
+          echo "dcq[$id] 訂閱層用盡（${pick%% *}），fallback 兜底層：${POOL_TAIL}" >&2; continue
+        fi
+        [ "$pick" = NONE ] && break
+        left=${pick#COOL }; sleep $(( left < 30 ? left : 30 )); continue ;;
+    esac
+    set -- $pick; model=$2; slot=$3
+    tried="$tried $model"; n=$((n + 1))
+    echo "dcq[$id] model=$model" >&2
+    set -- $(watch_oc "$id" "$model" "$task" "$cwd" "$t0" "$paid"); rc=$1; why=$2
+    rmdir "$slot" 2>/dev/null
+    [ -e "$Q/.cancel/$id" ] && { rc=130; break; }
+    case "$why:$rc" in
+      exit:0) reset_fail "$model"
+         mv "$jobfile" "$Q/done/$id.job"
+         echo "dcq[$id] PASS model=$model" >&2
+         return 0 ;;
+      # 總時限是工單的問題不是模型的：不罰模型、不再換
+      jobmax:*) rc=124; break ;;
+      stall:*) rc=124; bump_fail "$model"
+         echo "dcq[$id] $model 停滯，冷卻計數＋1，換下一個模型" >&2 ;;
+      exit:2) echo "dcq[$id] FATAL rc=2（工單契約錯，不重試）" >&2
+         break ;;
+      exit:1|exit:124)
+          # 本機確定性錯誤：不同模型連續兩次上游失敗且簽章相同 → 換誰都一樣，
+          # 停階梯、不罰模型（issue #6）。空簽章永不相等——既有測試的假 dc 在
+          # up* 不印上游錯，空簽章若算相同，免費全敗才升付費的案例會被誤判。
+          sig="$(err_sig "$Q/logs/$id.$(fk "$model").out")"
+          if [ -n "$sig" ] && [ "$sig" = "$prevsig" ] && [ "$model" != "$prevmodel" ]; then
+            reset_fail "$prevmodel"
+            rc=2
+            echo "dcq[$id] FATAL rc=2（本機確定性錯誤：$prevmodel 與 $model 同錯）" >&2
+            break
+          fi
+          bump_fail "$model"
+          echo "dcq[$id] 上游失敗 rc=${rc}，換下一個模型" >&2
+          prevsig=$sig prevmodel=$model ;;
+      *) echo "dcq[$id] 驗收未過 rc=${rc}，換下一個模型" >&2 ;;
+    esac
+  done
+
+  printf 'LAST_RC=%s\nTRIED=%s\n' "$rc" "$n" >> "$jobfile"
+  if [ -e "$Q/.cancel/$id" ]; then
+    echo 'CANCELLED=1' >> "$jobfile"
+    rm -f "$Q/.cancel/$id"
+    echo "dcq[$id] CANCELLED（不重試）" >&2
+  else
+    echo "dcq[$id] FAIL rc=${rc}（試過 $n 個模型：${tried# }）" >&2
+  fi
+  mv "$jobfile" "$Q/failed/$id.job"
+  return 1
+}
+
+# --- 搶單 ---------------------------------------------------------------------
+# 同檔系統的 mv 是 atomic rename，兩個 worker 搶同一張只有一個 mv 成功 —— 這本身
+# 就是鎖，不用另外再加一層。cwd 被別人佔就放回 pending 換下一張，不阻塞本 worker。
+# 印 "JOB|<檔>|<hash>"、"WAIT"（還有事在跑但現在搶不到）或 "DRAIN"（真的沒事了）。
+claim_one() {
+  local f id cwd h
+  # 免費終止是全域事實，不是單張工單的問題：一有警報就全隊停止收單，
+  # 已在跑的那張讓它跑完（殺掉會留半套產物，比跑完更難收拾）。
+  [ -e "$Q/.ALARM" ] && { echo DRAIN; return 0; }
+  for f in "$Q"/pending/*.job; do
+    [ -e "$f" ] || break
+    id="$(basename "$f" .job)"
+    mv "$f" "$Q/running/$id.job" 2>/dev/null || continue
+    cwd="$(sed -n 's/^CWD=//p' "$Q/running/$id.job")"
+    h="$(hash12 "$cwd")"
+    if mkdir "$Q/.cwdlock/$h" 2>/dev/null; then
+      # pid 要寫：dc 也搶同一把鎖，看不到 pid 會把這把當孤兒清掉
+      echo $$ > "$Q/.cwdlock/$h/pid"
+      echo "JOB|$Q/running/$id.job|$h"; return 0
+    fi
+    mv "$Q/running/$id.job" "$Q/pending/$id.job" 2>/dev/null
+  done
+  # 收工條件要同時看 running/：只看 pending 的話，所有 job 都在跑的那一瞬間
+  # pending 是空的，worker 會誤判收工提早退場，把還在跑的 job 留成孤兒。
+  if [ -z "$(ls -A "$Q/pending" 2>/dev/null)" ] && [ -z "$(ls -A "$Q/running" 2>/dev/null)" ]; then
+    echo DRAIN
+  else
+    echo WAIT
+  fi
+}
+
+worker() {
+  local claim jobfile h
+  while true; do
+    claim="$(claim_one)"
+    case "$claim" in
+      DRAIN) return 0 ;;
+      WAIT)  sleep 1; continue ;;
+    esac
+    jobfile="$(echo "$claim" | cut -d'|' -f2)"; h="$(echo "$claim" | cut -d'|' -f3)"
+    run_job "$jobfile"
+    rm -rf "$Q/.cwdlock/$h"
+  done
+}
+
+cmd_run() {
+  # .out 保留期限與權限（issue #5）：過期刪、剩下的收成 600。聚合檔（gaps.tsv 等）不動。
+  find "$Q/logs" -name '*.out' -mtime +"$LOG_DAYS" -delete 2>/dev/null
+  chmod 600 "$Q"/logs/*.out 2>/dev/null
+  [ "$JOBS" -ge 1 ] 2>/dev/null || die "DCQ_JOBS 必須是正整數"
+  # 上限硬夾 8：社群實測 1–5 並發穩定、10–32 崩，且官方只說 "traffic is monitored
+  # for abuse" 沒給數字。衝高並發的期望值是被 ban 不是更快。
+  [ "$JOBS" -le "$JOBS_MAX" ] || die "DCQ_JOBS=$JOBS 超過硬上限 $JOBS_MAX"
+  # 同時只准一個 runner：下面的孤兒回收會把「活著的 runner 正在跑的 job」也搬回 pending，
+  # 兩個 runner 就會同一張工單跑兩次。ponytail: 檢查與寫入非原子，兩個 run 同一毫秒啟動才會漏。
+  local rp; rp="$(cat "$Q/.runner.pid" 2>/dev/null || true)"
+  [ -n "$rp" ] && [ "$rp" != $$ ] && kill -0 "$rp" 2>/dev/null && die "dcq: 已有 runner 在跑（pid ${rp}）"
+  echo $$ > "$Q/.runner.pid"; trap 'rm -f "$Q/.runner.pid"' EXIT
+  # 上一輪被 kill 會留下孤兒：running/ 裡的 job 與沒人持有的 cwdlock。
+  # ponytail: 無人重跑 run 就沒人清，開機時無腦全收；同時只准一個 dcq run 在跑。
+  for f in "$Q"/running/*.job; do [ -e "$f" ] && mv "$f" "$Q/pending/"; done
+  rm -f "$Q"/running/*.pid 2>/dev/null
+  rm -rf "$Q"/.inuse/* 2>/dev/null   # 併發槽只屬於 dcq run，上一輪被殺留下的全是孤兒
+  # 鎖現在是 dc 和 dcq 共用的：只清沒人持有的，別把別人正在跑的 dc 的鎖掃掉
+  for l in "$Q"/.cwdlock/*; do
+    [ -d "$l" ] || continue
+    p="$(cat "$l/pid" 2>/dev/null || true)"
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && continue
+    rm -rf "$l"
+  done
+  [ -n "$(ls -A "$Q/pending" 2>/dev/null)" ] || { echo "dcq: pending 是空的"; return 0; }
+  [ -e "$Q/.ALARM" ] && die "dcq: 上一輪留下警報（$(cat "$Q/.ALARM")）。確認後刪掉 $Q/.ALARM 再跑"
+  local FCK; FCK="$(dirname "$0")/freecheck"
+  [ ! -x "$FCK" ] || DCQ_HOME="$Q" "$FCK" $MODELS || die "dcq: 中止——freecheck 警報"
+  echo "dcq: 起 $JOBS 個 slot，模型池：${MODELS}（每隻上限 ${MODEL_MAX}、停滯 ${STALL_S}s、總時限 ${JOB_MAX}s）" >&2
+  local i
+  for i in $(seq 1 "$JOBS"); do worker & done
+  wait
+  cmd_status
+}
+
+# --- cancel ------------------------------------------------------------------
+# 先立標記再殺，順序不能反：反過來的話 run_job 會在看到標記前就把 rc 當模型失敗，
+# 直接換下一個模型重跑。dc 是 bash 殼，殺它不會帶走 opencode，所以殺整棵樹。
+killtree() {
+  local p="$1" c
+  for c in $(pgrep -P "$p" 2>/dev/null); do killtree "$c"; done
+  kill -TERM "$p" 2>/dev/null || true
+}
+cmd_cancel() {
+  local id="${1:-}" pidf pid
+  [ -n "$id" ] || die "用法：dcq cancel <job-id>（id 見 dcq status）"
+  [ -e "$Q/pending/$id.job" ] || [ -e "$Q/running/$id.job" ] || die "沒有這張在跑或待跑的工單：$id"
+  : > "$Q/.cancel/$id"
+  pidf="$Q/running/$id.pid"
+  if [ -f "$pidf" ]; then
+    pid="$(cat "$pidf")"
+    killtree "$pid"
+    echo "dcq: 已標記取消並殺掉 ${id}（pid=$pid 及子程序）"
+  elif [ -e "$Q/pending/$id.job" ]; then
+    # 還在 pending 且沒人在跑它：直接結案，不留一張永遠不會被收走的標記
+    printf 'LAST_RC=130\nTRIED=0\nCANCELLED=1\n' >> "$Q/pending/$id.job"
+    if mv "$Q/pending/$id.job" "$Q/failed/$id.job" 2>/dev/null; then
+      rm -f "$Q/.cancel/$id"
+      echo "dcq: 已取消 ${id}（還沒開跑，移到 failed）"
+    else
+      echo "dcq: 已標記取消 ${id}（剛好被 worker 搶走，worker 收到標記就會停）"
+    fi
+  else
+    echo "dcq: 已標記取消 ${id}（running 但沒 pid，等 worker 收到標記就停）"
+  fi
+}
+
+cmd_status() {
+  local s
+  for s in pending running done failed; do
+    # 只算 .job：running/ 還放 .pid，全算的話 1 張在跑會顯示 running 2
+    printf '%-8s %s\n' "$s" "$(ls -1 "$Q/$s" 2>/dev/null | grep -c '\.job$')"
+  done
+  [ -n "$(ls -A "$Q/failed" 2>/dev/null)" ] && {
+    echo "--- failed ---"
+    for f in "$Q"/failed/*.job; do
+      echo "  $(basename "$f" .job)  $(sed -n 's/^LAST_RC=/rc=/p' "$f" | tr '\n' ' ')$(grep -q '^CANCELLED=1' "$f" && echo cancelled)"
+    done
+  }
+  echo "--- models ---"
+  local m left busy
+  for m in $MODELS $POOL_PAID ${POOL_PEN:-} $POOL_TAIL; do
+    left=$(cool_left "$m"); busy=$(ls -1d "$Q/.inuse/$(fk "$m")".* 2>/dev/null | wc -l | tr -d ' ')
+    printf '  %-32s busy=%s/%s %s\n' "$m" "$busy" "$MODEL_MAX" "$([ "$left" -gt 0 ] && echo "cooling ${left}s" || echo ok)"
+  done
+  return 0
+}
+
+# --- start -------------------------------------------------------------------
+# dcq run 是呼叫端的子行程：Claude Code 主 session 收工會連 runner 一起 SIGTERM
+# （2026-10-03 一晚連死兩次，工單卡在 running/）。start 把 runner 放進獨立 tmux server，
+# 跟 deep-run 的 tmux -L deep 同一招。看進度用 status 或 logs/runner.log。
+cmd_start() {
+  command -v tmux >/dev/null || die "dcq start 需要 tmux"
+  local sock="${DCQ_TMUX:-dcq}" self
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  tmux -L "$sock" has-session -t run 2>/dev/null && die "dcq: 已有 runner 在跑（tmux -L $sock attach -t run）"
+  tmux -L "$sock" new-session -d -s run \
+    "DCQ_HOME=$(printf %q "$Q") $(printf %q "$self") run -j $JOBS >> $(printf %q "$Q/logs/runner.log") 2>&1"
+  echo "dcq: runner 已脫離 session（tmux -L ${sock}；log：$Q/logs/runner.log）"
+}
+# --- wait --------------------------------------------------------------------
+# start 脫離後呼叫端拿不到完成訊號，agent 只能等人問才去看 status（2026-10-05）。
+# wait 純 shell 睡眠迴圈、零 token：agent 用 run_in_background 跑它，結束時 harness 會叫回來。
+# 不給 id 就等 pending+running 全空。rc：0 全過、1 有 failed、124 逾時。
+cmd_wait() {
+  local tmo="${DCQ_WAIT_MAX:-3600}" ids=() t0 id left rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --timeout) tmo="$2"; shift 2 ;; *) ids+=("$1"); shift ;; esac
+  done
+  t0=$(date +%s)
+  while :; do
+    left=0
+    if [ ${#ids[@]} -eq 0 ]; then
+      [ -n "$(ls "$Q"/pending/*.job "$Q"/running/*.job 2>/dev/null)" ] && left=1
+    else
+      for id in ${ids[@]+"${ids[@]}"}; do
+        [ -e "$Q/pending/$id.job" ] || [ -e "$Q/running/$id.job" ] && left=1
+      done
+    fi
+    [ "$left" = 0 ] && break
+    [ $(( $(date +%s) - t0 )) -ge "$tmo" ] && { echo "dcq wait: 逾時 ${tmo}s"; return 124; }
+    sleep "${DCQ_POLL_S:-15}"
+  done
+  for id in ${ids[@]+"${ids[@]}"}; do
+    if [ -e "$Q/done/$id.job" ]; then echo "PASS $id"
+    elif [ -e "$Q/failed/$id.job" ]; then echo "FAIL $id $(sed -n 's/^LAST_RC=/rc=/p' "$Q/failed/$id.job" | tail -1)"; rc=1
+    else echo "MISSING $id"; rc=1; fi
+  done
+  [ ${#ids[@]} -eq 0 ] && { cmd_status | sed -n 1,4p; [ -n "$(ls "$Q"/failed/*.job 2>/dev/null)" ] && rc=1; }
+  return $rc
+}
+cmd_clear() { rm -f "$Q"/{pending,running,done,failed}/*.job "$Q"/logs/*.out "$Q"/running/*.pid 2>/dev/null; rm -rf "$Q"/.cwdlock/* 2>/dev/null; rm -rf "$Q"/.health/* "$Q"/.inuse/* "$Q"/.cancel/* 2>/dev/null; echo "dcq: 已清空"; }
+
+init
+case "${1:-}" in
+  add)    shift; cmd_add "$@" ;;
+  run)    shift; [ "${1:-}" = "-j" ] && { JOBS="$2"; shift 2; }; cmd_run ;;
+  start)  shift; [ "${1:-}" = "-j" ] && { JOBS="$2"; shift 2; }; cmd_start ;;
+  status) cmd_status ;;
+  rank)   rank_free "${MODELS_MANUAL:-$MODELS}" table ;;
+  cancel) shift; cmd_cancel "$@" ;;
+  wait)   shift; cmd_wait "$@" ;;
+  clear)  cmd_clear ;;
+  *) cat >&2 <<'EOF'
+用法：
+  dcq add <task.md 絕對路徑> [cwd]   入列（跑 deep-lint + wo-verify --dry 准入閘）
+  dcq run [-j N]                     起 N 個 slot 併發跑到 pending 清空（預設 4，上限 8）
+  dcq start [-j N]                   同 run，但放進獨立 tmux 脫離呼叫端（從 agent session 派工用這個）
+  dcq status                         各狀態計數與失敗清單
+  dcq cancel <job-id>                取消一張工單（殺掉整棵程序樹，階梯不重試，移到 failed）
+  dcq wait [id...] [--timeout S]     睡到這些工單結案（不給 id＝等佇列清空）；rc 0 全過／1 有失敗／124 逾時
+  dcq clear                          清空佇列與日誌
+
+環境變數：
+  DCQ_HOME    佇列根目錄（預設 ~/.dcq）
+  DCQ_JOBS    並發數（預設 4，硬上限 8）
+  DCQ_POOL_GO        兜底池，排在 ZEN 後（預設 longcat-2.5-preview-free；設空字串＝停用）
+  DCQ_POOL_ZEN       主池手排（預設 nemotron-3-ultra space-bunny step-5 ling-3.1-flash mimo
+                     nemotron-3.5-lightning，皆 -free；
+                     實際順序由 autorank 依 gaps.tsv 重算，看 dcq rank）
+  DCQ_MODELS         有設就整條覆寫兩個免費池（舊介面）
+  DCQ_POOL_PAID      訂閱層，免費全敗或全冷卻才用（預設 7 個 opencode-go/ 模型，見檔頭；
+                     只准 opencode-go/ 前綴；設空字串＝永不動用）
+  DCQ_POOL_TAIL      兜底層，訂閱層也用盡才用（預設 omniroute/or-free omniroute/…/agnes-2.0-flash；
+                     設空字串＝不用）
+  DCQ_FREE_ROUNDS    免費層整輪重試幾輪才升級訂閱層（預設 2）
+  DCQ_MODEL_MAX      單一模型同時最多幾張（預設 3），滿了分給下一隻
+  DCQ_ALLOWED_FAILS  單一模型連續幾次上游失敗／停滯就冷卻（預設 2；舊名 DCQ_BREAK_N）
+  DCQ_COOLDOWN_S     冷卻秒數（預設 120；舊名 DCQ_BREAK_S）
+  DCQ_AUTORANK       1＝每次啟動依 logs/gaps.tsv 自動重排免費層（預設）；0＝照手排。`dcq rank` 看統計
+  DCQ_RANK_MIN       每隻至少幾筆樣本才參與重排（預設 10）；DCQ_RANK_WIN 只看最近幾筆（預設 30）
+  DCQ_RANK_STALL_PCT 停滯率達幾 % 就降到懲罰層（訂閱層之後，預設 30）；DCQ_RANK_PAROLE_D 天沒新樣本假釋回免費層（預設 7）
+  DCQ_RANK_ZERO_N    樣本達幾筆而 PASS 為 0 就直接降級，不等 DCQ_RANK_MIN（預設 3；0＝停用）
+  DCQ_STALL_S        輸出靜默幾秒判定停滯並換模型（預設 200；校準看 logs/gaps.tsv，dcq rank 近邊會警告）
+  DCQ_JOB_MAX        單張工單總時限秒數，含所有模型（預設 2700）
+  DCQ_MASK           .out 遮罩器（預設 ~/.claude/tools/fi-mask-transcript.mjs）
+  DCQ_LOG_DAYS       .out 保留幾天，過期刪（預設 14）
+EOF
+     exit 2 ;;
+esac
+exit
+}

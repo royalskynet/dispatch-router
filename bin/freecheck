@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# freecheck — 確認 Go lane 的免費模型「還是免費」。停止免費就終止並跳警報。
+#
+# 為什麼不能靠名字：dc 的 is_free() 比對 *-free 字尾，但 longcat-2.5-preview-free
+# 是「限時」無限，時限到了名字不會變、計費會變。名字是宣告，額度才是事實。
+#
+# 判準（任一成立即警報）：
+#   1. /zen/go/v1/usage 任一窗 status != ok      → lane 受限，繼續跑只會排隊或轉付費
+#   2. /zen/go/v1/usage 任一窗 percent > 0        → 只 WARN（已加白，見下方 case）
+#   3. 要用的 Go 模型從 /models 目錄消失          → 免費池收攤
+#
+# ponytail: 判準 2 的天花板——別處（hermes、opencode TUI）用 Go 付費模型也會讓
+# percent 上升，會誤報。寧可誤停不可誤花；確定是誤報就 DC_FREECHECK=off。
+#
+# exit 0 = 還免費（或不適用，例如純 Zen 模型）
+# exit 3 = 警報
+set -u
+
+[ "${DC_FREECHECK:-on}" = "off" ] && exit 0
+
+STATE="${DCQ_HOME:-$HOME/.dcq}"
+ALARM="$STATE/.ALARM"
+
+alarm() {
+  mkdir -p "$STATE" 2>/dev/null
+  printf '%s\n' "$1" > "$ALARM"
+  echo "freecheck: 警報 —— $1" >&2
+  echo "freecheck: 已寫 ${ALARM}，dcq 會停止收單。確認是誤報就刪掉它。" >&2
+  command -v hpush >/dev/null && hpush "🚨 dispatch-router freecheck: $1" >/dev/null 2>&1
+  exit 3
+}
+
+K="${OPENCODE_GO_API_KEY:-}"
+[ -n "$K" ] || K="$(tr -d '\r\n' < "$HOME/.creds/kv/OPENCODE_ZEN_API_KEY.txt" 2>/dev/null || true)"
+# 沒 key 就查不了計費——CLI 走自己的 auth.json 仍跑得動，不擋，但要出聲。
+[ -n "$K" ] || { echo "freecheck: 跳過（沒有 key 可查 Go 計費狀態）" >&2; exit 0; }
+
+H=(-H "Authorization: Bearer $K" -H "x-opencode-session: ses_freecheck00000000000000000" -A "dispatch-router-freecheck/1.0")
+
+u="$(curl -sS --max-time 15 https://opencode.ai/zen/go/v1/usage "${H[@]}" 2>/dev/null || true)"
+# 查不到就不擋（網路問題不是計費問題），但同樣出聲。
+[ -n "$u" ] || { echo "freecheck: 跳過（/usage 無回應）" >&2; exit 0; }
+
+verdict="$(printf '%s' "$u" | python3 -c '
+import sys, json
+try:
+    w = json.load(sys.stdin).get("usage", {})
+except Exception:
+    print("SKIP unparseable"); raise SystemExit
+bad = ["%s status=%s" % (k, v.get("status")) for k, v in w.items() if v.get("status") != "ok"]
+hot = ["%s %s%%" % (k, v.get("percent")) for k, v in w.items() if (v.get("percent") or 0) > 0]
+if bad: print("ALARM Go 額度窗受限：" + "、".join(bad))
+elif hot: print("WARN Go 額度已用：" + "、".join(hot))
+else: print("OK")
+' 2>/dev/null || echo "SKIP python")"
+
+# 加白（2026-10-02 用戶裁決）：Go lane 不是真 free，但 dc 用它吃訂閱額度屬可接受例外。
+# 判準 2 降為 WARN 不停單；額度窗受限（判準 1）與目錄消失（判準 3）仍警報。
+case "$verdict" in
+  ALARM*) alarm "${verdict#ALARM }" ;;
+  WARN*) echo "freecheck: ${verdict}（加白，不停單）" >&2 ;;
+  OK) ;;
+  *) echo "freecheck: 跳過（${verdict}）" >&2; exit 0 ;;
+esac
+
+# 目錄檢查只針對真的要用的 Go 模型；Zen 專屬的（big-pickle、nemotron 等）不在 Go
+# 目錄裡，缺席是正常的。
+catalog=""
+for m in "$@"; do
+  case "$m" in
+    longcat-2.5-preview-free) ;;
+    *) continue ;;
+  esac
+  [ -n "$catalog" ] || catalog="$(curl -sS --max-time 15 https://opencode.ai/zen/go/v1/models "${H[@]}" 2>/dev/null || true)"
+  [ -n "$catalog" ] || break
+  printf '%s' "$catalog" | grep -q "\"$m\"" || alarm "免費模型 $m 已從 Go 目錄消失"
+done
+
+exit 0

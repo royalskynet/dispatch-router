@@ -1,0 +1,124 @@
+---
+name: dc
+description: 派工給 opencode 執行人（走 opencode 客戶端，免認證、無 Anthropic 協定牆、可用整個 Zen 免費池、非免費模型發 TG 警示）：主 session 給計畫或一句任務＋一條驗收，dc 派工後由 wo-verify 機械判定成敗，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（自動 cwd 互斥、模型池＋per-model 冷卻、停滯 watchdog）。說「派 dc」「dc 去跑」「派工 opencode」時用。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時用後備 deep（任務檔要「後備理由：」行）。
+---
+
+# dc = opencode 免費池執行人，完成定義＝wo-verify 通過
+
+**預設派工執行人**：deep 自 2026-10-01 降為後備（`deep-run` 閘門要任務檔有「後備理由：」行），只補 dc 做不到的場景。dc 走 opencode 客戶端路徑，**免認證即可用**，且沒有 Anthropic 協定牆（整個 Zen 免費池都能用）。
+
+## dc 做不到的部分
+
+| 情境 | 誰做 |
+|---|---|
+| 讀 codebase／追依賴／單點小修／想快速試一個想法 | **dc** |
+| 要寫 `~/.claude/**`、`.git/config`、launchd | 主 session 直接做；需 agent 多步自主時用後備 deep |
+| 需要 `GH_TOKEN`（`gh search`／push／PR 等） | 主 session 直接做；需 agent 多步自主時用後備 deep |
+
+後備 deep：任務檔首行 `後備理由：<gh|GH_TOKEN|沙箱外寫入|.git/config|launchd|~/.claude|CLAUDE_CONFIG_DIR> 說明`，否則 `deep-run` 閘門 exit 3。
+
+## 任務檔
+
+**契約沿用舊 deep skill 的工單格式，全文在 `~/.claude/skills-disabled/deep/SKILL.md`，不在此重抄**（deep-lint／驗收 shell 區塊／「預期：」行／`## 禁止` 段／≤40 行）。
+
+dc 在派工前跑同一套閘門：`deep-lint` 不過就不派，`wo-verify <task.md> --dry`（旗標在檔名之後） 語法錯就不派。
+
+## 派工設計六條（免費池能不能用，取決於工單怎麼寫）
+
+免費池的限制不是額度，是**逾時、無 caching、可用性波動**。這六條是繞過三者的寫法，缺一條長任務就會斷在半路。
+
+1. **單輪不得有長時間無輸出的指令。** `504 Upstream idle timeout exceeded` 是**閒置**逾時，不是總時長上限——殺手是 `uv pip install`／`npm ci`／大型下載這種幾分鐘不吐 token 的步驟。這類指令由呼叫端先跑完，dc 只接需要判斷的部分。
+2. **一工單一目標。** 多步工單斷在第 N 步，前面全部白跑。拆成數張單步工單，每張自帶 `## 驗收`，用 `wo-verify` 的 rc 決定要不要重派；斷了只重跑那一張。
+3. **模型釘死，不用 auto 路由。** OmniRoute 的 `auto/best-free` 每次挑到不同 `dc/*`，而 `dc/*` 對外部 API 一律 `FreeTierError` 403 —— 必掛。走 `DC_FREE_MODEL` 指定單一模型。
+4. **驗收要寫成真斷言，而且未動工前必須失敗。**「預期：…」那行 wo-verify **不檢查**，只跑 shell 區塊看 exit code —— `echo x | ./foo.sh` 永遠 rc=0，模型做錯照樣 PASS。比對輸出寫 `[ "$(...)" = "..." ]`。dc 派工前會先在同一個 cwd 跑一次驗收當 **do-nothing 負向對照**：此刻就通過＝驗收是空包彈或工單是 no-op，當場 `exit 2` 不派工。確認既有狀態型的工單加一行 `NEG-CONTROL: n/a`。
+5. **工單寫成冪等。** 斷言寫「已存在就跳過」而非「建立」。重派不會破壞前一輪成果，這是能無腦重試的前提。
+6. **context 放檔案，不放 prompt。** Zen 免費池沒有 prompt caching，每輪重送 context 都是全價重算（Go lane 有，回應帶 `cached_tokens`；但工單大小本來就該由檔案承載）。工單給絕對路徑讓模型自己讀，禁止把檔案內容貼進任務檔。
+
+判斷式：**工單同時滿足「單步」「冪等」「輸入是路徑不是內容」才派 dc**，否則拆成多張 dcq 工單或主 session 直接做。
+
+## 派工
+
+```bash
+dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
+```
+
+- 任務檔路徑必須**絕對**。
+- 模型**計費分級不擋**：free／sub（訂閱額度）／metered（按量或沒查過的組合），非 free 照派，每筆記 `billing.tsv`，TG 10 分鐘最多一則（`DC_TG_EVERY`）。別家組合名帶 `-free` 不算 free，查過成員的只有 `omniroute/free-tools`。
+- 未指定模型時釘死 `space-bunny-free`，不吃 opencode config 的 per-agent 付費 model。
+- **停止免費就終止並跳警報**：派工前 `bin/freecheck` 查 `/zen/go/v1/usage`，任一額度窗 `status != ok`，或要用的 Go 免費模型從 `/models` 消失 → 寫 `~/.dcq/.ALARM`＋`hpush` 推播，`dc` rc=2 中止、`dcq` 全隊停止收單。名字有 `-free` 不代表還免費（Go 的免費是限時的），額度才是事實（`percent > 0` 只 WARN 不停：付費層和別處用 Go 都會讓它上升）。誤報就 `DC_FREECHECK=off`，或刪掉 `.ALARM`。
+- `--agent <name>` 可指定 opencode agent（控制工具權限），但模型仍由 dc 釘死。
+- **同一個 cwd 一次只准一個 dc**：`dc` 自己拿 `~/.dcq/.cwdlock/<hash>` 的原子鎖（與 `dcq` 同一把），撞上就 `exit 75` 並印持鎖者 pid，不會兩個 agent 寫同一目錄互相覆蓋。要排隊就 `DC_LOCK_WAIT=<秒>`。看到 rc=75 不是上游壞了，是有人在那個目錄跑，換目錄或等。
+- **評分器釘住，改驗收＝判篡改**：派工前 `wo-verify --dump` 把驗收腳本抽出存一份 pin，派工後用 `--pinned` 跑那一份並逐行比對工單當下的版本；不一致（含整段被刪）`exit 3`，絕不跑被改過的版本。看到 rc=3 不是工單瑕疵也不是上游壞了，是執行人動了評分器（fixindex 0372 §4／0373 的前例），要看 diff 查他到底有沒有做事。
+- **驗收重跑 K 次全過才算 PASS**：`DC_VERIFY_K` 預設 2。單次通過只代表「至少成功過一次」；第 2 次才失敗會印「驗收或改動不穩定（flaky）」，不要只憑第一次通過結案。驗收很慢時再降成 1。
+- **chunkTimeout WARN**：provider 沒設 `chunkTimeout` 時上游停滯會乾等（5 分鐘預設 v1.18.27 才有，更舊可能無上限，外觀等同卡死）。`dc` 只出聲不擋，看到 WARN 就去 `opencode.json` 設 `provider.<p>.options.chunkTimeout: 120000`。
+- 環境變數：`DC_FREE_EXTRA`（補免費白名單）、`DC_FREE_MODEL`（換預設免費模型）、`DC_FREECHECK=off`（關計費閘）、`DC_SKIP_LINT=1`（跳過 lint）、`DC_BIN`（wo-verify／deep-lint 所在目錄）、`DC_LOCK_WAIT`（撞鎖時等幾秒，預設 0＝不等）、`DC_NO_TIMEOUT_WARN=1`（關 chunkTimeout WARN）、`DC_NEGCTL=0`（關 do-nothing 負向對照）、`DC_NEGCTL_TIMEOUT`（負向對照逾時，預設 120s）、`DC_VERIFY_K`（驗收重跑次數，預設 2）。
+
+## 多張工單就用 dcq（併發跑者）
+
+一次派多張時不要自己開 N 個 `dc`：opencode 會對工作目錄做 snapshot、`wo-verify` 斷言又是相對路徑，兩張工單共用 cwd 會互相汙染（A 的產物讓 B 假過、B 的改動讓 A 假失敗）。`dcq` 把 cwd 互斥處理掉。
+
+```bash
+dcq add /abs/task1.md /path/to/repo-a
+dcq add /abs/task2.md /path/to/repo-b
+dcq start -j 4        # 從 agent session 派工用這個：runner 進獨立 tmux，session 收工不會連帶殺掉
+dcq run -j 4          # 前景跑（預設 4，硬上限 8）；掛在呼叫端底下，呼叫端死就跟著死
+dcq status            # 成敗總表
+dcq wait <id>...      # 睡到這些工單結案；agent 一律用 run_in_background 跑，結束時 harness 自動叫回（零 token）
+dcq cancel <job-id>   # 中止一張：殺整棵程序樹，階梯不重試，移到 failed 標 cancelled
+```
+
+**派完就掛 `dcq wait`**：`dcq add` 印出的 job id 全部收起來，`dcq start` 後立刻用 Bash `run_in_background` 跑 `dcq wait <ids>`。不掛 wait，agent 拿不到完成訊號，只能等人問才去看（2026-10-05 實例）。禁止改用 ScheduleWakeup／Monitor／sleep 輪詢。
+
+要停一張工單用 `dcq cancel`，不要自己 `kill` —— 直接 kill 會被當成模型失敗，自動換下一個模型重跑同一張。
+
+實測（2026-09-30，Go 訂閱後、`space-bunny-free`）：4 併發 4/4 PASS、8 併發 8/8 PASS，`opencode.db` WAL 零鎖衝突。CLI **沒有** `opencode-go/` provider，Go 模型直接掛 `opencode/` 底下。
+
+Go 的 HTTP lane（`/zen/go/v1`）**對外是通的**，跟被 `FreeTierError` 擋死的免費 Zen lane 不是同一道閘；只帶 Bearer 會回 400 `MissingSessionID`，還要 `x-opencode-session` 與自訂 User-Agent，模型用裸 id。細節見 README。但 HTTP 給的是推理不是 agent，改檔案仍得走 CLI。
+
+模型池：`DCQ_POOL_ZEN`（nemotron-3-ultra → space-bunny → step-5 → ling-3.1-flash → mimo）在前，`DCQ_POOL_GO`（longcat，40% 停滯）殿後兜底。每次啟動由 autorank 依 `gaps.tsv` 重算真實順序（`dcq rank` 看表），手排只是樣本不足時的後備。autorank 有兩道降級：停滯率 ≥30%（longcat），以及 ≥3 筆樣本而 0 PASS 的短路（nemotron-3.5-lightning，曾謊報驗收）。兩者都只降到免費層最後，過一張就自己回昇；`DCQ_MODELS` 有設就整條覆寫。`rc=1/124` 上游掛就換下一隻，`rc=2` 是工單契約錯不重試。
+
+- **per-model 冷卻**：同一隻連續 `DCQ_ALLOWED_FAILS`（2）次上游失敗或停滯 → 冷卻 `DCQ_COOLDOWN_S`（120）秒，只罰那一隻，不停全隊。
+- **權重：免費優先**：免費池跑滿 `DCQ_FREE_ROUNDS`（2）輪全敗，或免費模型全在冷卻，才 fallback 到 `DCQ_POOL_PAID`（Go 訂閱模型）；jobfile 標 `PAID=1`。設空＝永不動用。
+- **per-model 併發槽**：每隻最多 `DCQ_MODEL_MAX`（3）張，滿了分給下一隻。
+- **watchdog**：`.out` 靜默 ≥ `DCQ_STALL_S`（200）秒 → 殺掉、冷卻計數＋1、換下一隻。工單總時限 `DCQ_JOB_MAX`（2700）秒，超過就殺但不罰模型、不換。最大靜默間隔記在 `~/.dcq/logs/gaps.tsv`，收緊門檻前先看它。
+- `dcq status` 列出每隻模型的 `busy=n/max` 與冷卻剩餘秒數。
+
+## 驗收
+
+**exit code ＝ `wo-verify` 的 rc，不是模型的。** 模型回報 DONE 一律不算數。
+
+```bash
+dc <task.md> <cwd>; echo "rc=$?"   # 0 = 驗收重跑 K 次全過
+```
+
+反向也成立：驗收斷言不可能成立時，即使模型正常執行完，dc 仍回非 0。
+
+三道防假成功的閘，各有自己的退出碼：
+
+| rc | 意思 | 主 session 要做的事 |
+|---|---|---|
+| 0 | 驗收連過 `DC_VERIFY_K` 次（預設 2） | 結案 |
+| 2（派工前） | do-nothing 負向對照失敗：驗收未動工就通過 | 改驗收寫成真斷言，或加 `NEG-CONTROL: n/a` |
+| 3 | 驗收區塊與 pin 不一致＝執行人動了評分器 | 看 diff，查他有沒有真的做事，**不要**改 pin 再跑一次 |
+| 其它 | 驗收腳本首個失敗指令的 rc | 照常重派或自己修 |
+
+## 已知坑（實測）
+
+- **`--auto` 必開**：`permission.bash="ask"` 在 headless 下會被自動拒絕 —— 沒這道模型**一跑 bash 就死**（連 `ls` 都過不了），只能靠 write/edit 硬寫。dc 已內建，`DC_NO_AUTO=1` 可關。
+- **`--pure` 必開**：同一模型 4.5s vs 16s（`agentpet.js` 外掛佔 ~11s）。dc 已內建。
+- **`--dir` + `-f` 必給**：任務檔常在專案外，用 `--dir` 指定工作目錄、`-f` 附加任務檔。dc 已內建。
+- **message 必須放最前面**：`-f` 是陣列旗標，會把後續位置參數一起當附件路徑吞掉。
+- **驗收在 `--dir` 的目錄底下跑**：斷言用相對路徑，在呼叫端 cwd 跑會誤判 FAIL。dc 已處理。
+- **免費端點會突然掛**：實測 `ling-3.0-flash-fin-free` 回 `Upstream unavailable`。dc 不做自動 fallback，失敗就回報，換模型由呼叫端決定。
+- **模型很慢**：免費池的帳單是 wall-clock 不是 token。單一函式小修 17–20 秒，兩個函式加約束 4 分鐘。長任務不要用 dc。
+- **`504 Upstream idle timeout exceeded` 的根因是單輪閒置，不是總時長**（2026-09-30 實測：7 步工單死在 step 4 的 `uv venv`／`uv pip install`）。對策見上面五條第 1、2 點，不要靠重試硬碰。
+- **實測穩定度**（2026-09-30，經 zen_shim CLI 路徑，PONG 往返）：`big-pickle` 3.5–4.4s、`zen-space-bunny` 2.5–3.5s、`zen-nemotron` 4–20s，三輪全過；同時段走 OmniRoute 的 `auto/best-free` 三輪全掛、`free-tools` 21–47s 且間歇回 `[404]: 0 endpoints out of 9 requested`。**走 CLI 的穩，走 OmniRoute 的不穩。**
+
+## 不做
+
+- 跨多檔改動、長鏈重構、需要在合理時間內拿到結果的活 → 拆 dcq 或主 session 直接做。
+- 沙箱外寫入 → 主 session 直接做；要 agent 多步自主才用後備 deep。
+
+## 相依
+
+`wo-verify` 與 `deep-lint` 是通用任務檔檢查器，本 repo 不 vendored 一份（避免與 deep-agent 雙抄漂移）。dc 依序解析：`PATH` → `$DC_BIN`（預設 `~/.deepclaude/deep-agent/bin`）。裝了 `deep-agent` 即有。
