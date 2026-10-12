@@ -9,6 +9,8 @@ mkdir -p ~/.local/bin ~/.claude/skills
 ln -sfn "$REPO/bin/dc" ~/.local/bin/dc
 ln -sfn "$REPO/bin/dcq" ~/.local/bin/dcq
 ln -sfn "$REPO/bin/oc-free-check" ~/.local/bin/oc-free-check
+# PATH 上的 wo-verify 也由本 repo 提供（手動驗收、其他腳本用）；dc 自己不走 PATH
+ln -sfn "$REPO/bin/wo-verify" ~/.local/bin/wo-verify
 # 每日 06:00 探測免費模型（dcq rank 讀 ~/.dcq/logs/probe.tsv）
 cp "$REPO/launchd/com.51mini.dcq-probe.plist" ~/Library/LaunchAgents/
 launchctl bootout gui/$(id -u)/com.51mini.dcq-probe 2>/dev/null || true
@@ -22,7 +24,7 @@ fi
 ln -sfn "$REPO/skills/dc" ~/.claude/skills/dc
 
 echo "Installed symlinks:"
-for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/oc-free-check ~/.claude/skills/dc; do
+for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/oc-free-check ~/.local/bin/wo-verify ~/.claude/skills/dc; do
   ls -l "$t"
   [ -e "$t" ] || { echo "DANGLING: $t"; exit 1; }
 done
