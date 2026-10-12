@@ -6,7 +6,7 @@ set -u
 OC="$(cd "$(dirname "$0")/.." && pwd)/bin/dc"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/wa" "$T/wb" "$T/cfg/opencode"
-export PATH="$T/bin:$PATH"
+export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q"                  # 鎖根目錄
 export XDG_CONFIG_HOME="$T/cfg"         # 別碰使用者真的 opencode.json
 # DC_NEGCTL=0：這些測試的 wo-verify 是 `exit 0` 的假貨，do-nothing 對照會當場中止派工。

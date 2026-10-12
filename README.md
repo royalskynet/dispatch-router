@@ -86,16 +86,16 @@ The rest of this README is in Traditional Chinese.
 
 連結 `~/.local/bin/dc` 與 `~/.claude/skills/dc`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
 
-**相依**：`wo-verify`、`deep-lint` 來自 `deep-agent`，不在此 repo vendored（避免雙抄漂移）。需在 `PATH`，或設 `DC_BIN=<dir>` 指向 `deep-agent/bin`。
+**相依**：`wo-verify`、`deep-lint` 收在本 repo `bin/`，dc 直接用同目錄那份，不需要裝 `deep-agent`／deepclaude。`DC_BIN=<dir>` 只用來覆寫（測試注入假閘）。
 
 另需 `jq`：`dc` 有 7 處要用，其中 `bin/dc:135` 靠它深度合併 `OPENCODE_CONFIG_CONTENT`。`dcq start` 另需 `tmux`（`bin/dcq:408` 直接 die）；`dcq run` 不用。
 
 ### Windows（git-bash）
 
-`install.sh` 用 `ln -sfn`，Windows 沒有這個；`New-Item -ItemType SymbolicLink` 即使開了開發者模式也常要管理員權限。最省的做法是**跳過 symlink，直接把兩個 `bin` 目錄加進 git-bash 的 `PATH`**（寫進 `~/.bashrc`，git-bash 會讀）：
+`install.sh` 用 `ln -sfn`，Windows 沒有這個；`New-Item -ItemType SymbolicLink` 即使開了開發者模式也常要管理員權限。最省的做法是**跳過 symlink，直接把 `bin` 目錄加進 git-bash 的 `PATH`**（寫進 `~/.bashrc`，git-bash 會讀）：
 
 ```bash
-export PATH="$HOME/.deepclaude/dispatch-router/bin:$HOME/.deepclaude/deep-agent/bin:$PATH"
+export PATH="$HOME/.deepclaude/dispatch-router/bin:$PATH"
 ```
 
 `dc`／`dcq`／`wo-verify`／`deep-lint` 都是 bash script，**Windows 上只能經 git-bash 執行**，PowerShell 直接打不會動。裝完先確認六支都在：

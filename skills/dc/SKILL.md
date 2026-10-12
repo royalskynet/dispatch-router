@@ -51,7 +51,7 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 - **評分器釘住，改驗收＝判篡改**：派工前 `wo-verify --dump` 把驗收腳本抽出存一份 pin，派工後用 `--pinned` 跑那一份並逐行比對工單當下的版本；不一致（含整段被刪）`exit 3`，絕不跑被改過的版本。看到 rc=3 不是工單瑕疵也不是上游壞了，是執行人動了評分器（fixindex 0372 §4／0373 的前例），要看 diff 查他到底有沒有做事。
 - **驗收重跑 K 次全過才算 PASS**：`DC_VERIFY_K` 預設 2。單次通過只代表「至少成功過一次」；第 2 次才失敗會印「驗收或改動不穩定（flaky）」，不要只憑第一次通過結案。驗收很慢時再降成 1。
 - **chunkTimeout WARN**：provider 沒設 `chunkTimeout` 時上游停滯會乾等（5 分鐘預設 v1.18.27 才有，更舊可能無上限，外觀等同卡死）。`dc` 只出聲不擋，看到 WARN 就去 `opencode.json` 設 `provider.<p>.options.chunkTimeout: 120000`。
-- 環境變數：`DC_FREE_EXTRA`（補免費白名單）、`DC_FREE_MODEL`（換預設免費模型）、`DC_FREECHECK=off`（關計費閘）、`DC_SKIP_LINT=1`（跳過 lint）、`DC_BIN`（wo-verify／deep-lint 所在目錄）、`DC_LOCK_WAIT`（撞鎖時等幾秒，預設 0＝不等）、`DC_NO_TIMEOUT_WARN=1`（關 chunkTimeout WARN）、`DC_NEGCTL=0`（關 do-nothing 負向對照）、`DC_NEGCTL_TIMEOUT`（負向對照逾時，預設 120s）、`DC_VERIFY_K`（驗收重跑次數，預設 2）。
+- 環境變數：`DC_FREE_EXTRA`（補免費白名單）、`DC_FREE_MODEL`（換預設免費模型）、`DC_FREECHECK=off`（關計費閘）、`DC_SKIP_LINT=1`（跳過 lint）、`DC_BIN`（覆寫 wo-verify／deep-lint 所在目錄，預設 repo `bin/`，測試注入假閘用）、`DC_LOCK_WAIT`（撞鎖時等幾秒，預設 0＝不等）、`DC_NO_TIMEOUT_WARN=1`（關 chunkTimeout WARN）、`DC_NEGCTL=0`（關 do-nothing 負向對照）、`DC_NEGCTL_TIMEOUT`（負向對照逾時，預設 120s）、`DC_VERIFY_K`（驗收重跑次數，預設 2）。
 
 ## 多張工單就用 dcq（併發跑者）
 
@@ -121,4 +121,4 @@ dc <task.md> <cwd>; echo "rc=$?"   # 0 = 驗收重跑 K 次全過
 
 ## 相依
 
-`wo-verify` 與 `deep-lint` 是通用任務檔檢查器，本 repo 不 vendored 一份（避免與 deep-agent 雙抄漂移）。dc 依序解析：`PATH` → `$DC_BIN`（預設 `~/.deepclaude/deep-agent/bin`）。裝了 `deep-agent` 即有。
+`wo-verify` 與 `deep-lint` 收在本 repo `bin/`，dc／dcq 一律用同目錄那份，不走 PATH（PATH 上的 `wo-verify` 是 deepclaude 的 symlink）。dc 與 deepclaude 互不依賴：2026-10-12 起不再借 `~/.deepclaude/deep-agent/bin`，兩份各自演進；`test/dcq_test.sh` 斷言 `bin/` 不得引用 `~/.deepclaude`。

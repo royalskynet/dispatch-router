@@ -67,10 +67,11 @@ if [ -f "$OCJ" ] && command -v jq >/dev/null && jq -e '.provider.opencode.option
   echo "dc: 中止——${OCJ} 有 provider.opencode.options.baseURL 覆寫，會 405（fixindex 9775），刪掉該 provider 區塊" >&2; exit 2
 fi
 
-OCBIN="${DC_BIN:-$HOME/.deepclaude/deep-agent/bin}"
-WV="$(command -v wo-verify || true)"; [ -x "${WV:-/nonexistent}" ] || WV="$OCBIN/wo-verify"
-[ -x "$WV" ] || { echo "dc: 找不到 wo-verify（可設 DC_BIN=<dir>）" >&2; exit 2; }
-DL="$(command -v deep-lint || true)"; [ -x "${DL:-/nonexistent}" ] || DL="$OCBIN/deep-lint"
+# wo-verify／deep-lint 用 repo 自帶的那份（bin/ 同目錄），不走 PATH：PATH 上的 wo-verify
+# 是 deepclaude 的 symlink，dc 與 deepclaude 互不依賴。DC_BIN 只給測試注入假閘用。
+OCBIN="${DC_BIN:-$(dirname "$(readlink -f "$0")")}"
+WV="$OCBIN/wo-verify"; DL="$OCBIN/deep-lint"
+[ -x "$WV" ] || { echo "dc: 找不到 wo-verify：${WV}" >&2; exit 2; }
 
 # 沒有可跑的驗收區塊就不派工：模型做完也無法判定成敗，等於燒時間換一個不知道對不對的結果。
 if [ "${DC_SKIP_LINT:-0}" != 1 ] && [ -x "$DL" ]; then

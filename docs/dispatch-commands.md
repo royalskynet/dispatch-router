@@ -14,8 +14,8 @@
 | `wo-verify` | `wo-verify <WO.md> [--dry\|--dump\|--pinned <script>]` | dc 的機械裁判。`--dump` 抽驗收腳本、`--pinned` 比對防篡改 |
 | `deep-lint` | dc 內部呼叫 | 工單靜態檢查。名字有 deep 但沒隨 deep-run 停用 |
 
-`dc` 找 `wo-verify`／`deep-lint` 的順序：先 PATH，再 `$DC_BIN`（預設
-`~/.deepclaude/deep-agent/bin`）。
+`dc`／`dcq` 用 repo `bin/` 自帶的 `wo-verify`／`deep-lint`（`$DC_BIN` 可覆寫），不走 PATH；
+`~/.local/bin/wo-verify` 仍指向 deepclaude 那份，兩邊互不依賴（2026-10-12 起）。
 
 ### dc 的三道防假成功閘（2026-10-11 加）
 
