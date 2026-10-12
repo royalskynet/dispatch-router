@@ -10,7 +10,7 @@ OC="$(cd "$(dirname "$0")/.." && pwd)/bin/dc"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 T="$(cd "$T" && pwd -P)"   # macOS /var → /private/var，要和 git worktree list 印的一致
 mkdir -p "$T/bin" "$T/cfg/opencode"
-export PATH="$T/bin:$PATH" DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
+export DC_BIN="$T/bin" PATH="$T/bin:$PATH" DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
 # DC_NEGCTL=0：這些測試的 wo-verify 是 `exit 0` 的假貨，do-nothing 對照會當場中止派工。
 # 負向對照本身由 dc_verify_gate_test.sh 驗。
 export DC_FREECHECK=off DC_NO_TIMEOUT_WARN=1 DC_NEGCTL=0

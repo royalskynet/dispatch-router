@@ -6,10 +6,10 @@
 # 用真的 wo-verify（這裡測的就是它和 dc 的接線），假的只有 opencode 與 deep-lint。
 set -u
 DC="$(cd "$(dirname "$0")/.." && pwd)/bin/dc"
-WV="$(command -v wo-verify || echo "$HOME/.deepclaude/deep-agent/bin/wo-verify")"
+WV="$(cd "$(dirname "$0")/.." && pwd)/bin/wo-verify"   # repo 自帶那份，不走 PATH（PATH 上是 deepclaude 的）
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/w" "$T/cfg/opencode"
-export PATH="$T/bin:$PATH"
+export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
 export DC_FREECHECK=off DC_NO_TIMEOUT_WARN=1
 unset DC_LOCK_HELD

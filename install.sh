@@ -28,6 +28,8 @@ for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/oc-free-check ~/.claude/s
 done
 
 echo
-echo "相依：wo-verify 與 deep-lint（來自 deep-agent，需在 PATH 或設 DC_BIN）。"
-if command -v wo-verify >/dev/null; then echo "  wo-verify  ok"; else echo "  wo-verify  缺 — 先跑 deep-agent/install.sh"; fi
-if command -v deep-lint >/dev/null; then echo "  deep-lint  ok"; else echo "  deep-lint  缺 — 先跑 deep-agent/install.sh"; fi
+# wo-verify／deep-lint 已收進 bin/，dc 直接用同目錄那份，不依賴 deepclaude／deep-agent。
+for g in wo-verify deep-lint; do
+  [ -x "$REPO/bin/$g" ] || { echo "MISSING: $REPO/bin/$g"; exit 1; }
+done
+echo "  wo-verify／deep-lint：repo 自帶（bin/）"

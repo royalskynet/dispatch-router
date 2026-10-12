@@ -4,7 +4,7 @@
 set -u
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 export DCQ_HOME="$T/q"; mkdir -p "$T/bin" "$T/wa" "$T/wb"
-export PATH="$T/bin:$PATH"
+export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 # freecheck 會打真的上游：Go 付費額度只要 >0% 就警報，整個自檢會被擋在開跑前。
 # 這裡測佇列不測計費，關掉。
 # 同 dc_lock_test.sh：假 wo-verify 一律 exit 0，關掉 do-nothing 對照。
@@ -120,6 +120,9 @@ dcq clear >/dev/null
 #    （20c5395 修過一次，pool 改版又踩一次）。一律寫成 ${VAR}。
 R="$(cd "$(dirname "$0")/.." && pwd)"
 chk "bin/ 無 \$VAR 緊貼全形字元" "$(LC_ALL=C grep -lE '\$[A-Za-z_][A-Za-z0-9_]*[^ -~]' "$R"/bin/* | wc -l | tr -d ' ')" "0"
+# dc 與 deepclaude 互不依賴：wo-verify／deep-lint 用 bin/ 自帶那份，不准再指回 ~/.deepclaude
+chk "bin/ 不引用 ~/.deepclaude 路徑" "$(grep -lE '\.deepclaude|deep-agent/bin' "$R"/bin/* | wc -l | tr -d ' ')" "0"
+chk "bin/ 自帶 wo-verify 與 deep-lint" "$( [ -x "$R/bin/wo-verify" ] && [ -x "$R/bin/deep-lint" ] && echo ok)" "ok"
 
 # 7) watchdog 停滯：hang 在 m1 上靜默 → 被殺、換 m2 過關、m1 進冷卻、gaps.tsv 有記錄
 : > "$TRACE"

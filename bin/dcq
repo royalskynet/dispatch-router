@@ -237,9 +237,9 @@ cmd_add() {
   cwd="$(cd "$cwd" && pwd)"
 
   # 准入閘：沒有可跑的驗收區塊的工單不該佔 slot。用 dc 自己的閘，不另寫一套。
-  local ocbin="${DC_BIN:-$HOME/.deepclaude/deep-agent/bin}" dl wv
-  dl="$(command -v deep-lint || echo "$ocbin/deep-lint")"
-  wv="$(command -v wo-verify || echo "$ocbin/wo-verify")"
+  # 跟 dc 同一份 repo 自帶閘（bin/ 同目錄），不走 PATH 上 deepclaude 的那份
+  local ocbin="${DC_BIN:-$(dirname "$(readlink -f "$0")")}" dl wv
+  dl="$ocbin/deep-lint"; wv="$ocbin/wo-verify"
   [ -x "$dl" ] && { "$dl" "$task" || die "deep-lint 未過，拒絕入列：$task"; }
   [ -x "$wv" ] && { "$wv" "$task" --dry >/dev/null 2>&1 || die "驗收區塊語法錯，拒絕入列：$task"; }
 

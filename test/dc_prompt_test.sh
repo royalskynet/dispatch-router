@@ -7,7 +7,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DC="$REPO/bin/dc"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/w" "$T/cfg"
-export PATH="$T/bin:$PATH"
+export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
 # DC_NEGCTL=0：這些測試的 wo-verify 是 `exit 0` 的假貨，do-nothing 對照會當場中止派工。
 # 負向對照本身由 dc_verify_gate_test.sh 驗。
