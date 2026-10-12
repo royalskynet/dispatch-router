@@ -4,6 +4,29 @@
 
 與 [`deep-agent`](https://github.com/royalskynet/deep-agent) 平行：deep 走 deepclaude 在沙箱外跑，dc 走 opencode 客戶端路徑。
 
+## Quick install／快速安裝
+
+```bash
+git clone https://github.com/royalskynet/dispatch-router && cd dispatch-router && ./install.sh
+```
+
+需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`oc-free-check` 連到 `~/.local/bin`、註冊每日探測免費模型的 launchd job、把 skill 連到 `~/.claude/skills/dc`。
+
+## English
+
+**dispatch-router** wraps [opencode](https://opencode.ai) as a task executor for coding agents: one task file goes in, and the work comes back only when a machine check says it is done.
+
+- `dc <task.md> [cwd]` dispatches one work order. The exit code is the exit code of the task's own acceptance script (`wo-verify`), not the model's claim of success.
+- Before dispatching, a lint gate refuses tasks without a runnable acceptance block, and a do-nothing control run rejects acceptance checks that would pass without any work.
+- The acceptance script is pinned before the run; if the executor edits it, the run is judged as tampering (rc=3). Acceptance is re-run K times (default 2) to catch flaky results.
+- `dcq` runs many work orders in parallel with per-directory locks, a model pool with per-model cooldown, and a stall watchdog.
+- Model billing tiers are checked before each dispatch; paid models still run but trigger a Telegram warning.
+
+Use plain `opencode run` if you only need a model to try something once. dc is for when "done" has to be decided by a script, not by the model.
+
+The rest of this README is in Traditional Chinese.
+
+
 ## dc 到底比 `opencode run` 多什麼
 
 只有這幾樣是真的多了東西，其餘都是把原生旗標設好預設值：
@@ -208,7 +231,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 
 ## 每日探測（oc-free-check）
 
-launchd `com.host.dcq-probe` 每天 08:15 跑 `oc-free-check -p opencode --tsv ~/.dcq/logs/probe.tsv`：起一個 `opencode serve`，對每個免費模型送「Reply with just: ok」，記狀態、秒數、原因（TSV 第 6 欄）。08:15 是免費額度 00:00 UTC 重置之後；06:00 會量到前一天用完的額度。
+launchd job `dcq-probe`（`launchd/` 內的 plist）每天 08:15 跑 `oc-free-check -p opencode --tsv ~/.dcq/logs/probe.tsv`：起一個 `opencode serve`，對每個免費模型送「Reply with just: ok」，記狀態、秒數、原因（TSV 第 6 欄）。08:15 是免費額度 00:00 UTC 重置之後；06:00 會量到前一天用完的額度。
 
 狀態分級（`prompt_async` 後輪詢 `/session/status`，opencode 遇限流會自己重試，同步呼叫只會卡到逾時）：
 
