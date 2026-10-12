@@ -18,7 +18,7 @@ chk() { # name tsv_history results_py want_grep
   local log="$T/push.log" tsv="$T/probe.tsv"
   : > "$log"; printf '%s' "$2" > "$tsv"
   HPUSH_LOG="$log" python3 - "$tsv" "$3" <<'PY' || { echo "FAIL $1: 腳本錯誤"; fail=1; return; }
-import importlib.util, sys, ast
+import importlib.util, importlib.machinery, sys, ast
 spec = importlib.util.spec_from_loader("ofc", importlib.machinery.SourceFileLoader("ofc", "bin/oc-free-check"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.append_tsv(sys.argv[1], ast.literal_eval(sys.argv[2]))
