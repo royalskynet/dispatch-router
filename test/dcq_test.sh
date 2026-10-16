@@ -18,7 +18,7 @@ cat > "$T/bin/dc" <<'EOF'
 #!/usr/bin/env bash
 task="$1"; cwd="$2"; n="$(basename "$task" .md)"
 echo "IN $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
-case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; *) sleep 1 ;; esac
+case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; *) sleep 1 ;; esac
 echo "OUT $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
 case "$n" in
   local*) echo "Error: Unexpected error"; echo "no such column: project_id"; echo "dc: opencode run rc=1" ;;
@@ -162,6 +162,14 @@ chk "超時進 failed rc=124" "$(grep -h '^LAST_RC=' "$DCQ_HOME"/failed/*.job)" 
 chk "超時不換模型" "$(grep -c '^IN slow3' "$TRACE")" "1"
 chk "超時不罰 m1" "$(DCQ_MODELS="m1 m2" dcq status | grep -c cooling)" "0"
 
+# 10b) 單隻上限：m1 一直有輸出（不觸發 stall）但不收工 → 撞 ATTEMPT_MAX 被殺、換 m2 過關，不是整張吃滿 JOB_MAX
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk busy1 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_ATTEMPT_MAX=4 DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=1 dcq run -j 1 >"$T/am.out" 2>&1
+chk "單隻超時換 m2 過關" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "1"
+chk "m1 沒跑滿 30s" "$(grep -c '^OUT busy1 .* m1 ' "$TRACE")" "0"
+chk "gaps.tsv 記 slow" "$(grep -c $'\tm1\t.*\tslow\t' "$DCQ_HOME/logs/gaps.tsv")" "1"
+
 # 11) 權重：免費兩隻 × 2 輪全上游失敗，才 fallback 訂閱層
 dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
 mk up2 "$T/wb"
@@ -171,12 +179,18 @@ chk "訂閱層只跑 1 次" "$(grep -c '^IN up2 .* go/px ' "$TRACE")" "1"
 chk "過關且標 PAID=1" "$(grep -h '^PAID=1' "$DCQ_HOME"/done/*.job 2>/dev/null | wc -l | tr -d ' ')" "1"
 chk "免費全敗之前沒碰訂閱層" "$(awk '/^IN up2/{print $4}' "$TRACE" | tail -1)" "go/px"
 
-# 11b) 懲罰層（免費累犯）排在訂閱層之後、兜底層之前；兜底層最後：免費、訂閱全敗才用；兜底過關就停
+# 11b) 免費的層全部排在付費之前：免費→懲罰（免費累犯）→兜底（免費）；兜底過關就停，不碰訂閱層（2026-10-13 使用者定）
 dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
 mk tl1 "$T/wb"
 DCQ_MODELS="m1" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="t/a t/b" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/tail.out" 2>&1
-chk "順序＝免費→訂閱→懲罰（累犯）→兜底" "$(awk '/^IN tl1/{print $4}' "$TRACE" | tr '\n' ' ')" "m1 go/px p/x t/a "
+chk "順序＝免費→懲罰→兜底，兜底過關不碰訂閱" "$(awk '/^IN tl1/{print $4}' "$TRACE" | tr '\n' ' ')" "m1 p/x t/a "
 chk "兜底過關" "$(ls "$DCQ_HOME"/done/ 2>/dev/null | wc -l | tr -d ' ')" "1"
+# 11c) 訂閱層（付費）墊底：免費、懲罰、兜底全敗才用
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk up3 "$T/wb"
+DCQ_MODELS="m1" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="t/a" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/last.out" 2>&1
+chk "順序＝免費→懲罰→兜底→訂閱" "$(awk '/^IN up3/{print $4}' "$TRACE" | tr '\n' ' ')" "m1 p/x t/a go/px "
+chk "訂閱墊底過關且標 PAID" "$(grep -c '^PAID=1' "$DCQ_HOME"/done/*up3*.job 2>/dev/null)" "1"
 
 # 12) 免費全在冷卻＝免費掛了 → 不等冷卻，直接走訂閱層
 dcq clear >/dev/null; : > "$TRACE"

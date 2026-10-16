@@ -30,6 +30,8 @@ Q="${DCQ_HOME:-$HOME/.dcq}"
 POOL_GO="${DCQ_POOL_GO-longcat-2.5-preview-free}"  # space-bunny-free 2026-10-07 從 Go 下架（改付費 space-bunny）
 # 2026-10-07 同一張修 bug 工單重測：longcat 30s → nemotron-3-ultra 45s → nemotron-3.5-lightning 151s 過；
 # muse-spark-1.3-contributor／mimo-v2.6-flash／big-pickle／space-bunny-free 420s 無產出，移出池。
+# （2026-10-14 更正：opencode.db 顯示 10-07 12:00～10-08 02:00 這 4 隻全部 0 輸出 token、同時段 nemotron／longcat 正常，
+#   是上游不回（額度／排隊）不是模型壞，移出屬誤判；現在由 zero_output 記 why=upstream 不記模型的帳。）
 # ponytail: 移出的幾隻沒有自動回測，要恢復得手動重跑同一張工單再加回來。
 # 2026-10-09 同一張 slugify 工單 7 隻並跑（每隻 1 樣本）：space-bunny 20s → longcat 28s → mimo 44s
 # → step-5 55s → nemotron-3-ultra 71s → ling-3.1-flash 77s 過；nemotron-3.5-lightning 100s 自稱過但驗收 FAIL。
@@ -38,14 +40,14 @@ POOL_GO="${DCQ_POOL_GO-longcat-2.5-preview-free}"  # space-bunny-free 2026-10-07
 # ponytail: 每隻累積 10 筆真實工單（gaps.tsv）就依停滯率與通過率重排；樣本少，排序只當暫定。
 # nemotron-3.5-lightning-free 留在手排裡，但 2026-10-09 起由 RANK_ZERO_N 短路自動墊底
 # （5 跑 0 PASS、1 停滯，且有一次自稱完成而驗收 FAIL）。先前是直接從這行移出，改回來的理由：
-# 寫死移出的不會自動回測，而短路只是降到懲罰層（訂閱層之後）——它仍會被試到，7 天沒新樣本還會假釋回免費層。
+# 寫死移出的不會自動回測，而短路只是降到懲罰層（免費層之後）——它仍會被試到，7 天沒新樣本還會假釋回免費層。
 POOL_ZEN="${DCQ_POOL_ZEN-nemotron-3-ultra-free space-bunny-free step-5-preview-free ling-3.1-flash-free mimo-v2.6-flash-free nemotron-3.5-lightning-free}"
 # 2026-10-09 依 gaps.tsv＋runner.log 重排：longcat 20 跑 8 停滯（40%）、PASS 3；nemotron-3-ultra
 # 11 跑 0 停滯、PASS 4，最大靜默 153s。longcat 移到整個免費層最後，仍排在付費層之前（免費優先）。
 MODELS="${DCQ_MODELS:-$POOL_ZEN $POOL_GO}"
-# 自動重排免費層（每次 dcq 啟動都算，零 token）：讀 gaps.tsv 每隻最近 RANK_WIN 筆，扣掉 rc=2
+# 自動重排免費層（每次 dcq 啟動都算，零 token）：讀 gaps.tsv 每隻最近 RANK_WIN 筆，扣掉 rc=2 與 why=upstream
 # （工單契約錯，不算模型的帳）。樣本 ≥RANK_MIN 的才算「合格」：
-#   - 停滯率 ≥RANK_STALL_PCT% → 降到懲罰層 POOL_PEN（訂閱層之後、兜底層之前；2026-10-09 起，原本在免費層最後）
+#   - 停滯率 ≥RANK_STALL_PCT% → 降到懲罰層 POOL_PEN（免費層之後、兜底層之前；2026-10-09 起，原本在免費層最後）
 #   - 其餘合格的在「合格者原本占的位置」裡依「每 PASS 一張平均花幾秒」重排（越少越前）：
 #     分子＝這些嘗試的總秒數（含卡住、失敗白等的時間），分母＝PASS 數。等待時間和通過率一起算。
 #     舊紀錄沒有秒數欄（第 6 欄），用最大靜默秒數代替（偏低，但卡住那筆≈STALL_S，白等的時間有算到）
@@ -63,7 +65,7 @@ RANK_ZERO_N="${DCQ_RANK_ZERO_N:-3}"   # 設 0＝停用短路
 #   - 樣本不足（manual）的位置裡依探測秒數排序，沒探測資料的排在有資料的後面
 # 真實工單的每 PASS 秒數仍是主排序：探測只送「回 ok」，量得到活著與反應快慢，量不到寫碼能力。
 PROBE_MAX_H="${DCQ_PROBE_MAX_H:-36}"
-# 累犯（zero／demoted）不留在免費層尾巴，而是放進懲罰層 POOL_PEN，排在訂閱層之後、兜底層之前：
+# 累犯（zero／demoted）不留在免費層尾巴，而是放進懲罰層 POOL_PEN，排在免費層之後、兜底層之前（2026-10-13 起訂閱層墊底）：
 # 免費層有 FREE_ROUNDS 輪重試，累犯留在免費層等於每張工單白等它卡兩次（longcat 471 s/pass）。
 # 假釋：最近一筆樣本超過 RANK_PAROLE_D 天就回免費層 manual 位置重給機會——放到訂閱層後面
 # 幾乎不會被試到，不假釋就永遠累積不到新樣本翻身。
@@ -75,27 +77,31 @@ rank_free() {  # $1=手排順序（空白分隔）；mode=table 時印統計表
   local pc; pc="$(date -v-"${RANK_PAROLE_D}"d +%F_%T 2>/dev/null || date -d "-${RANK_PAROLE_D} days" +%F_%T)"
   awk -F'\t' -v order="$1" -v min="$RANK_MIN" -v win="$RANK_WIN" -v sp="$RANK_STALL_PCT" \
       -v zn="$RANK_ZERO_N" -v mode="${2:-order}" -v pf="$pf" -v cut="$cut" -v pc="$pc" -v stall="${STALL_S:-200}" '
-    FILENAME==pf { if ($1>=cut) { if ($1>pl) pl=$1; PT[$1,$3]=PT[$1,$3] (PT[$1,$3]=="" ? "" : ",") $4 ":" $5 } next }
+    # QUOTA＝額度用完（08:00 重置），不是壞，當沒資料
+    FILENAME==pf { if ($1>=cut && $4!="QUOTA") { if ($1>pl) pl=$1; PT[$1,$3]=PT[$1,$3] (PT[$1,$3]=="" ? "" : ",") $4 ":" $5 } next }
     $4==0 && $3+0>pgmax { pgmax=$3+0; pgm=$2 }
     { m=$2; LT[m]=$1; k=++cnt[m]; R[m,k]=$4; W[m,k]=$5; D[m,k]=($6!="" ? $6 : $3) }
     END {
       nm=split(order, L, " ")
       for (i=1; i<=nm; i++) {
         m=L[i]; n=0; p=0; s=0; d=0; st=cnt[m]-win+1; if (st<1) st=1
-        for (k=st; k<=cnt[m]; k++) { if (R[m,k]==2) continue; n++; d+=D[m,k]; if (R[m,k]==0) p++; if (W[m,k]=="stall") s++ }
+        for (k=st; k<=cnt[m]; k++) { if (R[m,k]==2 || W[m,k]=="upstream") continue; n++; d+=D[m,k]; if (R[m,k]==0) p++; if (W[m,k]=="stall" || W[m,k]=="slow") s++ }
         N[i]=n; P[i]=p; S[i]=s; pr[i]=(n ? p/n : 0)
         sp_[i]=(p ? d/p : 1e9); sc[i]=-sp_[i]   # 分數越大越前：每 PASS 秒數取負
         st_="manual"
         if (zn>0 && n>=zn && p==0) st_="zero"   # 短路：一張都沒過，不等 RANK_MIN
-        else if (n>=min) { if (s*100>=sp*n) st_="demoted"; else { st_="ranked"; q[++nq]=i } }
+        else if (n>=min) { if (s*100>=sp*n) st_="demoted"; else st_="ranked" }
         if ((st_=="zero" || st_=="demoted") && LT[m]<pc) st_="manual"   # 假釋
         if (st_=="zero" || st_=="demoted") dm[++nd]=i
         # 探測：同一 model 多 provider 時任一 OK 就算活著，秒數取最小
         ps[i]=""; pok[i]=1e8
         if (pl!="" && (pl,m) in PT) { ps[i]="down"; np=split(PT[pl,m], pp, ",")
           for (z=1; z<=np; z++) { split(pp[z], kv, ":"); if (kv[1]=="OK") { ps[i]="ok"; if (kv[2]+0<pok[i]) pok[i]=kv[2]+0 } } }
+        # ranked 要等探測判完才進 q：先進 q 再改 probe-down 的話，它會在輸出時佔掉別隻合格者的位置
+        #（2026-10-13：nemotron 出現兩次、93% 的 space-bunny 整隻消失）
         if (ps[i]=="down" && st_!="zero" && st_!="demoted") { st_="probe-down"; pd[++npd]=i }
         else if (st_=="manual") mq[++nmq]=i
+        else if (st_=="ranked") q[++nq]=i
         tag[i]=st_
       }
       # manual 位置依探測秒數升冪（無資料＝1e8，同分維持手排順序）
@@ -115,17 +121,41 @@ rank_free() {  # $1=手排順序（空白分隔）；mode=table 時印統計表
         for (i=1; i<=nm; i++) printf "%-34s %4d %4d %4d %5.0f%% %8s %7s  %s\n", L[i], N[i], P[i], S[i], pr[i]*100, (P[i] ? sprintf("%.0f", sp_[i]) : "-"), (ps[i]=="ok" ? sprintf("%.0fs", pok[i]) : (ps[i]=="" ? "-" : "down")), tag[i]
         if (pl!="") print "探測批次：" pl
         print "順序：" out
-        print "懲罰層（訂閱層之後）：" pen
+        print "懲罰層（免費層之後）：" pen
         if (pgmax >= 0.9*stall) printf "⚠ 成功工單最大靜默 %ds（%s）已逼近 STALL_S=%d，門檻可能太緊會誤殺\n", pgmax, pgm, stall
       } else print out "|" pen
     }' "$pf" "$f"
 }
+# 名單同步（每次啟動算，零 token）：官方改名／下架／新上架時免改上面寫死的清單。
+# 依據＝probe.tsv 最新一批（≤PROBE_MAX_H）provider=opencode 的列：GONE 移出；OK 但不在清單的接到尾巴，
+# 當 manual 進 autorank（探測秒數排位置，0 PASS 短路自動進懲罰層）。改名＝舊名 GONE＋新名 OK，兩條規則一起處理。
+# POOL_SKIP：刻意不收的免費模型（預設空）。big-pickle／muse-spark 10-07 曾 420s 無產出移出，
+# 2026-10-14 CLI 實打 4s／3s 回 ok，依使用者裁決收回；寫碼品質交給 autorank 的 0 PASS 短路判。
+# DCQ_MODELS 有設或 DCQ_POOLSYNC=0 不同步；`dcq rank` 印這次增刪。
+POOL_SKIP="${DCQ_POOL_SKIP-}"
+pool_sync_zen() {  # $1=清單；印「新清單|新增|移出」
+  local pf="$Q/logs/probe.tsv"; [ -s "$pf" ] || { echo "$1||"; return; }
+  local cut; cut="$(date -v-"${PROBE_MAX_H}"H +%F_%T 2>/dev/null || date -d "-${PROBE_MAX_H} hours" +%F_%T)"
+  awk -F'\t' -v order="$1" -v skip="$POOL_SKIP" -v cut="$cut" '
+    $1>=cut && $2=="opencode" { if ($1>pl) { pl=$1; nk=0; split("", S) } if ($1==pl) { if (!($3 in S)) K[++nk]=$3; S[$3]=$4 } }
+    END {
+      n=split(order, L, " "); split(skip, X, " "); for (i in X) sk[X[i]]=1
+      for (i=1; i<=n; i++) { in_[L[i]]=1; if (S[L[i]]=="GONE") rm=rm (rm?" ":"") L[i]; else out=out (out?" ":"") L[i] }
+      for (k=1; k<=nk; k++) { m=K[k]; if (S[m]=="OK" && !(m in in_) && !(m in sk)) { out=out (out?" ":"") m; add=add (add?" ":"") m } }
+      print out "|" add "|" rm
+    }' "$pf"
+}
+SYNC_NOTE=""
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ]; then
+  _s="$(pool_sync_zen "$MODELS")"; [ -z "${_s%%|*}" ] || MODELS="${_s%%|*}"; _s="${_s#*|}"   # 全移光就維持原清單
+  [ -z "${_s%%|*}" ] || SYNC_NOTE="新增 ${_s%%|*}；"; [ -z "${_s#*|}" ] || SYNC_NOTE="${SYNC_NOTE}移出 ${_s#*|}；"
+fi
 POOL_PEN="${DCQ_POOL_PEN-}"   # 手動指定只在不自動排名時有效（測試用）；自動排名會覆寫
 if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
   MODELS_MANUAL="$MODELS"; _r="$(rank_free "$MODELS")"; MODELS="${_r%%|*}"; POOL_PEN="${_r#*|}"
 fi
 # 權重：免費層優先。只有免費模型整輪試過 FREE_ROUNDS 次都失敗，或免費模型全部在冷卻
-# （＝免費掛了），才 fallback 到訂閱層。訂閱層只准 opencode-go/（扣 Go 訂閱額度）——
+# （＝免費掛了），才往下走懲罰層 → 兜底層 → 訂閱層（2026-10-13 起訂閱墊底）。訂閱層只准 opencode-go/（扣 Go 訂閱額度）——
 # 走到這層 dc 會發 TG 警示。設空字串＝永不動用訂閱。
 # 收錄：Go 額度 per-model 各自計（opencode.ai/docs/go），多放幾隻＝容量相加；跳過與 Zen
 # 免費池同底模的（免費版掛了它多半也掛）、額度 <1k/月的（kimi-k3、qwen3.8-max、grok）與慢的
@@ -140,7 +170,25 @@ fi
 # ponytail: 單一簡單工單、每隻 1 樣本，只分得出快慢和明顯壞的；真實工單累積後再依通過率重排。
 # 額度用完的模型會連敗進冷卻，自動跳下一隻，所以排序不必顧額度。
 POOL_PAID="${DCQ_POOL_PAID-opencode-go/glm-5.3-flash opencode-go/deepseek-v4.1-flash opencode-go/deepseek-v4-pro opencode-go/minimax-m3 opencode-go/qwen3.8-flash opencode-go/kimi-k2.7-code opencode-go/glm-5.3}"
-# 兜底層：訂閱層也用盡才用。免費但品質不穩（or-free 隨機分配 OpenRouter 免費模型；
+# 訂閱層名單同步：讀 opencode-go-sync 每天 09:00 寫的 state（≤48h 才採用）。upstream 沒有的移出；
+# first_seen 不是 base（＝同步上線後才出現）的非 -free 新模型接到尾巴。上線前就有、刻意沒收的不會被加回。
+GO_STATE="${DCQ_GO_STATE:-$HOME/.omniroute/backups/opencode-go-sync-state.json}"
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ] && [ -s "$GO_STATE" ] && command -v jq >/dev/null; then
+  _cut="$(date -v-48H +%FT%T 2>/dev/null || date -d '-48 hours' +%FT%T)"
+  _s="$(jq -r --arg pool "$POOL_PAID" --arg cut "$_cut" '
+    select((.at // "") >= $cut and (.upstream | length) > 0)
+    | (.upstream) as $up | (.first_seen // {}) as $fs
+    | ($pool | split(" ") | map(select(length > 0))) as $p
+    | ($p | map(ltrimstr("opencode-go/") as $m | select(any($up[]; . == $m)) | "opencode-go/" + $m)) as $keep
+    | ($p - $keep) as $rm
+    | ([$up[] | select(($fs[.] // "base") != "base" and (endswith("-free") | not)) | "opencode-go/" + .] - $p) as $add
+    | "\(($keep + $add) | join(" "))|\($add | join(" "))|\($rm | join(" "))"' "$GO_STATE" 2>/dev/null)"
+  if [ -n "${_s%%|*}" ]; then
+    POOL_PAID="${_s%%|*}"; _s="${_s#*|}"
+    [ -z "${_s%%|*}" ] || SYNC_NOTE="${SYNC_NOTE}訂閱新增 ${_s%%|*}；"; [ -z "${_s#*|}" ] || SYNC_NOTE="${SYNC_NOTE}訂閱移出 ${_s#*|}；"
+  fi
+fi
+# 兜底層：免費層與懲罰層用盡才用，排在訂閱層之前（2026-10-13 使用者定：免費的先用完）。免費但品質不穩（or-free 隨機分配 OpenRouter 免費模型；
 # agnes 免費帳號常 429，2026-10-07 實測 225s 過），所以排在訂閱之後——使用者定的順序。
 # 走 OmniRoute（dc 從 ~/.creds/kv 帶 OMNIROUTE_API_KEY）。設空字串＝不用。
 POOL_TAIL="${DCQ_POOL_TAIL-omniroute/or-free omniroute/openai-compatible-chat-agnes/agnes-2.0-flash}"
@@ -162,6 +210,10 @@ MODEL_MAX="${DCQ_MODEL_MAX:-3}"      # 單一模型同時最多幾張；滿了�
 # 再改 per-model 門檻（該模型 PASS 最大靜默 ×1.3）。
 STALL_S="${DCQ_STALL_S:-200}"
 JOB_MAX="${DCQ_JOB_MAX:-2700}"       # 整張工單（含所有模型）的總時限，防失控迴圈燒 Go 額度（#52092）
+# 單隻模型一次嘗試的上限。一直有輸出（無限 Glob/Read，opencode#50678）不會觸發 STALL_S，
+# 沒有這道就一路吃到 JOB_MAX、整張判 jobmax 不換模型——fallback 鏈形同沒有。
+# 600 ≈ gaps.tsv PASS 單次最長 294s ×2（2026-10-13，n=11）。撞到＝why=slow，罰冷卻、換下一隻。
+ATTEMPT_MAX="${DCQ_ATTEMPT_MAX:-600}"
 POLL_S="${DCQ_POLL_S:-5}"
 # .out 是模型 transcript 原文，可能有憑證：先建 600 空檔、跑完遮罩、過期刪除（issue #5）
 MASK="${DCQ_MASK-$HOME/.claude/tools/fi-mask-transcript.mjs}"
@@ -190,6 +242,13 @@ bump_fail() {
   fi
 }
 reset_fail() { rm -rf "$Q/.health/$(fk "$1").fails" "$Q/.health/$(fk "$1").cool"; }
+# 上游不回（why=upstream）直接冷卻 UPSTREAM_COOL_S，不等 ALLOW 次：額度用完或排隊時同一隻再試只會再白等
+# STALL_S（10-07 實例 4 隻×2 輪×200s）。冷卻檔是跨工單共用的，併發中的其他工單也會跳過它。
+UPSTREAM_COOL_S="${DCQ_UPSTREAM_COOL_S:-900}"
+cool_upstream() {
+  echo $(( $(now) + UPSTREAM_COOL_S )) > "$Q/.health/$(fk "$1").cool"; rm -rf "$Q/.health/$(fk "$1").fails"
+  echo "dcq: 冷卻 $1 —— 上游不回，${UPSTREAM_COOL_S}s 內不派" >&2
+}
 # 錯誤簽章：.out 去掉 dc:/dcq 開頭的行後取最後 3 行。真 dc 每次都印
 # "dc: opencode run rc=1"，不排除的話任何上游失敗都會撞成同簽章。
 err_sig() { grep -v -e '^dc:' -e '^dcq' "$1" 2>/dev/null | tail -3; }
@@ -261,6 +320,14 @@ mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || now; }
 # 停滯都停在連續數個 Read 之後、log 無 ERROR、chunkTimeout=120s 也沒觸發，兩個假設待分辨——
 # ① 隱藏 reasoning 持續送 chunk（最後一則 assistant 有 reasoning part、沒有 running 的 tool）
 # ② 多工具呼叫漏派發（opencode#36804 變體：tool part 停在 running/pending）。
+# 上游不回（2026-10-14）：整個 session 的 assistant 訊息全是 0 輸出 token、沒有任何 part＝模型一個字都沒收到。
+# 成因多是免費額度用完時 opencode 每 3 秒靜默重試、不寫 log（anomalyco/opencode#45989，dc 的 429 log 攔截抓不到），
+# 或上游排隊。10-07 big-pickle／muse／mimo／space-bunny 同時段全 0 輸出被當模型壞掉移出池，事後證實是誤判。
+# watch_oc 記 why=upstream：照樣冷卻換模型，但 rank_free 不算進模型樣本。
+zero_output() {  # $1=opencode export JSON；是＝rc 0
+  jq -e '[.messages[] | select(.info.role == "assistant")] as $a
+    | ($a | length) > 0 and all($a[]; (.info.tokens.output // 0) == 0 and ((.parts // []) | map(select(.type != "step-start")) | length) == 0)' "$1" >/dev/null 2>&1
+}
 # 存 <out 去掉 .out>.stall.json（遮罩、600）並把一行摘要印到 stderr 與 stalls.tsv。
 # 找不到 session、opencode 失敗都只略過：診斷不能拖累派工。
 stall_dump() {
@@ -272,6 +339,7 @@ stall_dump() {
       '[.[] | select(.directory == $d and .created >= $t)] | sort_by(.created) | last | .id // empty' 2>/dev/null)
   [ -n "$sid" ] || { echo "dcq: stall_dump 找不到 session（${model}）" >&2; return 0; }
   ( umask 077; cd "$cwd" && timeout 30 opencode export "$sid" > "$js" 2>/dev/null ) || { rm -f "$js"; return 0; }
+  zero_output "$js" && STALL_UPSTREAM=1
   sum=$(jq -r '.messages[-1] as $m | [
       $m.info.role, ($m.info.time.completed != null),
       ([$m.parts[] | select(.type == "tool") | "\(.tool):\(.state.status)"] | join(",")),
@@ -282,7 +350,7 @@ stall_dump() {
   echo "dcq: stall_dump $model $sid 最後一則[role done tools reasoning字數]=${sum}" >&2
 }
 
-# 跑一隻模型並盯著它。印 "<rc> <why>"，why ∈ exit|stall|jobmax。
+# 跑一隻模型並盯著它。印 "<rc> <why>"，why ∈ exit|stall|slow|jobmax。
 # 判活看 .out 的 mtime：opencode 每完成一個 part 就寫一行。dc 收尾的 wo-verify 期間
 # 也算在內——驗收指令本身若靜默超過 STALL_S 會被誤判，STALL_S 要比最慢的驗收寬。
 watch_oc() {
@@ -301,9 +369,11 @@ watch_oc() {
     [ "$gap" -gt "$maxgap" ] && maxgap=$gap
     if [ "$gap" -ge "$STALL_S" ]; then why=stall
     elif [ $(( t - t0 )) -ge "$JOB_MAX" ]; then why=jobmax
+    elif [ $(( t - ta )) -ge "$ATTEMPT_MAX" ]; then why=slow
     else continue; fi
     echo "dcq[$id] watchdog: $model ${why}（${gap}s 無輸出／已跑 $(( t - t0 ))s），殺掉" >&2
-    [ "$why" = stall ] && stall_dump "$out" "$cwd" "$ta" "$model"
+    STALL_UPSTREAM=0; [ "$why" = stall ] && stall_dump "$out" "$cwd" "$ta" "$model"
+    [ "$STALL_UPSTREAM" = 1 ] && { why=upstream; echo "dcq[$id] $model 整段 0 輸出，判上游不回（額度／排隊），不記模型的帳" >&2; }
     killtree "$pid"; break
   done
   wait "$pid" 2>/dev/null; rc=$?
@@ -323,7 +393,7 @@ watch_oc() {
 
 run_job() {
   local jobfile="$1" id task cwd rc=0 why model slot tried="" n=0 t0 pick sig prevsig prevmodel
-  local pool="$MODELS" paid=0 pen=0 tail=0 round=1 left
+  local pool="$MODELS" paid=0 pen=0 tail=0 sub=0 round=1 left
   id="$(basename "$jobfile" .job)"
   task="$(sed -n 's/^TASK=//p' "$jobfile")"
   cwd="$(sed -n 's/^CWD=//p' "$jobfile")"
@@ -343,18 +413,19 @@ run_job() {
           round=$((round + 1)); tried=""
           echo "dcq[$id] 免費層第 ${round} 輪重試" >&2; continue
         fi
-        # 免費輪次用完，或免費模型全在冷卻 → 才動用訂閱層
-        if [ "$paid" = 0 ] && [ -n "$POOL_PAID" ]; then
-          paid=1; pool="$POOL_PAID"; tried=""; echo 'PAID=1' >> "$jobfile"
-          echo "dcq[$id] 免費層用盡（${pick%% *}），fallback 訂閱層：${POOL_PAID}" >&2; continue
-        fi
+        # 免費輪次用完，或免費模型全在冷卻 → 先把免費的層用完：懲罰層（免費累犯）→ 兜底層，
+        # 訂閱層（opencode-go，2026-10-07 起付費）墊底（2026-10-13 使用者定）。paid＝已離開主免費層。
         if [ "$pen" = 0 ] && [ -n "${POOL_PEN:-}" ]; then
           pen=1; paid=1; pool="$POOL_PEN"; tried=""
-          echo "dcq[$id] 訂閱層用盡（${pick%% *}），fallback 懲罰層（免費累犯）：${POOL_PEN}" >&2; continue
+          echo "dcq[$id] 免費層用盡（${pick%% *}），fallback 懲罰層（免費累犯）：${POOL_PEN}" >&2; continue
         fi
         if [ "$tail" = 0 ] && [ -n "$POOL_TAIL" ]; then
           tail=1; paid=1; pool="$POOL_TAIL"; tried=""
-          echo "dcq[$id] 訂閱層用盡（${pick%% *}），fallback 兜底層：${POOL_TAIL}" >&2; continue
+          echo "dcq[$id] 免費層用盡（${pick%% *}），fallback 兜底層：${POOL_TAIL}" >&2; continue
+        fi
+        if [ "$sub" = 0 ] && [ -n "$POOL_PAID" ]; then
+          sub=1; paid=1; pool="$POOL_PAID"; tried=""; echo 'PAID=1' >> "$jobfile"
+          echo "dcq[$id] 免費的層全用盡（${pick%% *}），fallback 訂閱層（付費）：${POOL_PAID}" >&2; continue
         fi
         [ "$pick" = NONE ] && break
         left=${pick#COOL }; sleep $(( left < 30 ? left : 30 )); continue ;;
@@ -372,8 +443,10 @@ run_job() {
          return 0 ;;
       # 總時限是工單的問題不是模型的：不罰模型、不再換
       jobmax:*) rc=124; break ;;
-      stall:*) rc=124; bump_fail "$model"
-         echo "dcq[$id] $model 停滯，冷卻計數＋1，換下一個模型" >&2 ;;
+      upstream:*) rc=124; cool_upstream "$model"
+         echo "dcq[$id] $model upstream，換下一個模型" >&2 ;;
+      stall:*|slow:*) rc=124; bump_fail "$model"
+         echo "dcq[$id] $model ${why}，冷卻計數＋1，換下一個模型" >&2 ;;
       exit:2) echo "dcq[$id] FATAL rc=2（工單契約錯，不重試）" >&2
          break ;;
       exit:1|exit:124)
@@ -592,7 +665,7 @@ case "${1:-}" in
   run)    shift; [ "${1:-}" = "-j" ] && { JOBS="$2"; shift 2; }; cmd_run ;;
   start)  shift; [ "${1:-}" = "-j" ] && { JOBS="$2"; shift 2; }; cmd_start ;;
   status) cmd_status ;;
-  rank)   rank_free "${MODELS_MANUAL:-$MODELS}" table ;;
+  rank)   rank_free "${MODELS_MANUAL:-$MODELS}" table; echo "名單同步：${SYNC_NOTE:-無變動}"; echo "訂閱層：$POOL_PAID" ;;
   cancel) shift; cmd_cancel "$@" ;;
   wait)   shift; cmd_wait "$@" ;;
   clear)  cmd_clear ;;
@@ -614,9 +687,9 @@ case "${1:-}" in
                      nemotron-3.5-lightning，皆 -free；
                      實際順序由 autorank 依 gaps.tsv 重算，看 dcq rank）
   DCQ_MODELS         有設就整條覆寫兩個免費池（舊介面）
-  DCQ_POOL_PAID      訂閱層，免費全敗或全冷卻才用（預設 7 個 opencode-go/ 模型，見檔頭；
+  DCQ_POOL_PAID      訂閱層（付費），免費／懲罰／兜底全用盡才用（預設 7 個 opencode-go/ 模型，見檔頭；
                      只准 opencode-go/ 前綴；設空字串＝永不動用）
-  DCQ_POOL_TAIL      兜底層，訂閱層也用盡才用（預設 omniroute/or-free omniroute/…/agnes-2.0-flash；
+  DCQ_POOL_TAIL      兜底層，免費與懲罰層用盡才用、排在訂閱層之前（預設 omniroute/or-free omniroute/…/agnes-2.0-flash；
                      設空字串＝不用）
   DCQ_FREE_ROUNDS    免費層整輪重試幾輪才升級訂閱層（預設 2）
   DCQ_MODEL_MAX      單一模型同時最多幾張（預設 3），滿了分給下一隻
@@ -624,10 +697,11 @@ case "${1:-}" in
   DCQ_COOLDOWN_S     冷卻秒數（預設 120；舊名 DCQ_BREAK_S）
   DCQ_AUTORANK       1＝每次啟動依 logs/gaps.tsv 自動重排免費層（預設）；0＝照手排。`dcq rank` 看統計
   DCQ_RANK_MIN       每隻至少幾筆樣本才參與重排（預設 10）；DCQ_RANK_WIN 只看最近幾筆（預設 30）
-  DCQ_RANK_STALL_PCT 停滯率達幾 % 就降到懲罰層（訂閱層之後，預設 30）；DCQ_RANK_PAROLE_D 天沒新樣本假釋回免費層（預設 7）
+  DCQ_RANK_STALL_PCT 停滯率達幾 % 就降到懲罰層（免費層之後，預設 30）；DCQ_RANK_PAROLE_D 天沒新樣本假釋回免費層（預設 7）
   DCQ_RANK_ZERO_N    樣本達幾筆而 PASS 為 0 就直接降級，不等 DCQ_RANK_MIN（預設 3；0＝停用）
   DCQ_STALL_S        輸出靜默幾秒判定停滯並換模型（預設 200；校準看 logs/gaps.tsv，dcq rank 近邊會警告）
   DCQ_JOB_MAX        單張工單總時限秒數，含所有模型（預設 2700）
+  DCQ_ATTEMPT_MAX    單隻模型一次嘗試的上限秒數，撞到就換下一隻（預設 600）
   DCQ_MASK           .out 遮罩器（預設 ~/.claude/tools/fi-mask-transcript.mjs）
   DCQ_LOG_DAYS       .out 保留幾天，過期刪（預設 14）
 EOF

@@ -38,30 +38,23 @@ exit code：`0` 全過｜`2` 工單瑕疵或負向對照失敗（dcq 視為 FATA
 | 指令 | 跑下去會怎樣 | 原檔 |
 |---|---|---|
 | `dc-new` | 印「已停用」，`exit 3` | `~/.local/bin/dc-new.disabled` |
-| `deepclaude` | 同上 | `~/.local/bin/deepclaude.disabled` |
 | `deep-run` | 同上 | `~/.local/bin/deep-run.disabled` |
 
 停用原因：deep 由 dc 取代，deepclaude 快取命中率 8.6%。
 恢復方式就是把 `.disabled` 改回原名。
 
-### 一個繞過停用的漏洞（未修）
+**deepclaude 已復活（10-16）**：`~/.local/bin/deepclaude` 改回指向 `~/.deepclaude/bin/deepclaude`，
+停用 stub 留作 `deepclaude.stub-20261005`（要再停用就改回 `deepclaude`）。
+舊的 `deepclaude-happy` 繞過漏洞已不存在（10-12 移到垃圾桶，見下）。
 
-`deepclaude-happy` **沒有** stub，內容是：
-
-```sh
-exec "$HOME/.deepclaude/bin/deepclaude" --happy "$@"
-```
-
-它直接呼叫 `~/.deepclaude/bin/deepclaude`（4.5K，真的 launcher，還活著），
-繞過 PATH 上的停用 stub。所以 `deepclaude` 跑不起來，但 `deepclaude-happy` 跑得起來。
-要補就是把 `deepclaude-happy` 也 stub 掉，或讓它改走 PATH 上的 `deepclaude`。
-
-## launchd：本機停用、plist 保留
+## launchd：plist 保留在 repo
 
 | Label | 狀態 |
 |---|---|
-| `local.deepclaude.proxy` | `bootout` + `launchctl disable`（`:20133` 的常駐 proxy，原本 KeepAlive） |
-| `local.deepclaude.happy` | `bootout` + `launchctl disable` |
+| `local.deepclaude.proxy` | 10-16 起 `enable` + `bootstrap`，在跑（`:20133` 的常駐 proxy，KeepAlive） |
+| `local.deepclaude.happy` | 10-16 起 `enable` + `bootstrap`，在跑；session 結束後用 `~/.deepclaude/bin/dc-restart` 重開（不在 PATH） |
+
+要再停用：`launchctl bootout` + `launchctl disable` 兩個 label。
 
 plist **留在 `~/.deepclaude/launchd/` 並且被 repo 追蹤**——它們機器無關、公開可見，
 停用是本機的事，不該讓 repo 少檔案。停用靠 `launchctl disable`，不靠改檔名
@@ -89,5 +82,5 @@ launchctl bootstrap "gui/$(id -u)" ~/.deepclaude/launchd/local.deepclaude.proxy.
 
 `~/.claude/CLAUDE.md`（machines/host.md）的路由表仍有一列叫人跑 `dc-new`，並說
 「proxy :20133 不通先 `launchctl bootstrap ~/.deepclaude/launchd/local.deepclaude.proxy.plist`」。
-現在 `dc-new` 回 exit 3，而且 plist 已經 `disable`，光 bootstrap 不會起來。
+現在 `dc-new` 回 exit 3。proxy plist 10-16 已 `enable`，bootstrap 那半句又成立了。
 那列是制度檔，要改要經使用者確認。

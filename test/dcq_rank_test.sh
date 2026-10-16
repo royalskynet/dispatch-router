@@ -19,7 +19,7 @@ for i in $(seq 6); do rowd g 0 30; done; for i in $(seq 4); do rowd g 1 30; done
 fail=0
 got="$(DCQ_MODELS= DCQ_POOL_ZEN="c b d a e f g" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
 want="a d b e g f"   # g 通過率較低但等得少，排在 f 前；c 停滯 40% 進懲罰層
-pen="$(DCQ_MODELS= DCQ_POOL_ZEN="c b d a e f g" DCQ_POOL_GO="" dcq rank | sed -n 's/^懲罰層（訂閱層之後）：//p')"
+pen="$(DCQ_MODELS= DCQ_POOL_ZEN="c b d a e f g" DCQ_POOL_GO="" dcq rank | sed -n 's/^懲罰層（免費層之後）：//p')"
 [ "$pen" = "c" ] || { echo "FAIL pen: got [$pen] want [c]"; fail=1; }
 [ "$got" = "$want" ] || { echo "FAIL order: got [$got] want [$want]"; fail=1; }
 got="$(DCQ_AUTORANK=0 DCQ_POOL_ZEN="c b d a e" DCQ_POOL_GO="" dcq status 2>&1 | awk '/busy=/{printf "%s ", $1}')"
@@ -38,7 +38,55 @@ got="$(DCQ_MODELS= DCQ_POOL_ZEN="y a" DCQ_POOL_GO="" dcq rank | sed -n 's/^順�
 : > "$P"; old="$(date -v-10d +%F 2>/dev/null || date -d '-10 days' +%F)_00:00:00"
 for i in 1 2 3; do printf '%s\th\t10\t1\texit\n' "$old" >> "$G"; printf '%s\tk\t10\t1\texit\n' "$D" >> "$G"; done
 out="$(DCQ_MODELS= DCQ_POOL_ZEN="h k a" DCQ_POOL_GO="" dcq rank)"
-got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"; pen="$(printf '%s\n' "$out" | sed -n 's/^懲罰層（訂閱層之後）：//p')"
+got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"; pen="$(printf '%s\n' "$out" | sed -n 's/^懲罰層（免費層之後）：//p')"
 [ "$got" = "h a" ] && [ "$pen" = "k" ] || { echo "FAIL parole: got [$got | $pen] want [h a | k]"; fail=1; }
+# 6) 合格（ranked）但探測掛掉的模型：只能出現一次、排最後，不得佔走另一隻合格者的位置
+#    （2026-10-13 實例：nemotron probe-down 又留在 ranked 名單，順序變 "nemotron mimo ling nemotron"，93% 的 space-bunny 消失）
+: > "$G"; : > "$P"
+for i in $(seq 10); do rowd r1 0 100; rowd r2 0 110; done
+printf '%s\topencode\tr1\tTIMEOUT\t60\n%s\topencode\tr2\tOK\t3\n' "$now" "$now" > "$P"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="r1 r2 m" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
+[ "$got" = "r2 m r1" ] || { echo "FAIL ranked+probe-down: got [$got] want [r2 m r1]"; fail=1; }
+# 7) 名單同步：改名（舊名 GONE＋新名 OK）→ 舊名移出、新名接進；SKIP 的不收；別家 provider 的列不算
+: > "$G"; export DCQ_GO_STATE="$T/none.json"
+printf '%s\topencode\told\tGONE\t0\n%s\topencode\tnew\tOK\t3\n%s\topencode\tskipme\tOK\t2\n%s\topencode-go\tother\tOK\t1\n%s\topencode\ta\tOK\t5\n' "$now" "$now" "$now" "$now" "$now" > "$P"
+out="$(DCQ_MODELS= DCQ_POOL_ZEN="old a" DCQ_POOL_GO="" DCQ_POOL_SKIP="skipme" dcq rank)"
+got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"; note="$(printf '%s\n' "$out" | sed -n 's/^名單同步：//p')"
+[ "$got" = "new a" ] || { echo "FAIL sync order: got [$got] want [new a]"; fail=1; }
+[ "$note" = "新增 new；移出 old；" ] || { echo "FAIL sync note: [$note]"; fail=1; }
+got="$(DCQ_POOLSYNC=0 DCQ_MODELS= DCQ_POOL_ZEN="old a" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
+case " $got " in *" old "*) ;; *) echo "FAIL POOLSYNC=0 still synced: [$got]"; fail=1 ;; esac
+# 8) QUOTA（額度用完，06:00 探測常見）不判 down
+printf '%s\topencode\tq\tQUOTA\t1\n%s\topencode\ta\tOK\t5\n' "$now" "$now" > "$P"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="q a" DCQ_POOL_GO="" dcq rank)"
+case "$got" in *"probe-down"*) echo "FAIL quota judged down"; fail=1 ;; esac
+# 9) 訂閱層同步：upstream 沒有的移出；first_seen 非 base 的非 -free 新模型接尾；base 的不收；過期 state 不採用
+: > "$P"
+printf '{"at":"%s","upstream":["g1","g3","old1","newm","newf-free"],"first_seen":{"g1":"base","g3":"base","old1":"base","newm":"2026-10-15","newf-free":"2026-10-15"}}' "$(date +%FT%T)" > "$DCQ_GO_STATE"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1 opencode-go/g2 opencode-go/g3" dcq rank | sed -n 's/^訂閱層：//p')"
+[ "$got" = "opencode-go/g1 opencode-go/g3 opencode-go/newm" ] || { echo "FAIL paid sync: [$got]"; fail=1; }
+printf '{"at":"2000-01-01T00:00:00","upstream":["g1"]}' > "$DCQ_GO_STATE"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1 opencode-go/g2" dcq rank | sed -n 's/^訂閱層：//p')"
+[ "$got" = "opencode-go/g1 opencode-go/g2" ] || { echo "FAIL stale go state: [$got]"; fail=1; }
+# 10) 上游不回：why=upstream 不算模型樣本（5 筆 upstream 不觸發 0 PASS 短路）；5 筆 stall 照樣觸發
+: > "$G"; rep 5 u 124 upstream; rep 5 s 124 stall
+out="$(DCQ_MODELS= DCQ_POOL_ZEN="u s a" DCQ_POOL_GO="" dcq rank)"
+pen="$(printf '%s\n' "$out" | sed -n 's/^懲罰層（免費層之後）：//p')"
+[ "$pen" = "s" ] || { echo "FAIL upstream counted as model fault: pen=[$pen] want [s]"; fail=1; }
+# 11) zero_output 分類：全 0 輸出且無 part＝上游不回；有工具 part 或有輸出＝模型卡住
+eval "$(sed -n '/^zero_output()/,/^}/p' "$(command -v dcq)")"
+printf '{"messages":[{"info":{"role":"user"},"parts":[{"type":"text"}]},{"info":{"role":"assistant","tokens":{"output":0}},"parts":[]}]}' > "$T/z1.json"
+printf '{"messages":[{"info":{"role":"assistant","tokens":{"output":0}},"parts":[{"type":"tool"}]}]}' > "$T/z2.json"
+printf '{"messages":[{"info":{"role":"assistant","tokens":{"output":0}},"parts":[]},{"info":{"role":"assistant","tokens":{"output":12}},"parts":[]}]}' > "$T/z3.json"
+zero_output "$T/z1.json" || { echo "FAIL zero_output z1 should be upstream"; fail=1; }
+if zero_output "$T/z2.json"; then echo "FAIL zero_output z2 has tool part"; fail=1; fi
+if zero_output "$T/z3.json"; then echo "FAIL zero_output z3 has output"; fail=1; fi
+# 12) upstream 一次就冷卻 UPSTREAM_COOL_S；一般 stall 的 bump_fail 第一次不冷卻
+eval "$(sed -n -e '/^now()/p' -e '/^fk()/p' -e '/^cool_left()/p' -e '/^reset_fail()/p' -e '/^UPSTREAM_COOL_S=/p' -e '/^cool_upstream()/,/^}/p' -e '/^bump_fail()/,/^}/p' "$(command -v dcq)")"
+Q="$DCQ_HOME"; ALLOW=2; COOL_S=120; mkdir -p "$Q/.health"
+cool_upstream "opencode/u1" 2>/dev/null; left=$(cool_left "opencode/u1")
+[ "$left" -ge 890 ] && [ "$left" -le 900 ] || { echo "FAIL cool_upstream left=$left want ~900"; fail=1; }
+bump_fail "s1" 2>/dev/null; left=$(cool_left "s1")
+[ "$left" = 0 ] || { echo "FAIL bump_fail cooled on first fail: $left"; fail=1; }
 [ "$fail" = 0 ] && echo PASS
 exit "$fail"

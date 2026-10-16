@@ -10,7 +10,7 @@
 git clone https://github.com/royalskynet/dispatch-router && cd dispatch-router && ./install.sh
 ```
 
-需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`oc-free-check` 連到 `~/.local/bin`、註冊每日探測免費模型的 launchd job、把 skill 連到 `~/.claude/skills/dc`。
+需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`oc-free-check` 連到 `~/.local/bin`、註冊每日探測免費模型的 launchd job、把 skill 連到 `~/.claude/skills/dr`。
 
 ## English
 
@@ -84,7 +84,7 @@ The rest of this README is in Traditional Chinese.
 ./install.sh
 ```
 
-連結 `~/.local/bin/dc` 與 `~/.claude/skills/dc`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
+連結 `~/.local/bin/dc` 與 `~/.claude/skills/dr`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
 
 **相依**：`wo-verify`、`deep-lint` 收在本 repo `bin/`，dc 直接用同目錄那份，不需要裝 `deep-agent`／deepclaude。`DC_BIN=<dir>` 只用來覆寫（測試注入假閘）。
 
@@ -198,7 +198,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 | **per-model 冷卻** | 借鏡 LiteLLM Router 的 `allowed_fails`／`cooldown_time`：同一隻連續 `DCQ_ALLOWED_FAILS`（2）次上游失敗或停滯，冷卻 `DCQ_COOLDOWN_S`（120）秒，期間不派給它。只罰那一隻 —— 舊版是全隊熔斷，一隻掛全隊停 |
 | **權重：免費優先** | 免費池整輪試過 `DCQ_FREE_ROUNDS`（2）輪都失敗，**或**免費模型全在冷卻，才 fallback 到 `DCQ_POOL_PAID`（預設 7 隻，依實測「寫得對＞反應快」排序：`opencode-go/glm-5.3-flash opencode-go/deepseek-v4.1-flash opencode-go/deepseek-v4-pro opencode-go/minimax-m3 opencode-go/qwen3.8-flash opencode-go/kimi-k2.7-code opencode-go/glm-5.3`。Go 額度 per-model 各自計，多放＝容量相加；與 Zen 免費同底模的 muse／mimo Go 版不收；deepseek-v4-flash 上游退役，2026-10-03 移除）。用過訂閱層的工單在 jobfile 標 `PAID=1`。`DCQ_POOL_PAID=` 設空＝永不動用，免費全冷卻時就等 |
 | **per-model 併發槽** | 單一模型同時最多 `DCQ_MODEL_MAX`（3）張，滿了直接分給下一隻，不在忙的模型上排隊 |
-| **watchdog** | opencode 的 `chunkTimeout` 有洞（[#43519](https://github.com/anomalyco/opencode/issues/43519) SSE keepalive 會歸零計時、[#48675](https://github.com/anomalyco/opencode/issues/48675) 一個 chunk 都沒送就卡住不報錯），外面再看一層：每 `DCQ_POLL_S`（5）秒看 `.out` 的 mtime，靜默 ≥ `DCQ_STALL_S`（200；2026-10-09 起，依 gaps.tsv 39 張 PASS 最大靜默 162s 留 25% 餘量）秒判停滯 → 殺整棵樹、冷卻計數＋1、換下一隻。整張工單超過 `DCQ_JOB_MAX`（2700）秒也殺，但**不罰模型、不換**（防 [#52092](https://github.com/anomalyco/opencode/issues/52092) 失控迴圈燒光 Go 額度） |
+| **watchdog** | opencode 的 `chunkTimeout` 有洞（[#43519](https://github.com/anomalyco/opencode/issues/43519) SSE keepalive 會歸零計時、[#48675](https://github.com/anomalyco/opencode/issues/48675) 一個 chunk 都沒送就卡住不報錯），外面再看一層：每 `DCQ_POLL_S`（5）秒看 `.out` 的 mtime，靜默 ≥ `DCQ_STALL_S`（200；2026-10-09 起，依 gaps.tsv 39 張 PASS 最大靜默 162s 留 25% 餘量）秒判停滯 → 殺整棵樹、冷卻計數＋1、換下一隻。單隻模型一次嘗試超過 `DCQ_ATTEMPT_MAX`（600，≈PASS 單次最長 294s×2）秒也一樣換手——一直有輸出的無限迴圈不會觸發停滯。整張工單超過 `DCQ_JOB_MAX`（2700）秒也殺，但**不罰模型、不換**（防 [#52092](https://github.com/anomalyco/opencode/issues/52092) 失控迴圈燒光 Go 額度） |
 | **取消** | `dcq cancel <id>`：先寫 `.cancel/<id>` 標記再殺程序樹，順序不能反 —— 反過來 `run_job` 會把 kill 的 rc 當成模型失敗，直接換下一個模型重跑同一張，人工中止永遠停不下來。`dc` 是 bash 殼，殺它不會帶走 opencode，所以殺整棵樹 |
 
 併發上限硬夾 8：社群實測 1–5 穩、10–32 崩，官方只說 "traffic is monitored for abuse" 沒給數字。衝高併發的期望值是被 ban，不是更快。
@@ -209,7 +209,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 
 `dcq status` 會列出每隻模型的 `busy=n/max` 與冷卻剩餘秒數。
 
-環境變數：`DCQ_HOME`（預設 `~/.dcq`）、`DCQ_JOBS`、`DCQ_POOL_GO`、`DCQ_POOL_ZEN`、`DCQ_POOL_PAID`、`DCQ_FREE_ROUNDS`、`DCQ_MODELS`、`DCQ_MODEL_MAX`、`DCQ_ALLOWED_FAILS`、`DCQ_COOLDOWN_S`、`DCQ_STALL_S`、`DCQ_JOB_MAX`、`DCQ_POLL_S`。舊名 `DCQ_BREAK_N`／`DCQ_BREAK_S` 仍可用，對應到 `DCQ_ALLOWED_FAILS`／`DCQ_COOLDOWN_S`。
+環境變數：`DCQ_HOME`（預設 `~/.dcq`）、`DCQ_JOBS`、`DCQ_POOL_GO`、`DCQ_POOL_ZEN`、`DCQ_POOL_PAID`、`DCQ_FREE_ROUNDS`、`DCQ_MODELS`、`DCQ_MODEL_MAX`、`DCQ_ALLOWED_FAILS`、`DCQ_COOLDOWN_S`、`DCQ_STALL_S`、`DCQ_JOB_MAX`、`DCQ_ATTEMPT_MAX`、`DCQ_POLL_S`。舊名 `DCQ_BREAK_N`／`DCQ_BREAK_S` 仍可用，對應到 `DCQ_ALLOWED_FAILS`／`DCQ_COOLDOWN_S`。
 
 自檢（都用假的下游，不打上游）：`./test/dcq_test.sh`（佇列、模型池、權重 fallback、冷卻、併發槽、watchdog、cancel）、`./test/dc_lock_test.sh`（cwd 鎖）、`./test/dc_model_test.sh`（模型閘：哪些准派、哪些要拒）
 
@@ -231,7 +231,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 
 ## 每日探測（oc-free-check）
 
-launchd job `dcq-probe`（`launchd/` 內的 plist）每天 08:15 跑 `oc-free-check -p opencode --tsv ~/.dcq/logs/probe.tsv`：起一個 `opencode serve`，對每個免費模型送「Reply with just: ok」，記狀態、秒數、原因（TSV 第 6 欄）。08:15 是免費額度 00:00 UTC 重置之後；06:00 會量到前一天用完的額度。
+launchd job `dcq-probe`（`launchd/` 內的 plist）每天 06:00 跑 `oc-free-check -p opencode --tsv ~/.dcq/logs/probe.tsv`：起一個 `opencode serve`，對每個免費模型送「Reply with just: ok」，記狀態、秒數、原因（TSV 第 6 欄）。免費額度 00:00 UTC（08:00 本地）才重置，06:00 量到額度用完的記 QUOTA，dcq rank 當沒資料不判 down。最新一批也驅動名單同步：GONE 移出池、新上架 OK 的接進池（`DCQ_POOL_SKIP` 排除）；訂閱層讀 opencode-go-sync state 同步。
 
 狀態分級（`prompt_async` 後輪詢 `/session/status`，opencode 遇限流會自己重試，同步呼叫只會卡到逾時）：
 
@@ -255,8 +255,8 @@ launchd job `dcq-probe`（`launchd/` 內的 plist）每天 08:15 跑 `oc-free-ch
 
 手動跑：`oc-free-check -p opencode`；看排名：`dcq rank`（多一欄 `probe`）。
 
-### 懲罰層（累犯排在訂閱層之後）
+### 懲罰層（累犯排在免費層之後）
 
 自動排名判成 `zero`（≥3 筆 0 PASS）或 `demoted`（停滯率 ≥30%）的免費模型，不再留在免費層尾巴，改進 `POOL_PEN`：
-**免費 → 訂閱（opencode-go）→ 懲罰層 → 兜底層**。免費層會重試 `DCQ_FREE_ROUNDS` 輪，累犯留在裡面等於每張工單白等它卡兩次。
+**免費 → 懲罰層 → 兜底層 → 訂閱（opencode-go，付費，2026-10-13 起墊底）**。免費層會重試 `DCQ_FREE_ROUNDS` 輪，累犯留在裡面等於每張工單白等它卡兩次。
 最近一筆樣本超過 `DCQ_RANK_PAROLE_D`（預設 7）天就假釋回免費層重新給機會。`dcq rank` 最後一行列出目前的懲罰層。
