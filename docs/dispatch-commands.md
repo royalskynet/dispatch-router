@@ -80,7 +80,7 @@ launchctl bootstrap "gui/$(id -u)" ~/.deepclaude/launchd/local.deepclaude.proxy.
 
 ## 已知失效的文件指令
 
-`~/.claude/CLAUDE.md`（machines/51mini.md）的路由表仍有一列叫人跑 `dc-new`，並說
+`~/.claude/CLAUDE.md`（機器補充檔）的路由表仍有一列叫人跑 `dc-new`，並說
 「proxy :20133 不通先 `launchctl bootstrap ~/.deepclaude/launchd/local.deepclaude.proxy.plist`」。
 現在 `dc-new` 回 exit 3。proxy plist 10-16 已 `enable`，bootstrap 那半句又成立了。
 那列是制度檔，要改要經使用者確認。

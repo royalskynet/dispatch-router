@@ -5,7 +5,7 @@
      只測 -p opencode：dc 把不帶前綴的模型名對到 opencode/（bin/dc），opencode-go/ 那份不會被用到。 -->
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.51mini.dcq-probe</string>
+  <key>Label</key><string>local.dispatch-router.dcq-probe</string>
   <key>ProgramArguments</key>
   <array>
     <string>/Users/you/.local/bin/oc-free-check</string>

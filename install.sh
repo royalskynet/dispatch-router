@@ -12,9 +12,14 @@ ln -sfn "$REPO/bin/oc-free-check" ~/.local/bin/oc-free-check
 # PATH 上的 wo-verify 也由本 repo 提供（手動驗收、其他腳本用）；dc 自己不走 PATH
 ln -sfn "$REPO/bin/wo-verify" ~/.local/bin/wo-verify
 # 每日 06:00 探測免費模型（dcq rank 讀 ~/.dcq/logs/probe.tsv）
-cp "$REPO/launchd/com.51mini.dcq-probe.plist" ~/Library/LaunchAgents/
-launchctl bootout gui/$(id -u)/com.51mini.dcq-probe 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.51mini.dcq-probe.plist
+cp "$REPO/launchd/local.dispatch-router.dcq-probe.plist" ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/local.dispatch-router.dcq-probe 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.dispatch-router.dcq-probe.plist
+# 10-17 前舊 label
+for _o in ~/Library/LaunchAgents/com.*.dcq-probe.plist; do
+  [ -f "$_o" ] || continue
+  launchctl bootout gui/$(id -u) "$_o" 2>/dev/null || true; rm -f "$_o"
+done
 
 # ~/.claude/skills/dr：若已是實體目錄（非 symlink），先備份進 repo 再連結
 if [ -d ~/.claude/skills/dr ] && [ ! -L ~/.claude/skills/dr ]; then
