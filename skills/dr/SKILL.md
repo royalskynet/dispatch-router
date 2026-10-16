@@ -1,21 +1,21 @@
 ---
-name: dc
-description: 派工給 opencode 執行人（走 opencode 客戶端，免認證、無 Anthropic 協定牆、可用整個 Zen 免費池、非免費模型發 TG 警示）：主 session 給計畫或一句任務＋一條驗收，dc 派工後由 wo-verify 機械判定成敗，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（自動 cwd 互斥、模型池＋per-model 冷卻、停滯 watchdog）。說「派 dc」「dc 去跑」「派工 opencode」時用。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時用後備 deep（任務檔要「後備理由：」行）。
+name: dr
+description: 派工給 opencode 執行人（走 opencode 客戶端，免認證、無 Anthropic 協定牆、可用整個 Zen 免費池、非免費模型發 TG 警示）：主 session 給計畫或一句任務＋一條驗收，dc 派工後由 wo-verify 機械判定成敗，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（自動 cwd 互斥、模型池＋per-model 冷卻、停滯 watchdog）。說「派dr」「派 dr」「派工」「派工 opencode」時用（底層指令是 dc／dcq）；說「派deep」走 deepclaude 的 deep skill，不是這裡。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時改派deep。
 ---
 
 # dc = opencode 免費池執行人，完成定義＝wo-verify 通過
 
-**預設派工執行人**：deep 自 2026-10-01 降為後備（`deep-run` 閘門要任務檔有「後備理由：」行），只補 dc 做不到的場景。dc 走 opencode 客戶端路徑，**免認證即可用**，且沒有 Anthropic 協定牆（整個 Zen 免費池都能用）。
+**預設派工執行人**（觸發詞「派dr」）。deepclaude 的「派deep」是另一條線，只補 dc 做不到、又需要 agent 多步自主的場景。dc 走 opencode 客戶端路徑，**免認證即可用**，且沒有 Anthropic 協定牆（整個 Zen 免費池都能用）。
 
 ## dc 做不到的部分
 
 | 情境 | 誰做 |
 |---|---|
 | 讀 codebase／追依賴／單點小修／想快速試一個想法 | **dc** |
-| 要寫 `~/.claude/**`、`.git/config`、launchd | 主 session 直接做；需 agent 多步自主時用後備 deep |
-| 需要 `GH_TOKEN`（`gh search`／push／PR 等） | 主 session 直接做；需 agent 多步自主時用後備 deep |
+| 要寫 `~/.claude/**`、`.git/config`、launchd | 主 session 直接做；需 agent 多步自主時改派deep |
+| 需要 `GH_TOKEN`（`gh search`／push／PR 等） | 主 session 直接做；需 agent 多步自主時改派deep |
 
-後備 deep：任務檔首行 `後備理由：<gh|GH_TOKEN|沙箱外寫入|.git/config|launchd|~/.claude|CLAUDE_CONFIG_DIR> 說明`，否則 `deep-run` 閘門 exit 3。
+派deep 的任務檔契約見 `~/.claude/skills/deep/SKILL.md`（2026-10-16 起取消「後備理由」閘門）。
 
 ## 任務檔
 
@@ -34,7 +34,9 @@ dc 在派工前跑同一套閘門：`deep-lint` 不過就不派，`wo-verify <ta
 5. **工單寫成冪等。** 斷言寫「已存在就跳過」而非「建立」。重派不會破壞前一輪成果，這是能無腦重試的前提。
 6. **context 放檔案，不放 prompt。** Zen 免費池沒有 prompt caching，每輪重送 context 都是全價重算（Go lane 有，回應帶 `cached_tokens`；但工單大小本來就該由檔案承載）。工單給絕對路徑讓模型自己讀，禁止把檔案內容貼進任務檔。
 
-判斷式：**工單同時滿足「單步」「冪等」「輸入是路徑不是內容」才派 dc**，否則拆成多張 dcq 工單或主 session 直接做。
+判斷式：**難度低、量大的活一律優先派**（不必等使用者說派工，主 session 走 `dr-worker` subagent）。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
+
+**單張也走 dcq**：只有 dcq 有模型 fallback 鏈（免費層 autorank → 懲罰層 → 兜底層 → 訂閱層（付費，墊底））與逾時換手。裸 `dc` 只跑一隻模型，掛了就沒救（fix 10299），只在指定模型做實驗時用。
 
 ## 派工
 
@@ -80,7 +82,7 @@ Go 的 HTTP lane（`/zen/go/v1`）**對外是通的**，跟被 `FreeTierError` �
 - **per-model 冷卻**：同一隻連續 `DCQ_ALLOWED_FAILS`（2）次上游失敗或停滯 → 冷卻 `DCQ_COOLDOWN_S`（120）秒，只罰那一隻，不停全隊。
 - **權重：免費優先**：免費池跑滿 `DCQ_FREE_ROUNDS`（2）輪全敗，或免費模型全在冷卻，才 fallback 到 `DCQ_POOL_PAID`（Go 訂閱模型）；jobfile 標 `PAID=1`。設空＝永不動用。
 - **per-model 併發槽**：每隻最多 `DCQ_MODEL_MAX`（3）張，滿了分給下一隻。
-- **watchdog**：`.out` 靜默 ≥ `DCQ_STALL_S`（200）秒 → 殺掉、冷卻計數＋1、換下一隻。工單總時限 `DCQ_JOB_MAX`（2700）秒，超過就殺但不罰模型、不換。最大靜默間隔記在 `~/.dcq/logs/gaps.tsv`，收緊門檻前先看它。
+- **watchdog**：`.out` 靜默 ≥ `DCQ_STALL_S`（200）秒 → 殺掉、冷卻計數＋1、換下一隻。單隻模型一次嘗試超過 `DCQ_ATTEMPT_MAX`（600）秒 → 同樣殺掉、冷卻計數＋1、換下一隻（一直有輸出的無限迴圈不會觸發停滯，靠這道換手）。工單總時限 `DCQ_JOB_MAX`（2700）秒，超過就殺但不罰模型、不換。最大靜默間隔記在 `~/.dcq/logs/gaps.tsv`，收緊門檻前先看它。
 - `dcq status` 列出每隻模型的 `busy=n/max` 與冷卻剩餘秒數。
 
 ## 驗收
@@ -117,7 +119,7 @@ dc <task.md> <cwd>; echo "rc=$?"   # 0 = 驗收重跑 K 次全過
 ## 不做
 
 - 跨多檔改動、長鏈重構、需要在合理時間內拿到結果的活 → 拆 dcq 或主 session 直接做。
-- 沙箱外寫入 → 主 session 直接做；要 agent 多步自主才用後備 deep。
+- 沙箱外寫入 → 主 session 直接做；要 agent 多步自主才改派deep。
 
 ## 相依
 

@@ -16,15 +16,16 @@ cp "$REPO/launchd/com.51mini.dcq-probe.plist" ~/Library/LaunchAgents/
 launchctl bootout gui/$(id -u)/com.51mini.dcq-probe 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.51mini.dcq-probe.plist
 
-# ~/.claude/skills/dc：若已是實體目錄（非 symlink），先備份進 repo 再連結
-if [ -d ~/.claude/skills/dc ] && [ ! -L ~/.claude/skills/dc ]; then
+# ~/.claude/skills/dr：若已是實體目錄（非 symlink），先備份進 repo 再連結
+if [ -d ~/.claude/skills/dr ] && [ ! -L ~/.claude/skills/dr ]; then
   mkdir -p "$REPO/.bak"
-  mv ~/.claude/skills/dc "$REPO/.bak/dc-$(date +%Y%m%d-%H%M%S)"
+  mv ~/.claude/skills/dr "$REPO/.bak/dr-$(date +%Y%m%d-%H%M%S)"
 fi
-ln -sfn "$REPO/skills/dc" ~/.claude/skills/dc
+ln -sfn "$REPO/skills/dr" ~/.claude/skills/dr
+[ -L ~/.claude/skills/dc ] && rm ~/.claude/skills/dc  # 10-16 前舊名
 
 echo "Installed symlinks:"
-for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/oc-free-check ~/.local/bin/wo-verify ~/.claude/skills/dc; do
+for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/oc-free-check ~/.local/bin/wo-verify ~/.claude/skills/dr; do
   ls -l "$t"
   [ -e "$t" ] || { echo "DANGLING: $t"; exit 1; }
 done

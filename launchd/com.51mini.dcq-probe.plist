@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- 每天 08:15 探測 opencode 免費模型（活著＋秒數），append 到 ~/.dcq/logs/probe.tsv 給 dcq rank 用。
-     08:15＝免費額度 00:00 UTC（08:00 本地）重置之後；06:00 會量到前一天用完的額度，把沒壞的模型誤判成 down。
+<!-- 每天 06:00 探測 opencode 免費模型（活著＋秒數），append 到 ~/.dcq/logs/probe.tsv 給 dcq rank 用。
+     06:00（2026-10-14 使用者定，08:15 改回）：額度 08:00 才重置，用完的記 QUOTA；dcq rank 把 QUOTA 當沒資料，不判 down。
      只測 -p opencode：dc 把不帶前綴的模型名對到 opencode/（bin/dc），opencode-go/ 那份不會被用到。 -->
 <plist version="1.0">
 <dict>
@@ -20,7 +20,7 @@
     <key>LANG</key><string>en_US.UTF-8</string>
   </dict>
   <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>15</integer></dict>
+  <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
   <key>StandardOutPath</key><string>/Users/you/.dcq/logs/probe.log</string>
   <key>StandardErrorPath</key><string>/Users/you/.dcq/logs/probe.log</string>
 </dict>
