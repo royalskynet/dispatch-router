@@ -13,6 +13,7 @@ FreeTierError「can only be used from within OpenCode」，所以只能透過 op
   oc-free-check -j 8 -t 60     # 併發 8、逾時 60s
   oc-free-check --server http://127.0.0.1:41999   # 沿用既有 server，不自起
   oc-free-check --all          # 連已下架（GONE）的也列出
+  oc-free-check --tsv F        # 排程用：寫 TSV、判通知，並推 @opencode 新推文（--x-handle '' 關掉）
 """
 import argparse
 import concurrent.futures as cf
@@ -182,6 +183,21 @@ def notify(msg):
         subprocess.run(["hpush", msg], capture_output=True)
 
 
+def needs_retest(path, results):
+    """這批逾時／錯誤、上一批也逾時／錯誤的模型——再不處理就會被報「連兩批不回應」。
+    探測一天只跑一批，連兩批＝連兩天 06:00，同一時段上游壅塞就會誤報（10-18 nemotron-3.5-lightning
+    連兩天 60s 逾時，手動重測 10.1s OK），所以推播前用長逾時重測一次再定案。"""
+    if not os.path.exists(path):
+        return []
+    rows = [l.rstrip("\n").split("\t") for l in open(path) if l.count("\t") >= 4]
+    if not rows:
+        return []
+    last = max(r[0] for r in rows)
+    prev = {r[2]: r[3] for r in rows if r[0] == last}
+    return [(p, m) for p, m, st, _r, _s in results
+            if st in ("TIMEOUT", "ERR") and prev.get(m) in ("TIMEOUT", "ERR")]
+
+
 def append_tsv(path, results):
     """每次跑一批、同一個時間戳，append 進 TSV 給 dcq rank 讀，再判要不要 hpush。
 
@@ -242,6 +258,43 @@ def append_tsv(path, results):
                f"（{'、'.join(slow[:5])}…）；下一批仍逾時才會報掛")
 
 
+# 官方 X 比 Zen 清單早講：新上架「now free」、限時免費結束、資安事件。清單只告訴你上下架了，
+# 推文告訴你為什麼、何時結束。只推新且命中關鍵字的，避免行銷文洗版。
+# ponytail: 關鍵字是手寫清單；漏報就加字，誤報多再改成只看含模型名的推文
+X_KEYWORDS = re.compile(
+    r"free|deprecat|sunset|remov|discontinu|no longer|ending|limited time|"
+    r"breach|security|incident|outage|downtime|zen|opencode go", re.I)
+
+
+def x_updates(seen_path, handle="opencode", n=15):
+    """讀官方帳號最新推文，回本次新出現且命中關鍵字的 [(id, time, text)]；已看過的 id 記在 seen_path。
+    twitter CLI 失敗（沒登入、被限流）回 None，不影響模型探測。第一次跑只建基準不推，免得一次灌 15 則舊文。"""
+    try:
+        p = subprocess.run(["twitter", "-c", "user-posts", handle, "-n", str(n), "--json"],
+                           capture_output=True, text=True, timeout=60)
+        posts = json.loads(p.stdout)
+    except Exception as e:
+        print(f"⚠️ 讀不到 @{handle} 推文：{e}", file=sys.stderr)
+        return None
+    if not isinstance(posts, list):
+        print(f"⚠️ 讀不到 @{handle} 推文：{str(posts)[:80]}", file=sys.stderr)
+        return None
+    first = not os.path.exists(seen_path)
+    seen = set() if first else set(open(seen_path).read().split())
+    fresh = [(t["id"], t.get("time", ""), t.get("text", "")) for t in posts
+             if t.get("id") and t["id"] not in seen]
+    with open(seen_path, "a") as f:
+        f.writelines(f"{i}\n" for i, _t, _x in fresh)
+    if first:
+        return []
+    return [x for x in fresh if X_KEYWORDS.search(x[2])]
+
+
+def notify_x(updates, handle="opencode"):
+    for tid, when, text in updates:
+        notify(f"📣 @{handle}（{when}）：{' '.join(text.split())[:200]}\nhttps://x.com/{handle}/status/{tid}")
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("-p", "--providers", default="opencode opencode-go")
@@ -251,6 +304,8 @@ def main():
     ap.add_argument("--server", default=None)
     ap.add_argument("--tsv", default=None)
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--x-handle", default="opencode")
+    ap.add_argument("--retest-timeout", type=int, default=150)
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
@@ -282,6 +337,16 @@ def main():
             futs = [ex.submit(timed, base, p, m, a.timeout) for p, m in models]
             for f in cf.as_completed(futs):
                 results.append(f.result())
+        retry = needs_retest(a.tsv, results) if a.tsv else []
+        if retry:
+            print(f"重測 {len(retry)} 個連兩批沒回應的模型（逾時 {a.retest_timeout}s）", file=sys.stderr)
+            with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+                again = {(r[0], r[1]): r for r in ex.map(
+                    lambda pm: timed(base, pm[0], pm[1], a.retest_timeout), retry)}
+            # 重測結果蓋掉原結果：OK 就斷掉逾時鏈，不推；仍逾時才照舊報
+            results = [again.get((r[0], r[1]), r) for r in results]
+            results = [r if r[2] != "OK" or (r[0], r[1]) not in again
+                       else r[:3] + (f"重測才回（首測逾時 {a.timeout}s）",) + r[4:] for r in results]
     finally:
         if proc:
             proc.terminate()
@@ -294,6 +359,9 @@ def main():
         print(f"{c}{st:9}{RESET} {secs:6.1f}s {prov}/{mid:42} {reason}")
     if a.tsv:
         append_tsv(a.tsv, results)
+        if a.x_handle:
+            ups = x_updates(os.path.join(os.path.dirname(a.tsv), f"x-{a.x_handle}.seen"), a.x_handle)
+            notify_x(ups or [], a.x_handle)
     keys = ("OK", "QUOTA", "RATELIMIT", "FAIL", "TIMEOUT", "ERR", "NOCLIENT", "GONE")
     counts = {k: sum(1 for r in results if r[2] == k) for k in keys}
     print("\n" + " / ".join(f"{k} {counts[k]}" for k in keys) + f"  （共 {len(results)}，GONE 用 --all 顯示）")
