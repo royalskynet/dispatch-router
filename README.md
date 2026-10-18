@@ -10,7 +10,7 @@
 git clone https://github.com/royalskynet/dispatch-router && cd dispatch-router && ./install.sh
 ```
 
-需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`oc-free-check` 連到 `~/.local/bin`、註冊每日探測免費模型的 launchd job、把 skill 連到 `~/.claude/skills/dr`。
+需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`oc-free-check` 連到 `~/.local/bin`、註冊每日探測免費模型的 launchd job（plist 內的 `/Users/you` 佔位會代換成實際 `$HOME`）、把 skill 連到各 agent 客戶端的 skills 目錄（見下節）。
 
 ## English
 
@@ -84,7 +84,17 @@ The rest of this README is in Traditional Chinese.
 ./install.sh
 ```
 
-連結 `~/.local/bin/dc` 與 `~/.claude/skills/dr`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
+連結 `~/.local/bin/dc` 與 skill `dr` 到各 agent 客戶端的 skills 目錄：
+
+| 目錄 | 誰讀 |
+|---|---|
+| `~/.claude/skills/dr` | Claude Code（另有 opencode，它本身也讀這裡） |
+| `~/.agents/skills/dr` | 讀 `~/.agents/skills` 的其他 agent |
+| `~/.codex/skills/dr` | Codex CLI |
+
+`DR_SKILL_HOME` 可改成其他目錄清單（空白分隔），重跑 `install.sh` 是冪等的。
+
+**client 支援範圍**：`dc`／`dcq` 是 shell 指令，任何能跑 bash 的 agent（Claude Code、Codex CLI、opencode）都能用；skill 只是把用法教給該客戶端。Codex CLI 讀 `~/.codex/skills/`（`SKILL.md` 的 YAML frontmatter 格式相同），`install.sh` 一併連結；若你的 Codex 版本尚未支援 skills，直接照本 README 的派工章節用 `dc`／`dcq` 即可，不影響功能。
 
 **相依**：`wo-verify`、`deep-lint` 收在本 repo `bin/`，dc 直接用同目錄那份，不需要裝 `deep-agent`／deepclaude。`DC_BIN=<dir>` 只用來覆寫（測試注入假閘）。
 
