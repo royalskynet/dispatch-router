@@ -83,4 +83,41 @@ if awk -F'\t' 'NF>=6 && $4=="NOCLIENT" && $6=="x" {ok=1} END{exit !ok}' "$T/prob
 else
   echo "FAIL 原因沒寫進第 6 欄"; fail=1
 fi
+
+# 重測對象：只挑「上一批也逾時／錯誤、這批又逾時」的，第一次逾時與上一批 OK 的不重測
+printf '%s' $'2026-10-17_06:00:00\topencode\tslow\tTIMEOUT\t60.0\tx\n2026-10-17_06:00:00\topencode\tfine\tOK\t2.0\n' > "$T/rt.tsv"
+python3 - "$T/rt.tsv" <<'PY' && echo "PASS 只重測連兩批逾時的" || { echo "FAIL 只重測連兩批逾時的"; fail=1; }
+import importlib.util, importlib.machinery, sys
+spec = importlib.util.spec_from_loader("ofc", importlib.machinery.SourceFileLoader("ofc", "bin/oc-free-check"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+res = [("opencode", "slow", "TIMEOUT", "", 60.0), ("opencode", "fine", "TIMEOUT", "", 60.0),
+       ("opencode", "new", "TIMEOUT", "", 60.0)]
+got = m.needs_retest(sys.argv[1], res)
+assert got == [("opencode", "slow")], got
+assert m.needs_retest(sys.argv[1] + ".none", res) == []
+PY
+
+# 官方 X：第一次只建基準不推；之後只推新且命中關鍵字的；twitter 壞掉回 None 不炸
+cat > "$T/bin/twitter" <<'EOF'
+#!/bin/sh
+cat "$X_FEED"
+EOF
+chmod +x "$T/bin/twitter"
+X_FEED="$T/feed.json" python3 - "$T/x.seen" <<'PY' && echo "PASS 官方 X 新推文判準" || { echo "FAIL 官方 X 新推文判準"; fail=1; }
+import importlib.util, importlib.machinery, sys, json, os
+spec = importlib.util.spec_from_loader("ofc", importlib.machinery.SourceFileLoader("ofc", "bin/oc-free-check"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+seen, feed = sys.argv[1], os.environ["X_FEED"]
+def put(posts): json.dump(posts, open(feed, "w"))
+put([{"id": "1", "time": "a", "text": "Beam is now free in OpenCode"}])
+assert m.x_updates(seen) == [], "第一次要只建基準"
+put([{"id": "2", "time": "b", "text": "Muse Spark free period ending"},
+     {"id": "3", "time": "c", "text": "Meetup photos from SF"},
+     {"id": "1", "time": "a", "text": "Beam is now free in OpenCode"}])
+got = m.x_updates(seen)
+assert [x[0] for x in got] == ["2"], got
+assert m.x_updates(seen) == [], "看過的不再推"
+put({"ok": False, "error": "not authenticated"})
+assert m.x_updates(seen) is None
+PY
 exit $fail
