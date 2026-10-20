@@ -70,21 +70,11 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 
 模型池來源是 `catalog/models.tsv`（free／sub／api 標籤），per-provider 併發上限在 `catalog/providers.tsv`。系統一模型（Laya、Jev）在 `catalog/judges.tsv`，只做判斷題，不能派工。
 
-## 兩條線不能混（2026-10-20 使用者定，fixindex 11041）
+## OC 模型只准 opencode run（2026-10-20 使用者定，fixindex 11041）
 
-dr 底下有兩套呼叫邏輯。清冊的 `dc_id` 前綴決定走哪條。
+派dr 的順序照上表：免費 → 訂閱 → 付費（API）。這節不改順序，只管呼叫方式。
 
-| 線 | 層 | `dc_id` | 怎麼叫 |
-|---|---|---|---|
-| opencode CLI | 免費、懲罰 | 無前綴（Zen `*-free`、`big-pickle`） | 只能 `opencode run`／`dc`／`dcq` |
-| opencode CLI | 訂閱 | `opencode-go/…` | `opencode run`，dc 臨時開 opencode-go provider |
-| OmniRoute API | 兜底 | `omniroute/<combo>`（`go-free`、`or-free`） | opencode 經本機 :20128 HTTP，combo 決定上游 |
-
-- **Zen 免費模型禁止 API 直打**（curl、OmniRoute、Hermes 都算）。API 沒回應不代表壞，不准判失效，也不准重試探測：OpenCode 會判濫用、封整個 IP 的 Zen 池（10-19 整池 403 就是這樣）。要知道能不能用，看 06:00 probe 排名，不另外探。
-- **Go 端點可以走 API**：Go 訂閱，以及 Go 端點上的免費模型（`opencode-go/*-free`，例如 OmniRoute `go-free` combo：longcat／beam／minimax-m3.1-flash-free＋nim-pool）。Zen 封鎖時 dr 就靠這條兜底。
-- **同名不同路**：`minimax-m3.1-flash-free`（Zen，CLI 線）和 `opencode-go/minimax-m3.1-flash-free`（Go，API 可打）是兩個入口，冷卻與封鎖互不影響。
-- **combo 在清冊要自己一列**，`model` 欄寫 combo 名，不掛在單一模型列上。`bin/dc` 的 `tier()` 也要明列，否則被當 metered。
-- **chain-a 不接 dr**：`go-free → or-free → go-sub`，尾棒 go-sub 付費，會讓派drf 漏進訂閱。要用就接它的免費段（`go-free`、`or-free`）。
+- 凡是 OC 模型（`opencode/…`、`opencode-go/…`），一律經 `opencode run`／`dc`／`dcq` 呼叫，不准 curl 或 HTTP 直打。API 沒回應不代表壞，不准判失效，也不准重試探測：OpenCode 會判濫用、封整個 IP 的 Zen 池（10-19 整池 403）。要知道能不能用，看 06:00 probe 排名。
 - 工單的 `ORDER` 入列時寫進 job 檔；重啟 runner 改不到排隊中的單，正在跑的單也不會中途換鏈。要改派法就改 job 檔或重新 `dcq add`。
 
 ## 多張工單就用 dcq（併發跑者）
