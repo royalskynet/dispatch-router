@@ -21,7 +21,7 @@ cat > "$T/bin/dc" <<'EOF'
 #!/usr/bin/env bash
 task="$1"; cwd="$2"; n="$(basename "$task" .md)"
 echo "IN $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
-case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; *) sleep 1 ;; esac
+case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; spin*:m1|vspin*:m1) case "$n" in v*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)" ;; esac; for i in $(seq 8); do echo tick; sleep 1; done ;; wspin*:m1) for i in $(seq 8); do echo $i > "$cwd/f$i"; echo tick; sleep 1; done ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; *) sleep 1 ;; esac
 echo "OUT $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
 case "$n" in
   local*) echo "Error: Unexpected error"; echo "no such column: project_id"; echo "dc: opencode run rc=1" ;;
@@ -173,6 +173,21 @@ DCQ_MODELS="m1 m2" DCQ_ATTEMPT_MAX=4 DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=1 dcq run 
 chk "單隻超時換 m2 過關" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "1"
 chk "m1 沒跑滿 30s" "$(grep -c '^OUT busy1 .* m1 ' "$TRACE")" "0"
 chk "gaps.tsv 記 slow" "$(grep -c $'\tm1\t.*\tslow\t' "$DCQ_HOME/logs/gaps.tsv")" "1"
+
+# 10c) 防空轉：git cwd 裡 m1 一直有輸出但不改檔 → SPIN_S 到就殺、換 m2；有改檔／進驗收／逐張關掉都不殺
+for w in g1 g2 g3 g4; do git init -q "$T/$w"; done
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"; : > "$DCQ_HOME/logs/gaps.tsv"
+mk spin1 "$T/g1"; mk wspin1 "$T/g2"; mk vspin1 "$T/g3"; mkdir -p "$T/ng"; mk spin3 "$T/ng"
+printf '# spin2\n' > "$T/spin2.md"; DCQ_SPIN_S=0 dcq add "$T/spin2.md" "$T/g4" >/dev/null
+DCQ_MODELS="m1 m2" DCQ_SPIN_S=3 DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=99 dcq run -j 4 >"$T/spin.out" 2>&1
+chk "五張都過關" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "5"
+chk "空轉的 m1 被殺（沒跑完 8s）" "$(grep -c '^OUT spin1 .* m1 ' "$TRACE")" "0"
+chk "空轉換 m2 過關" "$(grep -c '^IN spin1 .* m2 ' "$TRACE")" "1"
+chk "gaps.tsv 只記 1 筆 spin" "$(grep -c $'\tspin\t' "$DCQ_HOME/logs/gaps.tsv")" "1"
+chk "一直改檔的不殺" "$(grep -c '^OUT wspin1 .* m1 ' "$TRACE")" "1"
+chk "進驗收後不殺" "$(grep -c '^OUT vspin1 .* m1 ' "$TRACE")" "1"
+chk "DCQ_SPIN_S=0 入列的不殺" "$(grep -c '^OUT spin2 .* m1 ' "$TRACE")" "1"
+chk "非 git cwd 不看（同樣不改檔也不殺）" "$(grep -c '^OUT spin3 .* m1 ' "$TRACE")" "1"
 
 # 11) 權重：免費兩隻 × 2 輪全上游失敗，才 fallback 訂閱層
 dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
