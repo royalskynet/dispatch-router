@@ -211,7 +211,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 
 環境變數：`DCQ_HOME`（預設 `~/.dcq`）、`DCQ_JOBS`、`DCQ_POOL_GO`、`DCQ_POOL_ZEN`、`DCQ_POOL_PAID`、`DCQ_FREE_ROUNDS`、`DCQ_MODELS`、`DCQ_MODEL_MAX`、`DCQ_ALLOWED_FAILS`、`DCQ_COOLDOWN_S`、`DCQ_STALL_S`、`DCQ_JOB_MAX`、`DCQ_ATTEMPT_MAX`、`DCQ_POLL_S`。舊名 `DCQ_BREAK_N`／`DCQ_BREAK_S` 仍可用，對應到 `DCQ_ALLOWED_FAILS`／`DCQ_COOLDOWN_S`。
 
-自檢（都用假的下游，不打上游）：`./test/dcq_test.sh`（佇列、模型池、權重 fallback、冷卻、併發槽、watchdog、cancel）、`./test/dc_lock_test.sh`（cwd 鎖）、`./test/dc_model_test.sh`（模型閘：哪些准派、哪些要拒）、`./test/spinwatch_test.sh`（防空轉）
+自檢（都用假的下游，不打上游）：`./test/dcq_test.sh`（佇列、模型池、權重 fallback、冷卻、併發槽、watchdog、防空轉、cancel）、`./test/dc_lock_test.sh`（cwd 鎖）、`./test/dc_model_test.sh`（模型閘：哪些准派、哪些要拒）
 
 ### 同一個 repo 的多張工單要併發：一張一個 git worktree
 
@@ -225,15 +225,13 @@ dcq add /abs/A1.md <wt>/A1 mid
 
 工單裡的 cwd 要寫 worktree 路徑。改同一個檔的兩張會在 merge 時衝突，衝突由主 session 處理。2026-10-21 實測 4 張同 repo 併發 3 張第一輪 PASS。
 
-### `dcq-spinwatch` —— 防空轉（零 token）
+### 防空轉（watchdog 內建，零 token）
 
-dcq 的 watchdog 只看 `.out` 有沒有輸出。模型一直講話卻不改檔（繞圈讀檔、反覆重試同一招）抓不到，要等 `DCQ_ATTEMPT_MAX` 才換手。`dcq-spinwatch` 看 cwd 的 `git status`＋`git diff`：同一次嘗試 `-s` 秒（預設 420）工作樹完全沒變，就殺這次嘗試的程序樹，dcq 照常記失敗、換下一隻。全部工單離開 pending／running 就自己結束，紀錄在 `~/.dcq/logs/spinwatch.log`。
+dcq 的停滯判定只看 `.out` 有沒有輸出。模型一直講話卻不改檔（繞圈讀檔、反覆重試同一招）抓不到，要等 `DCQ_ATTEMPT_MAX` 才換手。cwd 是 git 工作樹時，watchdog 另外看工作樹指紋（HEAD＋`git diff HEAD`＋未追蹤檔內容）：同一次嘗試 `DCQ_SPIN_S` 秒（預設 420）完全沒變，就殺這次嘗試，記 `why=spin`，跟 stall 一樣罰冷卻、換下一隻，`dcq rank` 的停滯欄也算它。
 
-```bash
-dcq-spinwatch -s 420 <job-id>=<cwd> ... &   # cwd 必須是 git 工作樹
-```
-
-限制：唯讀工單（只產報告到 cwd 外）不能掛；驗收要跑超過 `-s` 秒的工單也會在驗收階段被誤殺，`-s` 要比最慢的驗收寬。
+- 非 git cwd 不看。
+- `.out` 出現 `dc: 驗收 →` 之後不看，慢驗收不會被誤殺。
+- 唯讀工單（只產報告到 cwd 外）在 git cwd 裡跑超過 420s 會被誤殺：入列時帶 `DCQ_SPIN_S=0 dcq add ...`，這張就不看（記成工單的 `SPIN=0`）。
 
 ### 清冊與難度分層（2026-10-19）
 
