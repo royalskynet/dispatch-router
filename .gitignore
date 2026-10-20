@@ -1,3 +1,5 @@
 .bak/
 .DS_Store
 *.log
+catalog/*.lock
+catalog/*.tmp

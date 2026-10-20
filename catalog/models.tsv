@@ -18,17 +18,19 @@ free	opencode-run	opencode/longcat-2.5-preview-free	gated	probe OK 10-18	Zen 免
 free	opencode-run	opencode/mimo-v2.6-flash-free	gated	probe OK 10-18	Zen 免費；真實工單會無限重複 Glob/Read（opencode#50678）	mimo-v2.6-flash-free	easy
 free	opencode-run	opencode/big-pickle	gated	probe OK 10-18	Zen 免費；曾卡住、假扮工具	big-pickle	easy
 free	opencode-run	opencode/nemotron-3.5-lightning-free	gated	probe OK 10-16	Zen 免費；94s 且改錯過	nemotron-3.5-lightning-free	easy
-free	omniroute	opencode-go/longcat-2.5-preview-free	ok	calllog 10396/11502	Go 免費（Go API 可直打）；OmniRoute go-free 首棒		any
-free	omniroute	opencode-go/step-5-preview-free	flaky	calllog 14/215	Go 免費		any
-free	omniroute	opencode-go/beam-free	ok	calllog 1/1	Go 免費；樣本少		any
-free	omniroute	opencode-go/cat-jam-free	ok	calllog 1/1	Go 免費；樣本少		any
-free	omniroute	go-free（combo）	ok	10-20 實打回 longcat-2.5-preview-free	OmniRoute HTTP combo：opencode-go longcat／beam／minimax-m3.1-flash-free＋nim-pool，全免費（10-20 查 combos 表）；chain-a＝go-free→or-free→go-sub，尾棒付費不接	omniroute/go-free	any
+free	opencode-run	opencode-go/longcat-2.5-preview-free	ok	calllog 10396/11502	Go 免費（Go API 可直打）；OmniRoute go-free 首棒	opencode-go/longcat-2.5-preview-free	any
+free	opencode-run	opencode-go/step-5-preview-free	flaky	calllog 14/215	Go 免費		any
+free	opencode-run	opencode-go/beam-free	ok	calllog 1/1	Go 免費；樣本少	opencode-go/beam-free	any
+free	opencode-run	opencode-go/minimax-m3.1-flash-free	ok	手動補同步 10-21	Go 免費；自動新增，尚無實測	opencode-go/minimax-m3.1-flash-free	any
+free	opencode-run	opencode-go/cat-jam-free	removed	calllog 1/1	Go 免費；樣本少；10-21 自動移出（手動補同步：上游無）		any
+free	omniroute	go-free（combo）	removed	10-20 實打回 longcat-2.5-preview-free	OmniRoute HTTP combo：opencode-go longcat／beam／minimax-m3.1-flash-free＋nim-pool，全免費（10-20 查 combos 表）；chain-a＝go-free→or-free→go-sub，尾棒付費不接；10-20 23:22 經 dc 實跑 OmniRoute 回 Unable to determine provider for model go-free（/v1/models 有列但 combo 路由不通），Go *-free 已直接進兜底層；10-20 使用者刪除 OmniRoute 內全部 OC 模型，combo 已不存在		any
+free	omniroute	nim-pool（combo）	ok	10-20 chain-a 實打回 openai/gpt-oss-20b	OmniRoute HTTP combo：NVIDIA NIM gpt-oss-20b→nemotron-super（round-robin 兩 key）→glm-5.3-flash→ultra，全免費；非 OC 免費主路，排在 Go *-free 之後、or-free 之前	omniroute/nim-pool	any
 free	omniroute	openrouter/free	ok	calllog 2206/3744	OpenRouter 免費池隨機分配（or-free combo）；:free 20 RPM	omniroute/or-free	easy
 free	omniroute	openrouter/*:free（17 個）	unverified	OpenRouter /models 10-19	nemotron-3 ultra/super、gemma-4、inkling、laguna 等；個別直點未測		any
 free	omniroute	nvidia/openai/gpt-oss-20b	flaky	calllog 6/16	NVIDIA NIM 免費；失敗多為佇列逾時 45s		any
 free	omniroute	nvidia/nvidia/nemotron-3-super-120b-a12b	flaky	calllog 4/14	NVIDIA NIM 免費		any
 free	omniroute	nvidia/z-ai/glm-5.3-flash	ok	calllog 1/1	NVIDIA NIM 免費；樣本少		any
-free	omniroute	openai-compatible-chat-agnes/agnes-2.0-flash	flaky	calllog 0/801	Agnes 免費帳號：7 天零成功（429 免費限額、503 no available channel）；建議移出兜底層		any
+free	omniroute	openai-compatible-chat-agnes/agnes-3.0-flash	ok	curl 1/1 2026-10-20	舊 2.0-flash 整代已被上游下架（500 get_channel_failed）；免費改 3.0-flash（pricing 現價 $0、非 reasoning 模型）。免費層仍有未公開 token 額度（fix 10187），不進 combo／鏈中段（fix 10235）		any
 free	gemini-cli	gemini（AI Studio key）	unverified	settings 有 API key	免費層額度官方不再公布，看 AI Studio；本機沒有成功紀錄		any
 sub	claude-code	claude-fable-5-1／claude-opus-5-5／claude-sonnet-5-5／claude-haiku-5-5	ok	auth claude.ai pro	本 session 即是；子 agent 用 Agent 工具 model 參數		any
 sub	codex	gpt-6.1-sol（預設）／gpt-6-sol／gpt-6-luna／gpt-6-astra	ok	auth ChatGPT	codex exec；codex 只接專屬執行位		any
@@ -39,6 +41,8 @@ sub	omniroute	opencode-go/minimax-m3	unverified	Go 上游清單	Go 訂閱；27s	
 sub	omniroute	opencode-go/qwen3.8-flash	unverified	Go 上游清單	Go 訂閱；28s	opencode-go/qwen3.8-flash	any
 sub	omniroute	opencode-go/kimi-k2.7-code	unverified	Go 上游清單	Go 訂閱	opencode-go/kimi-k2.7-code	any
 sub	omniroute	opencode-go/glm-5.3	unverified	Go 上游清單	Go 訂閱	opencode-go/glm-5.3	any
+sub	opencode-run	opencode-go/gemini-4-argon-contributor	ok	run 10-21 ok 7s	Go 訂閱；自動新增；10-21 opencode run 實打 1 次回 ok	opencode-go/gemini-4-argon-contributor	any
+sub	opencode-run	opencode-go/step-5-preview	ok	run 10-21 ok 3s	Go 訂閱；自動新增；10-21 opencode run 實打 1 次回 ok	opencode-go/step-5-preview	any
 sub	omniroute	opencode-go/step-5-preview	ok	calllog 1/1	Go 訂閱		any
 api	opencode-run	opencode/<Zen 付費 80+ 個>	unverified	opencode models	扣 Zen 餘額：Claude／GPT-5～6.1／Gemini 3.x／Grok／Kimi／Qwen3.8-max 等		any
 api	omniroute	openai/*（OpenAI 連線）	unverified	calllog 只有 connection-test	Hermes 語音用 whisper-1／gpt-4o-mini-tts；按量計費		any

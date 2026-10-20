@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""catalog-sync — 把 dcq 啟動時算出的名單增刪回寫 catalog/models.tsv（由 `dcq sync-catalog` 呼叫）。
+
+增刪清單由 dcq 經環境變數給（同一套同步邏輯，不在這裡重算）：
+  SYNC_ADD_ZEN     Zen 免費新增（dc_id 無斜線）
+  SYNC_ADD_GOFREE  Go 免費新增（opencode-go/*-free）
+  SYNC_ADD_SUB     Go 訂閱新增（opencode-go/*）
+  SYNC_RM          要移出的 dc_id（三層合計）
+移出照清冊既有慣例：status=removed、dc_id 清空、note 記原因，列保留（git 可追）。
+新增插在同層同類最後一列之後，與 dcq 動態結果的排位相同。清冊原本乾淨才自動 commit。
+
+用法：catalog-sync <models.tsv> [--dry-run] [--source <來源>] [--no-commit]
+"""
+import datetime
+import fcntl
+import os
+import subprocess
+import sys
+
+COLS = 8  # billing route model status evidence note dc_id fit
+
+
+def kind(dc_id):
+    return "zen" if "/" not in dc_id else dc_id.split("/", 1)[0]
+
+
+def apply(lines, add_zen, add_gofree, add_sub, rm, source, today):
+    """回傳 (新 lines, 變更說明 list)。lines 保留原文（含換行）。"""
+    rows = []  # (index, fields) 只收資料列
+    for i, l in enumerate(lines):
+        if l.strip() and not l.startswith("#"):
+            f = l.rstrip("\n").split("\t")
+            f += [""] * (COLS - len(f))
+            rows.append((i, f))
+    out = list(lines)
+    changes = []
+    active = {f[6] for _, f in rows if f[6]}
+
+    for i, f in rows:
+        if f[6] and f[6] in rm:
+            changes.append(f"移出 {f[6]}")
+            f[3], f[6] = "removed", ""
+            f[5] = f"{f[5]}；{today} 自動移出（{source}：上游無）" if f[5] else f"{today} 自動移出（{source}：上游無）"
+            out[i] = "\t".join(f) + "\n"
+
+    def insert(dc_id, billing, model, note):
+        if dc_id in active:
+            return
+        for i, f in rows:  # 同一模型曾被移出 → 原列復用（只認 removed；dc_id 空的 omniroute 紀錄列不算）
+            if f[2] == model and f[0] == billing and f[3] == "removed" and f[1] == "opencode-run":
+                f[3], f[6] = "ok", dc_id
+                f[5] = f"{f[5]}；{today} 自動恢復（{source}）"
+                out[i] = "\t".join(f) + "\n"
+                changes.append(f"恢復 {dc_id}")
+                active.add(dc_id)
+                return
+        # 插在同層同類最後一列之後（排位與 dcq 動態結果一致）；找不到同類就放檔尾
+        anchor = max((i for i, f in rows if f[0] == billing and f[6] and kind(f[6]) == kind(dc_id)),
+                     default=len(out) - 1)
+        after.setdefault(anchor, []).append("\t".join([billing, "opencode-run", model, "ok", f"{source} {today}",
+                                                       f"{note}；自動新增，尚無實測", dc_id, "any"]) + "\n")
+        changes.append(f"新增 {dc_id}")
+        active.add(dc_id)
+
+    after = {}
+    for m in add_zen:
+        insert(m, "free", f"opencode/{m}", "Zen 免費")
+    for m in add_gofree:
+        insert(m, "free", m, "Go 免費")
+    for m in add_sub:
+        insert(m, "sub", m, "Go 訂閱")
+    return [x for i, l in enumerate(out) for x in [l, *after.get(i, [])]], changes
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    path = argv[1]
+    dry = "--dry-run" in argv
+    no_commit = "--no-commit" in argv
+    source = argv[argv.index("--source") + 1] if "--source" in argv else "dcq 名單同步"
+    env = lambda k: os.environ.get(k, "").split()
+    add_zen, add_gofree, add_sub, rm = env("SYNC_ADD_ZEN"), env("SYNC_ADD_GOFREE"), env("SYNC_ADD_SUB"), set(env("SYNC_RM"))
+    today = datetime.date.today().strftime("%m-%d")
+
+    with open(path + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        lines = open(path, encoding="utf-8").readlines()
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        out, changes = apply(lines, add_zen, add_gofree, add_sub, rm, source, today)
+        if not changes:
+            print("catalog-sync: 清冊無變動")
+            return 0
+        print("catalog-sync: " + "；".join(changes))
+        if dry:
+            return 0
+        repo = os.path.dirname(os.path.abspath(path))
+        git = lambda *a: subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
+        in_git = git("rev-parse", "--is-inside-work-tree").returncode == 0
+        clean = in_git and git("diff", "--quiet", "HEAD", "--", path).returncode == 0
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(out)
+        os.replace(tmp, path)
+        if no_commit or not in_git:
+            return 0
+        if not clean:
+            print("catalog-sync: 清冊原有未提交改動，只寫檔不 commit", file=sys.stderr)
+            return 0
+        git("add", "--", path)
+        r = git("commit", "-q", "-m", f"catalog: 自動同步（{source}）" + "；".join(changes), "--", path)
+        if r.returncode != 0:
+            print("catalog-sync: commit 失敗：" + (r.stderr or r.stdout).strip(), file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""oc-free-check — 測 opencode 免費模型「現在」哪些真的可用。
+
+為什麼要這支：官網列 free 只代表標價 $0，不是即時可用性。免費端點跑在第三方
+上游，常被下架或回 500。而且 free tier 有來源檢查——直接打 API 會回
+FreeTierError「can only be used from within OpenCode」，所以只能透過 opencode
+本身發請求。本工具起一個 opencode server，逐一對免費模型送訊息，回報真實狀態。
+
+用法:
+  oc-free-check                # opencode + opencode-go 全部 free
+  oc-free-check -p opencode    # 指定 provider（可多個，空白分隔）
+  oc-free-check -f ling        # 只測名稱含 ling 的
+  oc-free-check -j 8 -t 60     # 併發 8、逾時 60s
+  oc-free-check --server http://127.0.0.1:41999   # 沿用既有 server，不自起
+  oc-free-check --all          # 連已下架（GONE）的也列出
+  oc-free-check --tsv F        # 排程用：寫 TSV、判通知，並推 @opencode 新推文（--x-handle '' 關掉）
+  oc-free-check --x-only D     # 只讀 @opencode 新推文（seen 檔放 D）：推通知；講到上下架／免費變動 exit 3，不送任何模型請求
+"""
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+CACHE = os.environ.get("MODELS_JSON", os.path.expanduser("~/.cache/opencode/models.json"))
+PROMPT = "Reply with just: ok"
+GREEN, RED, YEL, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
+
+
+ZEN_MODELS = "https://opencode.ai/zen/v1/models"
+
+
+def zen_listed():
+    """官方 Zen 目前上架的模型 id（跟 opencode.ai 後台 Models 頁同一份）；抓不到回 None，退回只看快取。"""
+    try:
+        return {m["id"] for m in http("GET", ZEN_MODELS, timeout=15).get("data", [])}
+    except Exception:
+        return None
+
+
+def free_models(providers, filt, listed=None):
+    """回 (provider, model, 狀態)；狀態 None＝要真的探測。
+    - GONE：快取標 deprecated（opencode 自己不列，送了立刻 HTTP 500），或官方清單已沒有它
+    - NOCLIENT：官方已上架、本機 opencode 的模型快取還沒有，dc 叫不到（實測回 server error）
+    官方清單只對 provider=opencode（Zen）有意義。"""
+    d = json.load(open(CACHE))
+    out = []
+    for p in providers:
+        cached = d.get(p, {}).get("models", {})
+        for mid, m in cached.items():
+            c = m.get("cost") or {}
+            if c.get("input", 0) == 0 and c.get("output", 0) == 0 and (not filt or filt in mid):
+                off = p == "opencode" and listed is not None and mid not in listed
+                out.append((p, mid, "GONE" if m.get("status") == "deprecated" or off else None))
+        if p == "opencode" and listed:
+            # jev-*：Zen 文件寫走 /zen/v1/systemone（TypeSafe System One 判斷模型，非聊天），
+            # opencode 對話協定一律回「Model does not support this protocol」，dc 永遠用不到
+            # ponytail: 清單 API 不給協定，只能按名稱排除；Zen 再出非聊天模型要加進這裡
+            out += [(p, mid, "NOCLIENT") for mid in sorted(listed - cached.keys())
+                    if mid.endswith("-free") and not mid.startswith("jev-")
+                    and (not filt or filt in mid)]
+    return out
+
+
+def http(method, url, body=None, timeout=120):
+    data = json.dumps(body).encode() if body is not None else None
+    # opencode.ai 會 403 掉 Python-urllib 預設 UA
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json", "User-Agent": "oc-free-check"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "null")
+
+
+def start_server():
+    p = subprocess.Popen(
+        ["opencode", "serve", "--port", "0"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    url, deadline = None, time.time() + 30
+    while time.time() < deadline:
+        line = p.stdout.readline()
+        if not line:
+            break
+        m = re.search(r"(http://127\.0\.0\.1:\d+)", line)
+        if m:
+            url = m.group(1)
+            break
+    if not url:
+        p.terminate()
+        sys.exit("無法啟動 opencode server")
+    threading.Thread(target=p.stdout.read, daemon=True).start()
+    for _ in range(30):
+        try:
+            http("GET", url + "/session", timeout=5)
+            return p, url
+        except Exception:
+            time.sleep(0.3)
+    p.terminate()
+    sys.exit("opencode server 沒有就緒")
+
+
+def classify_retry(s):
+    """opencode 遇到限流不回錯，而是自己重試（/session/status type=retry），同步呼叫就一路卡到
+    逾時，看起來像掛了。這裡直接讀重試原因：額度用完／限流都不是模型壞掉。"""
+    act = s.get("action") or {}
+    msg = s.get("message", "")
+    if act.get("reason") == "free_tier_limit":
+        nxt = s.get("next")
+        at = time.strftime("%m-%d %H:%M", time.localtime(nxt / 1000)) if nxt else "?"
+        return "QUOTA", f"{msg}（{at} 重置）"
+    if "rate limit" in msg.lower() or "429" in msg:
+        return "RATELIMIT", msg
+    return None, msg
+
+
+def read_reply(base, sid):
+    """None＝還沒有結果；否則 (狀態, 原因)。"""
+    msgs = http("GET", f"{base}/session/{sid}/message", timeout=15) or []
+    for m in reversed(msgs):
+        info = m.get("info", {})
+        if info.get("role") != "assistant":
+            continue
+        err = info.get("error")
+        if err:
+            msg = str((err.get("data") or {}).get("message") or err.get("name") or err)
+            return ("GONE" if "deprecated" in msg.lower() else "FAIL"), msg
+        if any(p.get("type") == "text" and p.get("text", "").strip() for p in m.get("parts", [])):
+            return "OK", ""
+        if info.get("time", {}).get("completed"):
+            return "FAIL", "回覆完成但沒有文字"
+    return None
+
+
+def test_one(base, prov, mid, timeout):
+    try:
+        # 帶 title：沒 title 的 session 會另叫 small model 產標題，白白多吃一份免費額度
+        sid = http("POST", base + "/session", {"title": "oc-free-check"}, timeout=30)["id"]
+    except Exception as e:
+        return (prov, mid, "ERR", f"建 session 失敗: {e}")
+    try:
+        http("POST", f"{base}/session/{sid}/prompt_async",
+             {"model": {"providerID": prov, "modelID": mid},
+              "parts": [{"type": "text", "text": PROMPT}]}, timeout=30)
+        deadline, last_retry = time.monotonic() + timeout, ""
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            s = (http("GET", base + "/session/status", timeout=15) or {}).get(sid) or {"type": "idle"}
+            if s["type"] == "retry":
+                st, last_retry = classify_retry(s)
+                if st:
+                    return (prov, mid, st, last_retry)
+            elif s["type"] == "idle":
+                r = read_reply(base, sid)
+                if r:
+                    return (prov, mid) + r
+        return (prov, mid, "TIMEOUT", f"逾時 {timeout}s" + (f"；重試中：{last_retry}" if last_retry else ""))
+    except urllib.error.HTTPError as e:
+        return (prov, mid, "FAIL", f"HTTP {e.code} {e.read().decode(errors='replace')[:70]}")
+    except Exception as e:
+        return (prov, mid, "ERR", str(e)[:80])
+    finally:
+        for method, path in (("POST", "abort"), ("DELETE", "")):
+            try:
+                http(method, f"{base}/session/{sid}" + (f"/{path}" if path else ""), timeout=15)
+            except Exception:
+                pass
+
+
+def timed(base, prov, mid, timeout):
+    t0 = time.monotonic()
+    return test_one(base, prov, mid, timeout) + (round(time.monotonic() - t0, 1),)
+
+
+# 跟 dc 的 ABUSE_RE 同一組措辭：IP 判濫用不是模型掛了，是整個出口 IP 的免費層被停
+ABUSE_RE = re.compile(r"Detect Abuse Traffic|Free Model Gateway.*Forbidden|Forbidden.*Free Model Gateway"
+                      r"|detected abusive traffic", re.I)
+# zen-gate 住 dispatch-router（dc 也用），經 ~/.local/bin 上 PATH。找不到就停：閘查不到時當「沒閘」
+# 會在 IP 已被判濫用時照樣打免費池（10-19 搬家後發生過一次）
+ZEN_GATE_BIN = shutil.which("zen-gate") or os.path.expanduser("~/.local/bin/zen-gate")
+if not os.access(ZEN_GATE_BIN, os.X_OK):
+    sys.exit(f"找不到 zen-gate（{ZEN_GATE_BIN}），不探測：查不到共用閘就可能在封鎖中照打")
+
+
+def zen_gate(*args):
+    """zen-gate until → int（兩份閘的聯集）；trip → 寫兩份閘。失敗回 0，不擋探測主流程。"""
+    try:
+        r = subprocess.run([ZEN_GATE_BIN, *args], capture_output=True, text=True, timeout=15)
+        return int((r.stdout.strip().splitlines() or ["0"])[-1])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def notify(msg):
+    if subprocess.run(["sh", "-c", "command -v hpush"], capture_output=True).returncode == 0:
+        subprocess.run(["hpush", msg], capture_output=True)
+
+
+def needs_retest(path, results):
+    """這批逾時／錯誤、上一批也逾時／錯誤的模型——再不處理就會被報「連兩批不回應」。
+    探測一天只跑一批，連兩批＝連兩天 06:00，同一時段上游壅塞就會誤報（10-18 nemotron-3.5-lightning
+    連兩天 60s 逾時，手動重測 10.1s OK），所以推播前用長逾時重測一次再定案。"""
+    if not os.path.exists(path):
+        return []
+    rows = [l.rstrip("\n").split("\t") for l in open(path) if l.count("\t") >= 4]
+    if not rows:
+        return []
+    last = max(r[0] for r in rows)
+    prev = {r[2]: r[3] for r in rows if r[0] == last}
+    return [(p, m) for p, m, st, _r, _s in results
+            if st in ("TIMEOUT", "ERR") and prev.get(m) in ("TIMEOUT", "ERR")]
+
+
+def append_tsv(path, results):
+    """每次跑一批、同一個時間戳，append 進 TSV 給 dcq rank 讀，再判要不要 hpush。
+
+    欄位：時間戳 provider model 狀態 秒數 原因。dcq 只看最新一批（時間戳最大的那批）。
+
+    通知判定（為什麼不是「非 OK 就喊掛了」）：TIMEOUT 跟 FAIL 不是同一件事。FAIL 是上游
+    明確回錯（下架、限流、模型不存在），逾時只代表這一刻沒回話——上游壅塞、cold start
+    都會逾時，隔一批自己就回來（muse-spark 曾量到 39.0s）。而且多個模型同時由 OK 轉逾時
+    幾乎都是共因（本機出口或上游整體變慢），不是它們同時掛掉，列名說「掛了」會誤導。
+    所以：FAIL 立刻報；單一模型逾時先不報，連兩批才報；一次多個轉逾時只報共因一句。
+    QUOTA／RATELIMIT 是免費額度用完或限流，模型本身沒事，只報一句不說掛了；
+    GONE 是 opencode 已下架（deprecated），由 OK 轉 GONE 才報一次。
+    NOCLIENT 是官方新上架、本機客戶端還不認得，第一次出現時報一次。
+    """
+    rows = []
+    if os.path.exists(path):
+        rows = [l.rstrip("\n").split("\t") for l in open(path) if l.count("\t") >= 4]
+    batches = sorted({r[0] for r in rows}, reverse=True)
+
+    def batch_state(i):
+        if len(batches) <= i:
+            return {}
+        return {r[2]: r[3] for r in rows if r[0] == batches[i]}
+
+    prev, prev2 = batch_state(0), batch_state(1)
+
+    ts = time.strftime("%Y-%m-%d_%H:%M:%S")
+    with open(path, "a") as f:
+        for prov, mid, st, reason, secs in results:
+            r = str(reason).replace("\t", " ").replace("\n", " ")[:120]
+            f.write(f"{ts}\t{prov}\t{mid}\t{st}\t{secs}\t{r}\n")
+
+    def newly(states):
+        return sorted(m for _p, m, st, _r, _s in results if st in states and prev.get(m) == "OK")
+
+    # IP 判濫用（zen-gate trip 已推一則）不算模型掛了
+    dead = [m for m in newly({"FAIL"}) if not any(r[1] == m and ABUSE_RE.search(str(r[3])) for r in results)]
+    gone = newly({"GONE"})
+    slow = newly({"TIMEOUT", "ERR"})
+    quota = [(m, r) for _p, m, st, r, _s in results if st in ("QUOTA", "RATELIMIT")
+             and prev.get(m) == "OK"]
+    # 連兩批沒回應才算真掛：上上批 OK、上一批與這批都逾時／錯誤
+    confirmed = sorted(m for _p, m, st, _r, _s in results if st in ("TIMEOUT", "ERR")
+                       and prev.get(m) in ("TIMEOUT", "ERR") and prev2.get(m) == "OK")
+    if dead:
+        notify("⚠️ dc 免費模型掛了（上游回錯）：" + "、".join(dead))
+    if gone:
+        notify("⚠️ dc 免費模型已下架（deprecated）：" + "、".join(gone))
+    fresh = sorted(m for _p, m, st, _r, _s in results if st == "NOCLIENT" and m not in prev)
+    if fresh:
+        notify("ℹ️ 官方新上架免費模型，本機 opencode 還叫不到（等 models.dev 收錄或升級）："
+               + "、".join(fresh))
+    if confirmed:
+        notify("⚠️ dc 免費模型連兩批不回應：" + "、".join(confirmed))
+    if quota:
+        notify(f"ℹ️ dc 免費額度用完／限流 {len(quota)} 個，模型沒掛："
+               + "、".join(m for m, _r in quota[:6]) + f"（{quota[0][1][-20:]}）")
+    if len(slow) >= 3:
+        notify(f"ℹ️ dc 探測整體變慢：{len(slow)} 個模型同時逾時，像共因不是各自掛掉"
+               f"（{'、'.join(slow[:5])}…）；下一批仍逾時才會報掛")
+
+
+# 官方 X 比 Zen 清單早講：新上架「now free」、限時免費結束、資安事件。清單只告訴你上下架了，
+# 推文告訴你為什麼、何時結束。只推新且命中關鍵字的，避免行銷文洗版。
+# ponytail: 關鍵字是手寫清單；漏報就加字，誤報多再改成只看含模型名的推文
+X_KEYWORDS = re.compile(
+    r"free|deprecat|sunset|remov|discontinu|no longer|ending|limited time|"
+    r"breach|security|incident|outage|downtime|zen|opencode go", re.I)
+
+
+def x_updates(seen_path, handle="opencode", n=15, posts_out=None):
+    """讀官方帳號最新推文，回本次新出現且命中關鍵字的 [(id, time, text)]；已看過的 id 記在 seen_path。
+    twitter CLI 失敗（沒登入、被限流）回 None，不影響模型探測。第一次跑只建基準不推，免得一次灌 15 則舊文。"""
+    try:
+        p = subprocess.run(["twitter", "-c", "user-posts", handle, "-n", str(n), "--json"],
+                           capture_output=True, text=True, timeout=60)
+        posts = json.loads(p.stdout)
+    except Exception as e:
+        print(f"⚠️ 讀不到 @{handle} 推文：{e}", file=sys.stderr)
+        return None
+    if not isinstance(posts, list):
+        print(f"⚠️ 讀不到 @{handle} 推文：{str(posts)[:80]}", file=sys.stderr)
+        return None
+    if posts_out is not None:
+        posts_out.extend((t["id"], t.get("time", ""), t.get("text", "")) for t in posts if t.get("id"))
+    first = not os.path.exists(seen_path)
+    seen = set() if first else set(open(seen_path).read().split())
+    fresh = [(t["id"], t.get("time", ""), t.get("text", "")) for t in posts
+             if t.get("id") and t["id"] not in seen]
+    with open(seen_path, "a") as f:
+        f.writelines(f"{i}\n" for i, _t, _x in fresh)
+    if first:
+        return []
+    return [x for x in fresh if X_KEYWORDS.search(x[2])]
+
+
+# 會讓「可用清單」變動的推文：上架、免費開始／結束、下架。命中就讓 oc-probe 提前跑一輪完整探測，
+# 由探測（opencode run）決定清單，推文本身不直接改名單（官方說上架≠本機叫得到，fixindex 10194）。
+X_POOL_CHANGE = re.compile(
+    r"now free|for free|free (?:for|until|in|on)|limited time|"
+    r"deprecat|sunset|remov|discontinu|no longer|ending|"
+    r"now (?:available|live)|new model|launch|added to (?:zen|go)", re.I)
+
+
+# 10-20：推文只當觸發的話，Zen 閘一鎖（IP 被判濫用）探測就整輪跳過，官方已公告的改名／下架永遠進不了名單
+#（10-19「Space Bunny was MiniMax M3.1 Flash」鎖了一整天，dr 池還排 space-bunny-free 第一）。
+# 能從推文第一行讀出的明確變動直接記進 x-pool.tsv，dcq 名單同步會套用比最新探測批次新的列：
+#   「A was B」＝A 下架、B 上架；「A is now free / now available…free」＝A 上架；「A is no longer free」等＝A 下架。
+# 名字要對得上已知模型才記（本機 models.json 快取＋probe.tsv＋清冊），對不上就略過，不猜。
+# ponytail: 句型是手寫的三種；官方換寫法就會漏，漏了照舊等探測。
+X_RENAME = re.compile(r"^(.+?) was (.+)$", re.I)
+X_ADD = re.compile(r"^(.+?) is (?:now )?(?:free|available)\b", re.I)
+X_GONE = re.compile(r"^(.+?) (?:is no longer (?:free|available)|has been (?:deprecated|removed)|"
+                    r"is being (?:deprecated|removed)|(?:free )?(?:period )?(?:has )?ended)\b", re.I)
+
+
+X_NEW_MAX_D = float(os.environ.get("X_NEW_MAX_D", "3"))
+
+
+def x_age_days(tid):
+    """X 的推文 id 是 snowflake：右移 22 位＋1288834974657 ＝發文 epoch 毫秒。解析不了當很舊。"""
+    try:
+        return (time.time() * 1000 - ((int(tid) >> 22) + 1288834974657)) / 86400000
+    except ValueError:
+        return 1e9
+
+
+def x_slug(name):
+    name = re.sub(r"\(.*?\)", "", name)
+    return re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-")
+
+
+def x_pool_changes(posts, known):
+    """posts=[(id, time, text)]，known=已知模型名集合；回 [(id, "GONE"|"NEW", 模型名)]。"""
+    def resolve(name):
+        s = x_slug(name)
+        return next((c for c in (s + "-free", s) if c in known), None)  # Zen 免費名帶 -free，付費同名不帶
+    out = []
+    for tid, _w, text in posts:
+        # 上架只信 X_NEW_MAX_D 天內的推文：限時免費（隱身模型多半一週）舊文再收就是收進已結束的；下架不限
+        fresh = x_age_days(tid) <= X_NEW_MAX_D
+        line = re.split(r"\n|\s{2,}", text.strip())[0].strip()
+        m = X_RENAME.match(line)
+        if m:
+            old, new = resolve(m.group(1)), resolve(m.group(2))
+            if old and new and old != new:
+                out += [(tid, "GONE", old)] + ([(tid, "NEW", new)] if fresh else [])
+            continue
+        m = X_GONE.match(line)
+        if m and resolve(m.group(1)):
+            out.append((tid, "GONE", resolve(m.group(1))))
+            continue
+        m = X_ADD.match(line)
+        if fresh and m and re.search(r"free", text, re.I) and resolve(m.group(1)):
+            out.append((tid, "NEW", resolve(m.group(1))))
+    return out
+
+
+def x_known(logd):
+    known = set()
+    try:
+        known |= set(json.load(open(CACHE)).get("opencode", {}).get("models", {}))
+    except Exception:
+        pass
+    for f, col in ((os.path.join(logd, "probe.tsv"), 2),
+                   (os.environ.get("DR_CATALOG", os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "catalog", "models.tsv")), 6)):
+        try:
+            known |= {l.split("\t")[col].strip() for l in open(f)
+                      if l.strip() and not l.startswith("#") and len(l.split("\t")) > col}
+        except Exception:
+            pass
+    return known
+
+
+def record_x_pool(path, changes):
+    """追加到 x-pool.tsv（時間\tid\t動作\t模型），同一則同一動作不重記；回新記的列。"""
+    have = set()
+    if os.path.exists(path):
+        have = {tuple(l.rstrip("\n").split("\t")[1:4]) for l in open(path) if l.strip()}
+    now = time.strftime("%F_%T")
+    fresh = [c for c in changes if c not in have]
+    with open(path, "a") as f:
+        f.writelines(f"{now}\t{t}\t{a}\t{m}\n" for t, a, m in fresh)
+    return fresh
+
+
+def notify_x(updates, handle="opencode"):
+    for tid, when, text in updates:
+        notify(f"📣 @{handle}（{when}）：{' '.join(text.split())[:200]}\nhttps://x.com/{handle}/status/{tid}")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("-p", "--providers", default="opencode opencode-go")
+    ap.add_argument("-f", "--filter", default="")
+    ap.add_argument("-j", "--jobs", type=int, default=8)
+    ap.add_argument("-t", "--timeout", type=int, default=60)
+    ap.add_argument("--server", default=None)
+    ap.add_argument("--tsv", default=None)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--x-handle", default="opencode")
+    ap.add_argument("--x-only", default=None, metavar="DIR")
+    ap.add_argument("--retest-timeout", type=int, default=150)
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return
+    if a.x_only is not None:
+        ups = x_updates(os.path.join(a.x_only, f"x-{a.x_handle}.seen"), a.x_handle, posts_out=(allp := []))
+        if ups is None:
+            sys.exit(2)
+        # 每輪掃最近 15 則全部（不只新的），已記過的不重記；閘鎖住時名單也能跟著官方公告走
+        for tid, act, m in record_x_pool(os.path.join(a.x_only, "x-pool.tsv"),
+                                         x_pool_changes(allp, x_known(a.x_only))):
+            print(f"X_POOL {act} {m}（推文 {tid}）")
+        notify_x(ups, a.x_handle)
+        hits = [u for u in ups if X_POOL_CHANGE.search(u[2])]
+        for tid, _w, text in hits:
+            print(f"X_POOL_CHANGE {tid} {' '.join(text.split())[:120]}")
+        sys.exit(3 if hits else 0)
+    if not os.path.exists(CACHE):
+        sys.exit(f"找不到 {CACHE}（先跑一次 opencode 產生快取）")
+    # dc 判 Zen 免費閘道濫用時寫的全域閘檔（同一出口 IP）：閘內併發探測每個模型只會加重濫用訊號，
+    # 還會把每個模型報成 FAIL。跳過整輪、TSV 留上一次的結果。
+    # 10-19：只讀 dc 那份，dc 閘 01:46 到期而 Jev 閘仍封鎖，06:00 照樣併發打全池。改讀 zen-gate 的聯集。
+    until = zen_gate("until")
+    if until > time.time():
+        msg = f"Zen 免費閘道判濫用冷卻中（至 {time.strftime('%m-%d %H:%M', time.localtime(until))}），本輪不探測"
+        print(msg)
+        # 10-18：跳過只印 stdout，被封 18h 沒人知道；一天一跑，跳過就推一則。
+        notify(f"⚠️ dr 免費池：{msg}，TSV 沿用上次結果")
+        return
+
+    listed = zen_listed() if "opencode" in a.providers.split() else None
+    if listed is None and "opencode" in a.providers.split():
+        print("⚠️ 抓不到官方 Zen 清單，只依本機快取判斷", file=sys.stderr)
+    allm = free_models(a.providers.split(), a.filter, listed)
+    if not allm:
+        sys.exit("沒有符合的免費模型")
+    models = [(p, m) for p, m, st in allm if st is None]
+    why = {"GONE": "deprecated 或官方已下架", "NOCLIENT": "官方已上架，本機 opencode 還不認得"}
+    gone = [(p, m, st, why[st], 0.0) for p, m, st in allm if st]
+
+    proc = None
+    if a.server:
+        base = a.server.rstrip("/")
+    else:
+        proc, base = start_server()
+    try:
+        print(f"測試 {len(models)} 個免費模型（併發 {a.jobs}，逾時 {a.timeout}s）"
+              f"  server: {base}\n", file=sys.stderr)
+        results = list(gone)
+        # 10-19：先單打 1 隻當探針。IP 被判濫用時每個模型都回同一句 403，併發打全池只是多送
+        # N 次濫用訊號；探針中了就 trip 共用閘、停手。
+        canary = timed(base, models[0][0], models[0][1], a.timeout) if models else None
+        if canary and ABUSE_RE.search(str(canary[3])):
+            zen_gate("trip", f"oc-free-check 探針 {canary[1]}")
+            until = zen_gate("until")  # trip 的最後一行不是數字，到期時間另外問
+            print(f"{RED}BLOCKED{RESET}  {canary[1]}：{canary[3]}\n"
+                  f"Zen 免費層判本機 IP 濫用，只探 1 隻就停；共用閘至 "
+                  f"{time.strftime('%m-%d %H:%M', time.localtime(until)) if until else '?'}，TSV 沿用上次結果")
+            # 推播由 zen-gate trip 負責（由開轉關時一則），這裡不另推「掛了」
+            return
+        if canary:
+            results.append(canary)
+        with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+            futs = [ex.submit(timed, base, p, m, a.timeout) for p, m in models[1:]]
+            for f in cf.as_completed(futs):
+                results.append(f.result())
+        if any(ABUSE_RE.search(str(r[3])) for r in results):
+            zen_gate("trip", "oc-free-check 探測途中")
+        retry = needs_retest(a.tsv, results) if a.tsv else []
+        if retry:
+            print(f"重測 {len(retry)} 個連兩批沒回應的模型（逾時 {a.retest_timeout}s）", file=sys.stderr)
+            with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+                again = {(r[0], r[1]): r for r in ex.map(
+                    lambda pm: timed(base, pm[0], pm[1], a.retest_timeout), retry)}
+            # 重測結果蓋掉原結果：OK 就斷掉逾時鏈，不推；仍逾時才照舊報
+            results = [again.get((r[0], r[1]), r) for r in results]
+            results = [r if r[2] != "OK" or (r[0], r[1]) not in again
+                       else r[:3] + (f"重測才回（首測逾時 {a.timeout}s）",) + r[4:] for r in results]
+    finally:
+        if proc:
+            proc.terminate()
+
+    color = {"OK": GREEN, "FAIL": RED}
+    for prov, mid, st, reason, secs in sorted(results, key=lambda r: (r[2], r[4])):
+        if st == "GONE" and not a.all:
+            continue
+        c = color.get(st, YEL)
+        print(f"{c}{st:9}{RESET} {secs:6.1f}s {prov}/{mid:42} {reason}")
+    if a.tsv:
+        append_tsv(a.tsv, results)
+        if a.x_handle:
+            ups = x_updates(os.path.join(os.path.dirname(a.tsv), f"x-{a.x_handle}.seen"), a.x_handle)
+            notify_x(ups or [], a.x_handle)
+    keys = ("OK", "QUOTA", "RATELIMIT", "FAIL", "TIMEOUT", "ERR", "NOCLIENT", "GONE")
+    counts = {k: sum(1 for r in results if r[2] == k) for k in keys}
+    print("\n" + " / ".join(f"{k} {counts[k]}" for k in keys) + f"  （共 {len(results)}，GONE 用 --all 顯示）")
+
+
+if __name__ == "__main__":
+    main()

@@ -70,11 +70,11 @@ MODELS="${DCQ_MODELS:-$POOL_ZEN${POOL_GO:+ $POOL_GO}}"
 # ponytail: 不分工單難易；簡單工單多的模型會被高估。要更準得記工單大小再加權。
 RANK_MIN="${DCQ_RANK_MIN:-10}"; RANK_WIN="${DCQ_RANK_WIN:-30}"; RANK_STALL_PCT="${DCQ_RANK_STALL_PCT:-30}"
 RANK_ZERO_N="${DCQ_RANK_ZERO_N:-3}"   # 設 0＝停用短路
-# 每日探測（launchd 06:00 跑 oc-free-check --tsv，見 launchd/）：只用最新一批、且 ≤PROBE_MAX_H 小時。
+# 週探測（oc-probe/：launchd 06:00 的 oc-probe daily 每 7 天跑一次 oc-free-check --tsv）：只用最新一批、且 ≤PROBE_MAX_H 小時。
 #   - 探測非 OK → 移到免費層最後（比 zero/demoted 更後；明天探測回 OK 就自己回來）
 #   - 樣本不足（manual）的位置裡依探測秒數排序，沒探測資料的排在有資料的後面
 # 真實工單的每 PASS 秒數仍是主排序：探測只送「回 ok」，量得到活著與反應快慢，量不到寫碼能力。
-PROBE_MAX_H="${DCQ_PROBE_MAX_H:-36}"
+PROBE_MAX_H="${DCQ_PROBE_MAX_H:-192}"  # 2026-10-21：探測 10-20 起每 7 天一次，原 36h 讓一週 5 天不採用；改 8 天
 # 累犯（zero／demoted）不留在免費層尾巴，而是放進懲罰層 POOL_PEN，排在免費層之後、兜底層之前（2026-10-13 起訂閱層墊底）：
 # 免費層有 FREE_ROUNDS 輪重試，累犯留在免費層等於每張工單白等它卡兩次（longcat 471 s/pass）。
 # 假釋：最近一筆樣本超過 RANK_PAROLE_D 天就回免費層 manual 位置重給機會——放到訂閱層後面
@@ -162,10 +162,11 @@ pool_sync_zen() {  # $1=清單；印「新清單|新增|移出」
       print out "|" add "|" rm
     }' "$pf" "$xf"
 }
-SYNC_NOTE=""
+SYNC_NOTE="" SYNC_ADD_ZEN="" SYNC_ADD_SUB="" SYNC_ADD_GOFREE="" SYNC_RM=""   # 後四個給 sync-catalog 回寫清冊
 if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ]; then
   _s="$(pool_sync_zen "$MODELS")"; [ -z "${_s%%|*}" ] || MODELS="${_s%%|*}"; _s="${_s#*|}"   # 全移光就維持原清單
   [ -z "${_s%%|*}" ] || SYNC_NOTE="新增 ${_s%%|*}；"; [ -z "${_s#*|}" ] || SYNC_NOTE="${SYNC_NOTE}移出 ${_s#*|}；"
+  [ -z "${_s%%|*}" ] || SYNC_ADD_ZEN="${_s%%|*}"; [ -z "${_s#*|}" ] || SYNC_RM="${_s#*|}"
 fi
 POOL_PEN="${DCQ_POOL_PEN-}"   # 手動指定只在不自動排名時有效（測試用）；自動排名會覆寫
 if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
@@ -196,11 +197,11 @@ fi
 # ponytail: 單一簡單工單、每隻 1 樣本，只分得出快慢和明顯壞的；真實工單累積後再依通過率重排。
 # 額度用完的模型會連敗進冷卻，自動跳下一隻，所以排序不必顧額度。
 POOL_PAID="${DCQ_POOL_PAID-$(cat_pool sub slash)}"
-# 訂閱層名單同步：讀 opencode-go-sync 每天 09:00 寫的 state（≤48h 才採用）。upstream 沒有的移出；
+# 訂閱層名單同步：讀 oc-probe/bin/go-sync 每 7 天寫一次的 state（≤8 天才採用；2026-10-21 起週掃，原為每日 ≤48h）。upstream 沒有的移出；
 # first_seen 不是 base（＝同步上線後才出現）的非 -free 新模型接到尾巴。上線前就有、刻意沒收的不會被加回。
-GO_STATE="${DCQ_GO_STATE:-$HOME/.omniroute/backups/opencode-go-sync-state.json}"
+GO_STATE="${DCQ_GO_STATE:-$HOME/.dcq/logs/go-models.json}"
 if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ] && [ -s "$GO_STATE" ] && command -v jq >/dev/null; then
-  _cut="$(date -v-48H +%FT%T 2>/dev/null || date -d '-48 hours' +%FT%T)"
+  _cut="$(date -v-192H +%FT%T 2>/dev/null || date -d '-192 hours' +%FT%T)"
   _s="$(jq -r --arg pool "$POOL_PAID" --arg cut "$_cut" '
     select((.at // "") >= $cut and (.upstream | length) > 0)
     | (.upstream) as $up | (.first_seen // {}) as $fs
@@ -212,6 +213,7 @@ if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ] && [ -s "$GO_STATE"
   if [ -n "${_s%%|*}" ]; then
     POOL_PAID="${_s%%|*}"; _s="${_s#*|}"
     [ -z "${_s%%|*}" ] || SYNC_NOTE="${SYNC_NOTE}訂閱新增 ${_s%%|*}；"; [ -z "${_s#*|}" ] || SYNC_NOTE="${SYNC_NOTE}訂閱移出 ${_s#*|}；"
+    [ -z "${_s%%|*}" ] || SYNC_ADD_SUB="${_s%%|*}"; [ -z "${_s#*|}" ] || SYNC_RM="${SYNC_RM:+$SYNC_RM }${_s#*|}"
   fi
 fi
 # 兜底層：免費層與懲罰層用盡才用，排在訂閱層之前（2026-10-13 使用者定：免費的先用完）。免費但品質不穩（or-free 隨機分配 OpenRouter 免費模型；
@@ -219,6 +221,40 @@ fi
 # 走 OmniRoute（dc 從 ~/.creds/kv 帶 OMNIROUTE_API_KEY）。設空字串＝不用。
 # 2026-10-19：Agnes 7 天 0/801 成功（429 免費限額、503 no available channel），清冊 dc_id 留空移出。
 POOL_TAIL="${DCQ_POOL_TAIL-$(cat_pool free slash)}"
+# Go 免費層同步（2026-10-21）：同一份 go-sync state（≤8 天）。兜底層裡 upstream 沒有的 opencode-go/*-free 移出；
+# first_seen 非 base 的新 -free 接在 opencode-go 段尾（omniroute/* 之前）。omniroute/* 不動；全移光就維持原清單。
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ] && [ -s "$GO_STATE" ] && command -v jq >/dev/null; then
+  _cut="$(date -v-192H +%FT%T 2>/dev/null || date -d '-192 hours' +%FT%T)"
+  _s="$(jq -r --arg pool "$POOL_TAIL" --arg cut "$_cut" '
+    select((.at // "") >= $cut and (.upstream | length) > 0)
+    | (.upstream) as $up | (.first_seen // {}) as $fs
+    | ($pool | split(" ") | map(select(length > 0))) as $p
+    | ($p | map(select(startswith("opencode-go/") and (ltrimstr("opencode-go/") as $m | any($up[]; . == $m) | not)))) as $rm
+    | ([$up[] | select(endswith("-free") and ($fs[.] // "base") != "base") | "opencode-go/" + .] - $p) as $add
+    | ($p - $rm) as $k
+    | ([$k | to_entries[] | select(.value | startswith("opencode-go/")) | .key] | max // -1) as $i
+    | "\(($k[:$i+1] + $add + $k[$i+1:]) | join(" "))|\($add | join(" "))|\($rm | join(" "))"' "$GO_STATE" 2>/dev/null)"
+  if [ -n "${_s%%|*}" ]; then
+    POOL_TAIL="${_s%%|*}"; _s="${_s#*|}"
+    [ -z "${_s%%|*}" ] || SYNC_NOTE="${SYNC_NOTE}Go 免費新增 ${_s%%|*}；"; [ -z "${_s#*|}" ] || SYNC_NOTE="${SYNC_NOTE}Go 免費移出 ${_s#*|}；"
+    [ -z "${_s%%|*}" ] || SYNC_ADD_GOFREE="${_s%%|*}"; [ -z "${_s#*|}" ] || SYNC_RM="${SYNC_RM:+$SYNC_RM }${_s#*|}"
+  fi
+fi
+# omniroute/<m> 必須同時宣告在 opencode.json 的 provider.omniroute.models，否則 opencode 2 秒 ProviderModelNotFoundError，
+# 兜底首棒形同不存在（fixindex 11136）。沒宣告的在組池時剔除並提示，不派。
+oc_declared() {
+  local ocj="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" m out="" miss=""
+  [ -r "$ocj" ] && command -v jq >/dev/null || { echo "$1"; return; }
+  for m in $1; do
+    case "$m" in
+      omniroute/*) if jq -e --arg k "${m#omniroute/}" '.provider.omniroute.models[$k]' "$ocj" >/dev/null 2>&1; then out="$out $m"; else miss="$miss $m"; fi ;;
+      *) out="$out $m" ;;
+    esac
+  done
+  [ -z "$miss" ] || echo "dcq: opencode.json 未宣告，剔出池：${miss# }" >&2
+  echo "${out# }"
+}
+POOL_TAIL="$(oc_declared "$POOL_TAIL")"
 # API 層（按量扣錢）：訂閱層之後，DCQ_ALLOW_API=1 才用；清冊 billing=api 且有 dc_id 的列。預設不開。
 POOL_API=""; [ "${DCQ_ALLOW_API:-0}" = 1 ] && POOL_API="${DCQ_POOL_API-$(cat_pool api slash) $(cat_pool api zen)}"
 POOL_API="${POOL_API# }"; POOL_API="${POOL_API% }"
@@ -349,7 +385,7 @@ pick_model() {
 cmd_plan() {
   local order="${DCQ_ORDER:-default}" task tier ocbin="${DC_BIN:-$(dirname "$(readlink -f "$0")")}" n=0
   case "$order" in default|free|sub) ;; *) die "DCQ_ORDER 只能是 default／free／sub：$order" ;; esac
-  [ $# -gt 0 ] || die "用法：dcq plan <task.md>...（DCQ_ORDER=free|sub 換順序）"
+  [ $# -gt 0 ] || die "用法：dcq plan <task.md>...（DCQ_ORDER=free|sub 換順序；預設 default）"
   for task in "$@"; do
     n=$((n + 1)); tier="${DCQ_TIER:-}"
     [ -n "$tier" ] || { [ -x "$ocbin/triage" ] && tier="$("$ocbin/triage" "$task")"; }; tier="${tier:-mid}"
@@ -387,7 +423,8 @@ cmd_add() {
   # 難度：呼叫端給的優先；沒給就問本機 Laya（bin/triage，零 token），判不出一律 mid
   [ -n "$tier" ] || { [ -x "$ocbin/triage" ] && tier="$("$ocbin/triage" "$task")"; }
   case "$tier" in easy|mid|hard) ;; "") tier=mid ;; *) die "難度只能是 easy／mid／hard：$tier" ;; esac
-  # 層級順序（觸發詞對應：派dr＝default、派drf＝free、派drs＝sub）
+  # 層級順序（觸發詞對應：派dr＝default、派drf＝free、派drs＝sub）；沒給一律 default（預設＝派dr，10-21 使用者定）：
+  # 免費全敗會升到 opencode-go 訂閱層；只要免費的呼叫端自己帶 DCQ_ORDER=free
   case "$order" in default|free|sub) ;; *) die "DCQ_ORDER 只能是 default／free／sub：$order" ;; esac
   local id="$(date +%s)-$$-$(basename "${task%.md}")"
   printf 'TASK=%s\nCWD=%s\nTIER=%s\nORDER=%s\n' "$task" "$cwd" "$tier" "$order" > "$Q/pending/$id.job"
@@ -495,7 +532,7 @@ run_job() {
   local order free_main=""
   order="$(sed -n 's/^ORDER=//p' "$jobfile")"
   case "$order" in
-    free) paid_pool="" api_pool="" ;;
+    free|"") paid_pool="" api_pool="" ;;
     sub) [ -n "$paid_pool" ] && { free_main="$pool"; pool="$paid_pool"; sub=1; paid=1; echo 'PAID=1' >> "$jobfile"; } ;;
   esac
   t0=$(now)
@@ -778,6 +815,8 @@ case "${1:-}" in
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
   rank)   shift; rank_free "${MODELS_MANUAL:-$MODELS}" table "${1:-}"; echo "名單同步：${SYNC_NOTE:-無變動}"; echo "兜底層：$POOL_TAIL"; echo "訂閱層：$POOL_PAID"; echo "API 層：${POOL_API:-（關，DCQ_ALLOW_API=1 才開）}"; echo "hard 不派：${EASY_ONLY:-無}"; echo "provider 上限：${PROV_MAX:-無}" ;;
+  sync-catalog) shift; SYNC_ADD_ZEN="$SYNC_ADD_ZEN" SYNC_ADD_SUB="$SYNC_ADD_SUB" SYNC_ADD_GOFREE="$SYNC_ADD_GOFREE" SYNC_RM="$SYNC_RM" \
+                python3 "$(dirname "$(readlink -f "$0")")/catalog-sync" "$CAT/models.tsv" "$@" ;;
   cancel) shift; cmd_cancel "$@" ;;
   wait)   shift; cmd_wait "$@" ;;
   clear)  cmd_clear ;;
@@ -808,7 +847,7 @@ case "${1:-}" in
                      設空字串＝不用）
   DCQ_ALLOW_API      1＝訂閱層後再接 API 層（清冊 billing=api 有 dc_id 的列，或 DCQ_POOL_API）；預設 0
   DCQ_TIER           dcq add 沒給難度時用這個，不跑 triage
-  DCQ_ORDER          層級順序，入列時記進工單：default＝免費優先（派dr）、free＝只用免費（派drf）、sub＝訂閱優先（派drs）
+  DCQ_ORDER          層級順序，入列時記進工單：free＝只用免費（派drf）、default＝免費優先、全敗升訂閱（派dr，未設時的預設）、sub＝訂閱優先（派drs）
   DCQ_EASY_ONLY      hard 工單不派的模型（預設＝清冊 fit=easy）
   DCQ_PROV_MAX       per-provider 併發上限，如 "zen=2 omniroute=3"（預設讀 providers.tsv）
   DCQ_FREE_ROUNDS    免費層整輪重試幾輪才升級訂閱層（預設 2）

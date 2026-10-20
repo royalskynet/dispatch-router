@@ -13,6 +13,8 @@ export DCQ_POLL_S=1
 export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘檔
 # 舊斷言（up1 跑 2 次）假設「免費一輪、無訂閱層」；付費層另在 11)、12) 明確打開
 export DCQ_FREE_ROUNDS=1 DCQ_POOL_PAID="" DCQ_POOL_TAIL=""
+# 本檔測 default 鏈（派dr）；dcq 未設時預設也是 default（10-21 改，原 free 見 fixindex 11106），沒給的預設由 dcq_tier_test 5b 測
+export DCQ_ORDER=default
 
 # 假 dc：記下 (cwd, 進出時間, model)，依任務檔名決定 rc
 cat > "$T/bin/dc" <<'EOF'

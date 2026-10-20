@@ -24,6 +24,12 @@ DC_FREE_UNLISTED="big-pickle"
 # 是池裡最差的一隻；space-bunny 25 跑 21 PASS（84%）、85 s/pass，為當日 dcq autorank 首位。
 # dc 單張沒有池也沒有 fallback，預設挑錯等於四成機率白等 STALL_S。
 DEFAULT_FREE="minimax-m3.1-flash-free"  # 10-19 由 space-bunny-free 改名（@opencode 推文）。Zen 免費池（Go 版 2026-10-07 改付費，故不帶 opencode-go/ 前綴）
+# 預設已不在清冊的 Zen 現役名單（catalog-sync 回寫下架後）→ 改用清冊第一隻 Zen 免費，免得單張派工打到下架模型。
+DC_CATALOG="${DC_CATALOG:-$(dirname "$(readlink -f "$0")")/../catalog/models.tsv}"
+if [ -r "$DC_CATALOG" ]; then
+  _zen="$(awk -F'\t' '!/^#/ && $1=="free" && $7!="" && index($7,"/")==0 { print $7 }' "$DC_CATALOG")"
+  [ -z "$_zen" ] || printf '%s\n' "$_zen" | grep -qxF "$DEFAULT_FREE" || DEFAULT_FREE="$(printf '%s\n' "$_zen" | head -1)"
+fi
 is_free() {
   case "$1" in big-pickle) return 0 ;; esac
   case "$1" in *-free) return 0 ;; esac
@@ -40,7 +46,9 @@ tier() {
     omniroute/free-tools) echo free ;;
     # dcq 兜底層：OpenRouter 免費池與 Agnes 免費帳號（2026-10-07 查 omniroute connections）。
     # go-free：Go 免費 longcat／beam／minimax＋nim-pool（2026-10-20 查 combos 表；Zen 閘外的另一條免費路）。
-    omniroute/or-free|omniroute/go-free|omniroute/openai-compatible-chat-agnes/agnes-2.0-flash) echo free ;;
+    # nim-pool：NVIDIA NIM 免費 gpt-oss-20b／nemotron-super／glm-5.3-flash／ultra，兩把 key（2026-10-20 查 combos 表；OmniRoute 移除 OC 後的免費主路）。
+    # agnes：2026-10-20 上游下架 agnes-2.0-flash／1.5-flash 整代，免費改成 3.0-flash／2.5-flash（pricing 頁現價 $0）。
+    omniroute/or-free|omniroute/go-free|omniroute/nim-pool|omniroute/openai-compatible-chat-agnes/agnes-3.0-flash) echo free ;;
     opencode/*|opencode-go/*) if is_free "${1#*/}"; then echo free; elif [ "${1%%/*}" = opencode-go ]; then echo sub; else echo metered; fi ;;
     */*) echo metered ;;
     *) if is_free "$1"; then echo free; else echo metered; fi ;;
