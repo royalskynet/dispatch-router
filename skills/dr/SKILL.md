@@ -1,9 +1,9 @@
 ---
 name: dr
-description: 派工給 opencode 執行人（走 opencode 客戶端，免認證、無 Anthropic 協定牆、可用整個 Zen 免費池、非免費模型發 TG 警示）：主 session 給計畫或一句任務＋一條驗收，dc 派工後由 wo-verify 機械判定成敗，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（自動 cwd 互斥、模型池＋per-model 冷卻、停滯 watchdog）。說「派dr」「派 dr」「派工」「派工 opencode」時用（底層指令是 dc／dcq）；說「派deep」走 deepclaude 的 deep skill，不是這裡。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時改派deep。
+description: 派工給 opencode 執行人（走 opencode 客戶端，免認證、無 Anthropic 協定牆、可用整個 Zen 免費池、非免費模型發 TG 警示）：主 session 給計畫或一句任務＋一條驗收，dc 派工後由 wo-verify 機械判定成敗，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（自動 cwd 互斥、模型池＋per-model 冷卻、停滯 watchdog）。說「派dr」「派 dr」「派工」「派工 opencode」時用；「派drf」＝只用免費層、「派drs」＝訂閱優先（底層指令是 dc／dcq）；說「派deep」走 deepclaude 的 deep skill，不是這裡。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時改派deep。
 ---
 
-# dc = opencode 免費池執行人，完成定義＝wo-verify 通過
+# dc = opencode 執行人（免費優先、訂閱墊底），完成定義＝wo-verify 通過
 
 **預設派工執行人**（觸發詞「派dr」）。deepclaude 的「派deep」是另一條線，只補 dc 做不到、又需要 agent 多步自主的場景。dc 走 opencode 客戶端路徑，**免認證即可用**，且沒有 Anthropic 協定牆（整個 Zen 免費池都能用）。
 
@@ -34,7 +34,7 @@ dc 在派工前跑同一套閘門：`deep-lint` 不過就不派，`wo-verify <ta
 5. **工單寫成冪等。** 斷言寫「已存在就跳過」而非「建立」。重派不會破壞前一輪成果，這是能無腦重試的前提。
 6. **context 放檔案，不放 prompt。** Zen 免費池沒有 prompt caching，每輪重送 context 都是全價重算（Go lane 有，回應帶 `cached_tokens`；但工單大小本來就該由檔案承載）。工單給絕對路徑讓模型自己讀，禁止把檔案內容貼進任務檔。
 
-判斷式：**難度低、量大的活一律優先派**（不必等使用者說派工，主 session 走 `dr-worker` subagent）。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
+判斷式：**主 session 預估 5 分鐘內做得完就自己做，超過才派 drf**（2026-10-20 定，dcq 入列到結束 p50≈8 分鐘，fixindex 11066）。超過門檻不必等使用者說派工，主 session 主動提出，派前照下方「三種派法」先貼 `dcq plan` 問一次，確認後走 `dr-worker` subagent。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
 
 **單張也走 dcq**：只有 dcq 有模型 fallback 鏈（免費層 autorank → 懲罰層 → 兜底層 → 訂閱層（付費，墊底））與逾時換手。裸 `dc` 只跑一隻模型，掛了就沒救（fix 10299），只在指定模型做實驗時用。
 
@@ -54,6 +54,38 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 - **驗收重跑 K 次全過才算 PASS**：`DC_VERIFY_K` 預設 2。單次通過只代表「至少成功過一次」；第 2 次才失敗會印「驗收或改動不穩定（flaky）」，不要只憑第一次通過結案。驗收很慢時再降成 1。
 - **chunkTimeout WARN**：provider 沒設 `chunkTimeout` 時上游停滯會乾等（5 分鐘預設 v1.18.27 才有，更舊可能無上限，外觀等同卡死）。`dc` 只出聲不擋，看到 WARN 就去 `opencode.json` 設 `provider.<p>.options.chunkTimeout: 120000`。
 - 環境變數：`DC_FREE_EXTRA`（補免費白名單）、`DC_FREE_MODEL`（換預設免費模型）、`DC_FREECHECK=off`（關計費閘）、`DC_SKIP_LINT=1`（跳過 lint）、`DC_BIN`（覆寫 wo-verify／deep-lint 所在目錄，預設 repo `bin/`，測試注入假閘用）、`DC_LOCK_WAIT`（撞鎖時等幾秒，預設 0＝不等）、`DC_NO_TIMEOUT_WARN=1`（關 chunkTimeout WARN）、`DC_NEGCTL=0`（關 do-nothing 負向對照）、`DC_NEGCTL_TIMEOUT`（負向對照逾時，預設 120s）、`DC_VERIFY_K`（驗收重跑次數，預設 2）。
+
+## 三種派法（2026-10-20 使用者定）
+
+| 觸發詞 | 層級順序 | `DCQ_ORDER` |
+|---|---|---|
+| 派dr／派工 | 免費 → 懲罰 → 兜底 → 訂閱 → API（API 預設關） | `default` |
+| 派drf | 只用免費的層；免費全敗就結案失敗，不升級 | `free` |
+| 派drs | 訂閱先，用盡才回免費的層，API 墊底 | `sub` |
+
+流程固定三步：
+1. 寫好工單後跑 `DCQ_ORDER=<順序> ~/dev/dispatch-router/bin/dcq plan <task.md>...`。它會用本機 Laya 判每張的難度（easy／mid／hard，零 token），印出會走的層和併發上限，不入列。hard 工單會跳過清冊 `fit=easy` 的模型。
+2. 把 plan 的輸出原樣貼給使用者，問一次「這樣派嗎」。這是使用者定的例外：派工前要確認，不適用「全自動不問」。
+3. 確認後，每張跑 `DCQ_ORDER=<順序> dcq add <task.md> <cwd> <plan 判的難度>`，再跑 `dcq start -j N`。難度照 plan 給的值帶進去，入列時不再判第二次。
+
+模型池來源是 `catalog/models.tsv`（free／sub／api 標籤），per-provider 併發上限在 `catalog/providers.tsv`。系統一模型（Laya、Jev）在 `catalog/judges.tsv`，只做判斷題，不能派工。
+
+## 兩條線不能混（2026-10-20 使用者定，fixindex 11041）
+
+dr 底下有兩套呼叫邏輯。清冊的 `dc_id` 前綴決定走哪條。
+
+| 線 | 層 | `dc_id` | 怎麼叫 |
+|---|---|---|---|
+| opencode CLI | 免費、懲罰 | 無前綴（Zen `*-free`、`big-pickle`） | 只能 `opencode run`／`dc`／`dcq` |
+| opencode CLI | 訂閱 | `opencode-go/…` | `opencode run`，dc 臨時開 opencode-go provider |
+| OmniRoute API | 兜底 | `omniroute/<combo>`（`go-free`、`or-free`） | opencode 經本機 :20128 HTTP，combo 決定上游 |
+
+- **Zen 免費模型禁止 API 直打**（curl、OmniRoute、Hermes 都算）。API 沒回應不代表壞，不准判失效，也不准重試探測：OpenCode 會判濫用、封整個 IP 的 Zen 池（10-19 整池 403 就是這樣）。要知道能不能用，看 06:00 probe 排名，不另外探。
+- **Go 端點可以走 API**：Go 訂閱，以及 Go 端點上的免費模型（`opencode-go/*-free`，例如 OmniRoute `go-free` combo：longcat／beam／minimax-m3.1-flash-free＋nim-pool）。Zen 封鎖時 dr 就靠這條兜底。
+- **同名不同路**：`minimax-m3.1-flash-free`（Zen，CLI 線）和 `opencode-go/minimax-m3.1-flash-free`（Go，API 可打）是兩個入口，冷卻與封鎖互不影響。
+- **combo 在清冊要自己一列**，`model` 欄寫 combo 名，不掛在單一模型列上。`bin/dc` 的 `tier()` 也要明列，否則被當 metered。
+- **chain-a 不接 dr**：`go-free → or-free → go-sub`，尾棒 go-sub 付費，會讓派drf 漏進訂閱。要用就接它的免費段（`go-free`、`or-free`）。
+- 工單的 `ORDER` 入列時寫進 job 檔；重啟 runner 改不到排隊中的單，正在跑的單也不會中途換鏈。要改派法就改 job 檔或重新 `dcq add`。
 
 ## 多張工單就用 dcq（併發跑者）
 

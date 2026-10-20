@@ -1,0 +1,9 @@
+# 系統一模型清冊（TypeSafe System One：只回結構化判斷，不生成文字，不能派工）。2026-10-19，M4。
+# 能做：difficulty／score（打分）、choice（多選一）、noul（是非＋機率）；給路由、驗收、風險閘用。
+# 不能做：寫碼、寫文、改檔、多步 agent。dcq／dr 不派；jev-gate MCP（jev_evaluate／jev_apply_policy）與 bin/triage 才用。
+# 欄位同 models.tsv 前 6 欄：billing<TAB>route<TAB>model<TAB>status<TAB>evidence<TAB>note
+# 用法順序：Laya 先接（本機、零成本）；Laya 判不出或要 noul 才給 Jev（每次呼叫＝成本，見 memory project_jev_not_free_laya_first）。
+free	local	laya（ONNX 分類器）	ok	jev-gate 日用	只做判斷題（difficulty／kind／costly_mistake），不生成文字
+free	opencode-run	opencode/jev-1.13-free	flaky	jev-gate log	Jev 免費額度極薄，幾秒燒完
+api	omniroute	typesafe/jev（OpenRouter）	ok	jev-gate 日用	Jev 主體；每次約 0.00017 USD
+api	omniroute	typesafe/jev-router（OpenRouter）	unverified	OpenRouter /models 10-19	Jev 選模型＋推理力的付費路由器，價格浮動

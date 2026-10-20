@@ -4,6 +4,7 @@
 # 3) 樣本不足的留在手排位置；rc=2 不算樣本；DCQ_AUTORANK=0 照手排
 set -u
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘（10-19：Jev 閘封鎖時這些測試全掛）
 export DCQ_HOME="$T/q"; mkdir -p "$DCQ_HOME/logs"
 G="$DCQ_HOME/logs/gaps.tsv"; D="$(date +%F)_00:00:00"
 row() { printf '%s\t%s\t10\t%s\t%s\n' "$D" "$1" "$2" "$3" >> "$G"; }
@@ -56,6 +57,15 @@ got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"; note="$(printf '%s\n' 
 [ "$note" = "新增 new；移出 old；" ] || { echo "FAIL sync note: [$note]"; fail=1; }
 got="$(DCQ_POOLSYNC=0 DCQ_MODELS= DCQ_POOL_ZEN="old a" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
 case " $got " in *" old "*) ;; *) echo "FAIL POOLSYNC=0 still synced: [$got]"; fail=1 ;; esac
+# 7b) x-pool.tsv（推文讀出的改名）比探測新就蓋過探測；比探測舊的不採用
+X="$(dirname "$P")/x-pool.tsv"
+later="$(date -v+1M +%F_%T 2>/dev/null || date -d '+1 min' +%F_%T)"; earlier="2000-01-01_00:00:00"
+printf '%s\topencode\tbun\tOK\t3\n%s\topencode\ta\tOK\t5\n' "$now" "$now" > "$P"
+printf '%s\t1\tGONE\tbun\n%s\t1\tNEW\tmm\n%s\t2\tGONE\ta\n' "$later" "$later" "$earlier" > "$X"
+out="$(DCQ_MODELS= DCQ_POOL_ZEN="bun a" DCQ_POOL_GO="" dcq rank)"
+note="$(printf '%s\n' "$out" | sed -n 's/^名單同步：//p')"
+[ "$note" = "新增 mm；移出 bun；" ] || { echo "FAIL x-pool note: [$note]"; fail=1; }
+rm -f "$X"
 # 8) QUOTA（額度用完，06:00 探測常見）不判 down
 printf '%s\topencode\tq\tQUOTA\t1\n%s\topencode\ta\tOK\t5\n' "$now" "$now" > "$P"
 got="$(DCQ_MODELS= DCQ_POOL_ZEN="q a" DCQ_POOL_GO="" dcq rank)"
@@ -82,7 +92,8 @@ zero_output "$T/z1.json" || { echo "FAIL zero_output z1 should be upstream"; fai
 if zero_output "$T/z2.json"; then echo "FAIL zero_output z2 has tool part"; fail=1; fi
 if zero_output "$T/z3.json"; then echo "FAIL zero_output z3 has output"; fail=1; fi
 # 12) upstream 一次就冷卻 UPSTREAM_COOL_S；一般 stall 的 bump_fail 第一次不冷卻
-eval "$(sed -n -e '/^now()/p' -e '/^fk()/p' -e '/^cool_left()/p' -e '/^reset_fail()/p' -e '/^UPSTREAM_COOL_S=/p' -e '/^cool_upstream()/,/^}/p' -e '/^bump_fail()/,/^}/p' "$(command -v dcq)")"
+eval "$(sed -n -e '/^now()/p' -e '/^fk()/p' -e '/^ZEN_GATE=/p' -e '/^cool_left()/,/^}/p' -e '/^reset_fail()/p' -e '/^UPSTREAM_COOL_S=/p' -e '/^cool_upstream()/,/^}/p' -e '/^bump_fail()/,/^}/p' "$(command -v dcq)")"
+ZG="$(dirname "$(readlink -f "$(command -v dcq)")")/zen-gate"   # dcq 裡的 ZG 用 $0，eval 進來會指到 test/
 Q="$DCQ_HOME"; ALLOW=2; COOL_S=120; mkdir -p "$Q/.health"
 cool_upstream "opencode/u1" 2>/dev/null; left=$(cool_left "opencode/u1")
 [ "$left" -ge 890 ] && [ "$left" -le 900 ] || { echo "FAIL cool_upstream left=$left want ~900"; fail=1; }

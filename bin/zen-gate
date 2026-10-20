@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# zen-gate — 本機所有 Zen 免費層消費端共用的封鎖閘（同一出口 IP，一處被判濫用＝全部停打）。
+#
+# 為什麼要這支（10-19）：閘原本有兩份、互不讀——dc 寫 ~/.dcq/.zen-gate（epoch 秒），
+# Jev adapter 寫 ~/.jevgate/zen-free-status.json（cooldown_until epoch 毫秒＋blocked）。
+# dc 的閘 01:46 到期後，Jev 的閘仍在冷卻，06:00 oc-free-check 只看 dc 那份 → 併發探測全池 9 次 403。
+#
+#   zen-gate until          印兩份閘取最大的到期時間（epoch 秒；0＝沒閘）
+#   zen-gate check          閘內 exit 1 並印到期時間；閘外 exit 0
+#   zen-gate trip [原因]     判濫用時呼叫：兩份閘都寫到 now+DC_ZEN_GATE_S（只延長不縮短），
+#                           由開轉關時 hpush 一則
+#
+# Jev 檔只認 blocked:true 的冷卻：額度冷卻（429）是 Jev 自己模型的額度，不是 IP 封鎖，不擋 dc。
+set -u
+DG="${DC_ZEN_GATE:-$HOME/.dcq/.zen-gate}"
+JS="${JEV_ZEN_STATUS_FILE:-$HOME/.jevgate/zen-free-status.json}"
+GATE_S="${DC_ZEN_GATE_S:-21600}"
+
+dc_until() { local v; v=$(cat "$DG" 2>/dev/null | tr -dc 0-9); echo "${v:-0}"; }
+jev_until() {
+  [ -f "$JS" ] || { echo 0; return; }
+  jq -r 'if .blocked == true and (.cooldown_until|type) == "number" then (.cooldown_until/1000|floor) else 0 end' "$JS" 2>/dev/null || echo 0
+}
+until_max() { local a b; a=$(dc_until); b=$(jev_until); [ "${b:-0}" -gt "$a" ] && a=$b; echo "$a"; }
+
+case "${1:-}" in
+  until) until_max ;;
+  check)
+    u=$(until_max)
+    if [ "$u" -gt "$(date +%s)" ]; then echo "Zen 免費層封鎖閘至 $(date -r "$u" '+%m-%d %H:%M')"; exit 1; fi
+    exit 0 ;;
+  trip)
+    why="${2:-偵測到 403 abusive traffic}"
+    now=$(date +%s); new=$(( now + GATE_S )); old=$(until_max)
+    [ "$old" -gt "$now" ] && was_closed=1 || was_closed=0
+    [ "$(dc_until)" -lt "$new" ] && { mkdir -p "$(dirname "$DG")"; echo "$new" > "$DG"; }
+    if [ "$(jev_until)" -lt "$new" ]; then
+      mkdir -p "$(dirname "$JS")"; tmp="$JS.$$.tmp"
+      at=$(date -u +%FT%TZ); iso=$(date -u -r "$new" +%FT%TZ)
+      { cat "$JS" 2>/dev/null || echo '{}'; } | jq --argjson u "$((new * 1000))" --arg at "$at" --arg why "$why" --arg iso "$iso" \
+        '. + {ok:false, at:$at, cooldown_until:$u, blocked:true, error:("zen-gate trip: " + $why),
+              remediation:("Zen 免費層 403：OpenCode 判本機出口 IP 濫用（由 dc／oc-free-check 偵測）。所有消費端停打至 " + $iso + "；解封要等上游。")}' \
+        > "$tmp" 2>/dev/null && chmod 600 "$tmp" && mv "$tmp" "$JS" || rm -f "$tmp"
+    fi
+    if [ "$was_closed" = 0 ] && command -v hpush >/dev/null; then
+      hpush "⚠️ Zen 免費層判本機 IP 濫用（${why}），本機所有 Zen 免費消費端停打至 $(date -r "$new" '+%m-%d %H:%M')；dcq 走兜底層" >/dev/null 2>&1 || true
+    fi
+    echo "$new" ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

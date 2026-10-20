@@ -6,6 +6,7 @@ set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DC="$REPO/bin/dc"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘（10-19：Jev 閘封鎖時這些測試全掛）
 mkdir -p "$T/bin" "$T/w" "$T/cfg"
 export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"

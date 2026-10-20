@@ -4,6 +4,7 @@
 set -u
 DC="$(cd "$(dirname "$0")/.." && pwd)/bin/dc"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘（10-19：Jev 閘封鎖時這些測試全掛）
 mkdir -p "$T/bin" "$T/w" "$T/cfg/opencode"
 export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
@@ -83,6 +84,11 @@ printf '#!/bin/sh\nexit 0\n' > "$T/bin/opencode"; chmod +x "$T/bin/opencode"
 rm -f "$WV_MARK"
 DC_FREE_MODEL=opencode/mimo-v2.6-flash-free "$DC" "$T/t.md" "$T/w" >/dev/null 2>&1
 chk "沒標記時照跑驗收"                      "$([ -e "$WV_MARK" ] && echo called || echo skipped)" "called"
+# 反向：模型回「DC_TASK_DEFECT: N/A」＝沒有瑕疵，驗收照跑
+printf '#!/bin/sh\n[ "$1" = debug ] && { echo "{}"; exit 0; }\necho "DC_TASK_DEFECT: N/A - No defect found."\nexit 0\n' > "$T/bin/opencode"
+rm -f "$WV_MARK"
+DC_FREE_MODEL=opencode/mimo-v2.6-flash-free "$DC" "$T/t.md" "$T/w" >/dev/null 2>&1
+chk "DEFECT: N/A 照跑驗收"                  "$([ -e "$WV_MARK" ] && echo called || echo skipped)" "called"
 
 # opencode 遇 429 會照 retry-after 久等重試（PR #44517 前無設定可關）：dc 要看到主 agent 的限流 log 就砍掉、rc=1 快速失敗
 cat > "$T/bin/opencode" <<'X'

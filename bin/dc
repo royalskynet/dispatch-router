@@ -23,7 +23,7 @@ DC_FREE_UNLISTED="big-pickle"
 # 2026-10-09 依 gaps.tsv（75 筆真實工單）改：longcat 19 跑 9 停滯（40%）、471 s/pass，
 # 是池裡最差的一隻；space-bunny 25 跑 21 PASS（84%）、85 s/pass，為當日 dcq autorank 首位。
 # dc 單張沒有池也沒有 fallback，預設挑錯等於四成機率白等 STALL_S。
-DEFAULT_FREE="space-bunny-free"  # Zen 免費池（Go 版 2026-10-07 改付費，故不帶 opencode-go/ 前綴）
+DEFAULT_FREE="minimax-m3.1-flash-free"  # 10-19 由 space-bunny-free 改名（@opencode 推文）。Zen 免費池（Go 版 2026-10-07 改付費，故不帶 opencode-go/ 前綴）
 is_free() {
   case "$1" in big-pickle) return 0 ;; esac
   case "$1" in *-free) return 0 ;; esac
@@ -39,7 +39,8 @@ tier() {
     # nim-pool 卡死已移出；建置見 fix 0432）。組合改了要重查。
     omniroute/free-tools) echo free ;;
     # dcq 兜底層：OpenRouter 免費池與 Agnes 免費帳號（2026-10-07 查 omniroute connections）。
-    omniroute/or-free|omniroute/openai-compatible-chat-agnes/agnes-2.0-flash) echo free ;;
+    # go-free：Go 免費 longcat／beam／minimax＋nim-pool（2026-10-20 查 combos 表；Zen 閘外的另一條免費路）。
+    omniroute/or-free|omniroute/go-free|omniroute/openai-compatible-chat-agnes/agnes-2.0-flash) echo free ;;
     opencode/*|opencode-go/*) if is_free "${1#*/}"; then echo free; elif [ "${1%%/*}" = opencode-go ]; then echo sub; else echo metered; fi ;;
     */*) echo metered ;;
     *) if is_free "$1"; then echo free; else echo metered; fi ;;
@@ -121,6 +122,18 @@ if [ "$have_m" != 1 ]; then
   case "$m" in */*) ;; *) m="opencode/$m" ;; esac
   set -- -m "$m" "$@"
 fi
+# Zen 免費閘道判濫用（2026-10-18：opencode 蒸餾攻擊事件後收緊）：被判一次就整個 Zen 免費池停用
+# ZEN_GATE_S，所有佇列共用（同一個出口 IP）。被擋後換模型連打正是濫用特徵，故不換 Zen 模型重試。
+# 10-18 起另一種措辭：IP 判濫用（"detected abusive traffic from this IP address"），連官方客戶端也擋。
+ABUSE_RE='Detect Abuse Traffic|Free Model Gateway.*Forbidden|Forbidden.*Free Model Gateway|detected abusive traffic'
+ZEN_GATE="${DC_ZEN_GATE:-$HOME/.dcq/.zen-gate}"
+ZEN_GATE_S="${DC_ZEN_GATE_S:-21600}"
+# 10-19：閘有兩份（本檔與 Jev 的 zen-free-status.json），讀寫一律經 zen-gate 取聯集，見該檔頭
+ZG="$(dirname "$(readlink -f "$0")")/zen-gate"
+case "$m" in opencode/*)
+  gl=$(( $("$ZG" until 2>/dev/null || echo 0) - $(date +%s) ))
+  [ "$gl" -gt 0 ] && { echo "dc: Zen 免費閘道判濫用冷卻中（剩 ${gl}s），不送請求；要跑請用 dcq（自動走兜底層）或指定非 Zen 模型" >&2; exit 1; } ;;
+esac
 t="$(tier "$m")"
 if [ "$t" != free ]; then
   msg="⚠️ dc 派工用到非免費模型：${m}（${t}）task=$(basename "$f") cwd=${d}"
@@ -290,6 +303,10 @@ while kill -0 "$teepid" 2>/dev/null; do
   if grep -q -E "$UA_RE" "$out" 2>/dev/null; then
     rl=2; kill_oc; break
   fi
+  if grep -q -E "$ABUSE_RE" "$out" 2>/dev/null; then
+    rl=4; kill_oc; "$ZG" trip "dc 派工 $m" >/dev/null 2>&1 \
+      || { mkdir -p "$(dirname "$ZEN_GATE")"; echo $(( $(date +%s) + ZEN_GATE_S )) > "$ZEN_GATE"; }; break
+  fi
   if [ "$started" = 0 ]; then
     if grep -q -E "$START_RE" "$out" 2>/dev/null; then started=1
     elif [ $(( $(date +%s) - ts )) -ge "$START_S" ]; then rl=3; kill_oc; break; fi
@@ -312,12 +329,14 @@ if [ -n "$drift" ]; then
 fi
 [ "$rl" = 1 ] && { echo "dc: 上游限流（429），opencode 會照 retry-after 久等重試，已提早結束" >&2; exit 1; }
 [ "$rl" = 2 ] && { echo "dc: 上游不可用（$(grep -m1 -oE '(Upstream request failed[^"]*|Model [^ ]+ has been deprecated)' "$out")），已提早結束" >&2; exit 1; }
+[ "$rl" = 4 ] && { echo "dc: Zen 免費閘道判濫用（Detect Abuse Traffic），整個 Zen 免費池停用 ${ZEN_GATE_S}s（${ZEN_GATE}），已提早結束" >&2; exit 1; }
 [ "$rl" = 3 ] && { echo "dc: opencode ${START_S}s 內沒開工（無「> agent · model」行），判定卡住，已結束" >&2; exit 1; }
 [ "$rc" -eq 0 ] || { echo "dc: opencode run rc=${rc}（常見：上游掛=1、逾時=124、權限拒絕）" >&2; exit "$rc"; }
 # 模型回報工單瑕疵（issue #4）：不跑驗收，直接 exit 2 走既有的契約錯分支 ——
 # dcq 的 exit:2 是 FATAL、不重試、不罰模型，工單的錯不會算到模型頭上。
 # 錨行首：模型引用工單原文或印出程式碼時不能誤判。
-if grep -q '^DC_TASK_DEFECT:' "$out"; then
+# 排除「DC_TASK_DEFECT: N/A／none／無」：模型照格式回報「沒有瑕疵」不算（2026-10-18 or-free 完成後印 N/A 被判 rc=2）。
+if grep '^DC_TASK_DEFECT:' "$out" | grep -qviE '^DC_TASK_DEFECT:[[:space:]]*(N/?A|none|無)([^[:alnum:]]|$)'; then
   echo "dc: 模型回報工單瑕疵（DC_TASK_DEFECT），不跑驗收" >&2
   exit 2
 fi
