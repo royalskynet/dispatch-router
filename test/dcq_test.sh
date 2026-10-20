@@ -10,6 +10,7 @@ export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 # 同 dc_lock_test.sh：假 wo-verify 一律 exit 0，關掉 do-nothing 對照。
 export DC_FREECHECK=off DC_NEGCTL=0
 export DCQ_POLL_S=1
+export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘檔
 # 舊斷言（up1 跑 2 次）假設「免費一輪、無訂閱層」；付費層另在 11)、12) 明確打開
 export DCQ_FREE_ROUNDS=1 DCQ_POOL_PAID="" DCQ_POOL_TAIL=""
 
@@ -23,10 +24,11 @@ echo "OUT $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
 case "$n" in
   local*) echo "Error: Unexpected error"; echo "no such column: project_id"; echo "dc: opencode run rc=1" ;;
   diff*) echo "Error: boom from $DC_FREE_MODEL"; echo "dc: opencode run rc=1" ;;
+  vf*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)"; echo "verify fail $DC_FREE_MODEL" ;;
   # 假憑證值執行期拼出，檔案內不出現完整字面值（sensitive-canary 會擋讀檔，fix 9880）
   leak*) echo "FAKE_TOKEN=sk-$(printf 'x%.0s' $(seq 16))" ;;
 esac
-case "$n:$DC_FREE_MODEL" in tl*:t/*) exit 0 ;; tl*) exit 1 ;; up*:go/*) exit 0 ;; up*) exit 1 ;; bad*|defect*) exit 2 ;; local*|diff*) exit 1 ;; leak*) exit 0 ;; *) exit 0 ;; esac
+case "$n:$DC_FREE_MODEL" in tl*:t/*) exit 0 ;; tl*) exit 1 ;; up*:go/*) exit 0 ;; up*) exit 1 ;; bad*|defect*) exit 2 ;; local*|diff*|vf*) exit 1 ;; leak*) exit 0 ;; *) exit 0 ;; esac
 EOF
 chmod +x "$T/bin/dc"
 export TRACE="$T/trace"; : > "$TRACE"
@@ -185,6 +187,20 @@ mk tl1 "$T/wb"
 DCQ_MODELS="m1" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="t/a t/b" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/tail.out" 2>&1
 chk "順序＝免費→懲罰→兜底，兜底過關不碰訂閱" "$(awk '/^IN tl1/{print $4}' "$TRACE" | tr '\n' ' ')" "m1 p/x t/a "
 chk "兜底過關" "$(ls "$DCQ_HOME"/done/ 2>/dev/null | wc -l | tr -d ' ')" "1"
+# 11d) Zen 判濫用閘檔有效：無前綴模型（Zen 免費）一隻都不送，直接懲罰→兜底
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+echo $(( $(date +%s) + 600 )) > "$DC_ZEN_GATE"
+mk tl2 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="t/a" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/gate.out" 2>&1
+chk "Zen 閘內不碰無前綴模型" "$(awk '/^IN tl2/{print $4}' "$TRACE" | tr '\n' ' ')" "p/x t/a "
+rm -f "$DC_ZEN_GATE"
+# 11e) 10-19：只有 Jev 那份閘封鎖（dc 閘已過期）也要整池跳過
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+printf '{"ok":false,"blocked":true,"cooldown_until":%s}' "$(( ($(date +%s) + 600) * 1000 ))" > "$JEV_ZEN_STATUS_FILE"
+mk tl3 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="t/a" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/gate2.out" 2>&1
+chk "Jev 閘內不碰無前綴模型" "$(awk '/^IN tl3/{print $4}' "$TRACE" | tr '\n' ' ')" "p/x t/a "
+rm -f "$JEV_ZEN_STATUS_FILE"
 # 11c) 訂閱層（付費）墊底：免費、懲罰、兜底全敗才用
 dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
 mk up3 "$T/wb"
@@ -247,6 +263,13 @@ DCQ_MODELS="m1 m2 m3" DCQ_POOL_PAID="" DCQ_ALLOWED_FAILS=99 \
   dcq run -j 1 >"$T/diff.out" 2>&1
 chk "不同錯三隻都試" "$(grep -h '^TRIED=' "$DCQ_HOME"/failed/*.job)" "TRIED=3"
 chk "不同錯 rc=1" "$(grep -h '^LAST_RC=' "$DCQ_HOME"/failed/*.job)" "LAST_RC=1"
+chk "全死在上游 VERIFY_RUNS=0" "$(grep -h '^VERIFY_RUNS=' "$DCQ_HOME"/failed/*.job)" "VERIFY_RUNS=0"
+
+# 15c) 有交件但驗收不過：每次嘗試都跑到 dc 的驗收 → VERIFY_RUNS＝嘗試數（呼叫端據此判驗收失敗，不是基礎設施失敗）
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk vf1 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_POOL_PAID="" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/vf.out" 2>&1
+chk "驗收失敗 VERIFY_RUNS=2" "$(grep -h '^VERIFY_RUNS=' "$DCQ_HOME"/failed/*.job)" "VERIFY_RUNS=2"
 
 # 16) .out 權限與遮罩（issue #5）：600 空檔先建、跑完遮罩掉假憑證、過期刪、既存 644 收成 600
 dcq clear >/dev/null

@@ -8,6 +8,7 @@ set -u
 DC="$(cd "$(dirname "$0")/.." && pwd)/bin/dc"
 WV="$(cd "$(dirname "$0")/.." && pwd)/bin/wo-verify"   # repo 自帶那份，不走 PATH（PATH 上是 deepclaude 的）
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘（10-19：Jev 閘封鎖時這些測試全掛）
 mkdir -p "$T/bin" "$T/w" "$T/cfg/opencode"
 export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"

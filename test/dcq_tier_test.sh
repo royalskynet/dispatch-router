@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# dcq 清冊組池／難度分層／provider 併發的自檢：假 dc，不打上游。
+# 斷言：1) 清冊組出各層、API 層預設關  2) hard 工單不派 fit=easy  3) provider 上限 1 時同 provider 不重疊
+#       4) gaps.tsv 帶難度、排名依難度分開  5) 難度入列：給的照收、亂給拒收、triage 不在就 mid
+set -u
+R="$(cd "$(dirname "$0")/.." && pwd)"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+export DCQ_HOME="$T/q" DC_BIN="$T/bin" PATH="$T/bin:$PATH" DCQ_CATALOG="$T/cat"
+export DC_FREECHECK=off DC_NEGCTL=0 DCQ_POLL_S=1 DCQ_POOLSYNC=0 DCQ_FREE_ROUNDS=1 DCQ_GO_STATE="$T/none.json"
+export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"
+unset DCQ_POOL_ZEN DCQ_POOL_TAIL DCQ_POOL_PAID DCQ_POOL_GO DCQ_MODELS DCQ_PROV_MAX DCQ_EASY_ONLY DCQ_ALLOW_API DCQ_TIER
+mkdir -p "$T/bin" "$T/cat" "$T/w1" "$T/w2" "$T/tasks"
+dcq() { "$R/bin/dcq" "$@"; }
+fail=0; ok() { echo "ok - $1"; }; bad() { echo "not ok - $1"; fail=1; }
+
+printf '# 測試清冊\nfree\topencode-run\topencode/za\tok\tx\tx\tza\tany\nfree\topencode-run\topencode/zb\tok\tx\tx\tzb\teasy\nfree\tlocal\tlaya\tok\tx\tx\t\tany\nfree\tomniroute\tx/t\tok\tx\tx\tomniroute/t1\tany\nsub\tomniroute\tg\tok\tx\tx\topencode-go/g1\tany\napi\topencode-run\tp\tok\tx\tx\topencode/p1\tany\n' > "$T/cat/models.tsv"
+printf '# 測試\nomniroute\t3\tx\n' > "$T/cat/providers.tsv"
+
+# 假 dc：記 (工單, model, 進出時間)；za 一律失敗，其他一律過；slow* 工單睡 3 秒
+cat > "$T/bin/dc" <<'EOF'
+#!/usr/bin/env bash
+n="$(basename "$1" .md)"
+echo "IN $n $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
+case "$n" in slow*) sleep 3 ;; *) sleep 1 ;; esac
+echo "OUT $n $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
+[ "$DC_FREE_MODEL" = za ] && exit 1; exit 0
+EOF
+chmod +x "$T/bin/dc"
+export TRACE="$T/trace"; : > "$TRACE"
+for n in e1 h1 m1 slowa slowb; do echo "# $n" > "$T/tasks/$n.md"; done
+
+# 1) 清冊組池
+out="$(DCQ_AUTORANK=0 dcq rank 2>&1)"
+echo "$out" | grep -q '^順序：za zb$' && ok "免費層＝清冊無斜線列，依列序" || bad "免費層：$(echo "$out" | grep '^順序')"
+echo "$out" | grep -q '^兜底層：omniroute/t1$' && ok "兜底層＝免費有斜線列" || bad "兜底層：$(echo "$out" | grep '^兜底層')"
+echo "$out" | grep -q '^訂閱層：opencode-go/g1$' && ok "訂閱層＝sub 列" || bad "訂閱層：$(echo "$out" | grep '^訂閱層')"
+echo "$out" | grep -q '^API 層：（關' && ok "API 層預設關" || bad "API 層：$(echo "$out" | grep '^API')"
+echo "$out" | grep -q '^hard 不派：zb$' && ok "EASY_ONLY＝fit=easy" || bad "$(echo "$out" | grep '^hard')"
+echo "$out" | grep -q '^provider 上限：omniroute=3$' && ok "provider 上限讀 providers.tsv" || bad "$(echo "$out" | grep '^provider')"
+DCQ_ALLOW_API=1 DCQ_AUTORANK=0 dcq rank 2>&1 | grep -q '^API 層：opencode/p1$' && ok "DCQ_ALLOW_API=1 才有 API 層" || bad "API 層開旗標後不對"
+
+# 2) hard 工單跳過 fit=easy：za 失敗後，easy 落到 zb，hard 跳過 zb 落到兜底層
+dcq add "$T/tasks/e1.md" "$T/w1" easy >/dev/null 2>&1
+dcq add "$T/tasks/h1.md" "$T/w2" hard >/dev/null 2>&1
+DCQ_ALLOWED_FAILS=9 dcq run -j 2 >/dev/null 2>&1
+grep -q '^IN e1 zb ' "$TRACE" && ok "easy 工單會派 fit=easy 的 zb" || bad "easy 沒派到 zb：$(grep ' e1 ' "$TRACE")"
+if grep -q '^IN h1 zb ' "$TRACE"; then bad "hard 工單派到了 fit=easy 的 zb"; else ok "hard 工單不派 zb"; fi
+grep -q '^IN h1 omniroute/t1 ' "$TRACE" && ok "hard 工單落到兜底層" || bad "hard 沒到兜底層：$(grep ' h1 ' "$TRACE")"
+
+# 4a) gaps.tsv 第 7 欄記難度
+awk -F'\t' '$2=="zb" && $7=="easy"' "$DCQ_HOME/logs/gaps.tsv" | grep -q . && ok "gaps.tsv 記 easy" || bad "gaps.tsv 沒記難度：$(tail -3 "$DCQ_HOME/logs/gaps.tsv")"
+awk -F'\t' '$2=="omniroute/t1" && $7=="hard"' "$DCQ_HOME/logs/gaps.tsv" | grep -q . && ok "gaps.tsv 記 hard" || bad "gaps.tsv 沒記 hard"
+
+# 4b) zb 只在 hard 連 3 次 0 PASS：hard 排名降級，easy 不受影響
+: > "$DCQ_HOME/logs/gaps.tsv"
+for i in 1 2 3; do printf '%s\tzb\t1\t1\texit\t5\thard\n' "$(date +%F_%T)" >> "$DCQ_HOME/logs/gaps.tsv"; done
+dcq rank hard 2>&1 | grep -q '^懲罰層（免費層之後）：zb$' && ok "hard 排名把 zb 降到懲罰層" || bad "hard 排名：$(dcq rank hard 2>&1 | grep 懲罰)"
+dcq rank easy 2>&1 | grep -q '^懲罰層（免費層之後）：$' && ok "easy 排名不吃 hard 的紀錄" || bad "easy 排名：$(dcq rank easy 2>&1 | grep 懲罰)"
+dcq rank 2>&1 | grep -q '^懲罰層（免費層之後）：zb$' && ok "不分難度時照舊全算" || bad "不分難度：$(dcq rank 2>&1 | grep 懲罰)"
+: > "$DCQ_HOME/logs/gaps.tsv"
+
+# 3) provider 上限：zen=1 時 za／zb 兩張不同 cwd 工單不重疊；不設上限時會重疊（證明這個斷言抓得到）
+overlap() {  # trace 裡 slowa／slowb 的 [IN,OUT] 區間是否相交
+  awk '$2 ~ /^slow/ { t[$1" "$2]=$4 } END { if (t["IN slowa"]<t["OUT slowb"] && t["IN slowb"]<t["OUT slowa"]) exit 0; exit 1 }' "$TRACE"
+}
+run_pair() {
+  : > "$TRACE"
+  DCQ_POOL_ZEN="zb ze" dcq add "$T/tasks/slowa.md" "$T/w1" mid >/dev/null 2>&1
+  DCQ_POOL_ZEN="zb ze" dcq add "$T/tasks/slowb.md" "$T/w2" mid >/dev/null 2>&1
+  DCQ_POOL_ZEN="zb ze" DCQ_AUTORANK=0 DCQ_MODEL_MAX=1 dcq run -j 2 >/dev/null 2>&1
+}
+DCQ_PROV_MAX="" run_pair
+overlap && ok "對照：不設 provider 上限時兩張同時跑" || bad "對照組沒重疊，斷言抓不到差別：$(cat "$TRACE")"
+DCQ_PROV_MAX="zen=1" run_pair
+if overlap; then bad "zen=1 時兩張 Zen 工單重疊：$(cat "$TRACE")"; else ok "zen=1 時同 provider 不重疊"; fi
+grep -c '^OUT slow' "$TRACE" | grep -qx 2 && ok "兩張都跑完" || bad "沒跑完：$(cat "$TRACE")"
+ls "$DCQ_HOME/.inuse" | grep -q . && bad "跑完還有殘留槽：$(ls "$DCQ_HOME/.inuse")" || ok "provider 槽有歸還"
+
+# 5) 難度入列
+dcq clear >/dev/null 2>&1
+id="$(dcq add "$T/tasks/m1.md" "$T/w1" hard 2>/dev/null)"; grep -qx 'TIER=hard' "$DCQ_HOME/pending/$id.job" && ok "給 hard 照收" || bad "給 hard 沒記"
+id="$(dcq add "$T/tasks/m1.md" "$T/w1" 2>/dev/null)"; grep -qx 'TIER=mid' "$DCQ_HOME/pending/$id.job" && ok "DC_BIN 沒 triage 時記 mid" || bad "沒 triage 沒記 mid"
+dcq add "$T/tasks/m1.md" "$T/w1" huge >/dev/null 2>&1; [ $? = 2 ] && ok "亂給難度拒收 rc=2" || bad "亂給難度沒拒收"
+[ "$(JEV_GATE_DIR="$T/nope" "$R/bin/triage" "$T/tasks/m1.md")" = mid ] && ok "triage 找不到 jev-gate 印 mid" || bad "triage fail-open 不對"
+
+# 5b) 層級順序：drf 只用免費、drs 訂閱先、派dr 預設免費先；plan 與實跑一致
+: > "$TRACE"; dcq clear >/dev/null 2>&1
+for n in of os od; do echo "# $n" > "$T/tasks/$n.md"; done
+# 免費池只放必敗的 za、關掉兜底層，看各順序走到哪一層
+export DCQ_POOL_ZEN="za" DCQ_POOL_TAIL=""
+DCQ_ORDER=free dcq add "$T/tasks/of.md" "$T/w1" mid >/dev/null 2>&1
+DCQ_ORDER=sub  dcq add "$T/tasks/os.md" "$T/w2" mid >/dev/null 2>&1
+DCQ_AUTORANK=0 DCQ_ALLOWED_FAILS=9 dcq run -j 2 >/dev/null 2>&1
+if grep -q '^IN of opencode-go/' "$TRACE"; then bad "drf 用到了訂閱層"; else ok "drf 不碰訂閱層"; fi
+ls "$DCQ_HOME/failed" | grep -q 'of' && ok "drf 免費全敗就結案失敗" || bad "drf 沒進 failed"
+[ "$(grep '^IN os ' "$TRACE" | head -1 | awk '{print $3}')" = opencode-go/g1 ] && ok "drs 第一棒是訂閱層" || bad "drs 第一棒：$(grep '^IN os ' "$TRACE" | head -1)"
+DCQ_ORDER=default dcq add "$T/tasks/od.md" "$T/w1" mid >/dev/null 2>&1; : > "$TRACE"
+DCQ_AUTORANK=0 DCQ_ALLOWED_FAILS=9 dcq run -j 1 >/dev/null 2>&1
+[ "$(grep '^IN od ' "$TRACE" | awk '{print $3}' | tr '\n' ' ')" = "za opencode-go/g1 " ] && ok "派dr 免費先、訂閱後" || bad "派dr 順序：$(grep '^IN od ' "$TRACE")"
+out="$(DCQ_ORDER=sub DCQ_AUTORANK=0 dcq plan "$T/tasks/os.md" 2>&1)"
+echo "$out" | grep -q '1 訂閱：opencode-go/g1' && echo "$out" | grep -q '2 免費：za' && ok "plan sub 順序與實跑一致" || bad "plan sub：$out"
+out="$(DCQ_ORDER=free DCQ_AUTORANK=0 dcq plan "$T/tasks/of.md" 2>&1)"
+if echo "$out" | grep -q '訂閱'; then bad "plan free 列出訂閱層：$out"; else ok "plan free 不列訂閱層"; fi
+DCQ_ORDER=x dcq add "$T/tasks/od.md" "$T/w1" mid >/dev/null 2>&1; [ $? = 2 ] && ok "亂給 DCQ_ORDER 拒收" || bad "亂給 DCQ_ORDER 沒拒收"
+unset DCQ_POOL_ZEN DCQ_POOL_TAIL
+
+# 6) bash 會把緊接在 $var 後的全形字當成變數名（set -u 下直接 unbound variable），一律要寫 ${var}
+bad_lines="$(perl -ne 'print "$ARGV:$.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*(?=[\x80-\xff])/; close ARGV if eof' "$R"/bin/*)"
+[ -z "$bad_lines" ] && ok "bin/ 沒有 \$var 緊接全形字" || bad "要改成 \${var}：$bad_lines"
+
+exit "$fail"

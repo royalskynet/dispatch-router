@@ -10,7 +10,7 @@
 git clone https://github.com/royalskynet/dispatch-router && cd dispatch-router && ./install.sh
 ```
 
-需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`oc-free-check` 連到 `~/.local/bin`、註冊每日探測免費模型的 launchd job（plist 內的 `/Users/you` 佔位會代換成實際 `$HOME`）、把 skill 連到各 agent 客戶端的 skills 目錄（見下節）。
+需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`zen-gate` 連到 `~/.local/bin`、把 skill 連到 `~/.claude/skills/dr`。
 
 ## English
 
@@ -84,17 +84,7 @@ The rest of this README is in Traditional Chinese.
 ./install.sh
 ```
 
-連結 `~/.local/bin/dc` 與 skill `dr` 到各 agent 客戶端的 skills 目錄：
-
-| 目錄 | 誰讀 |
-|---|---|
-| `~/.claude/skills/dr` | Claude Code（另有 opencode，它本身也讀這裡） |
-| `~/.agents/skills/dr` | 讀 `~/.agents/skills` 的其他 agent |
-| `~/.codex/skills/dr` | Codex CLI |
-
-`DR_SKILL_HOME` 可改成其他目錄清單（空白分隔），重跑 `install.sh` 是冪等的。
-
-**client 支援範圍**：`dc`／`dcq` 是 shell 指令，任何能跑 bash 的 agent（Claude Code、Codex CLI、opencode）都能用；skill 只是把用法教給該客戶端。Codex CLI 讀 `~/.codex/skills/`（`SKILL.md` 的 YAML frontmatter 格式相同），`install.sh` 一併連結；若你的 Codex 版本尚未支援 skills，直接照本 README 的派工章節用 `dc`／`dcq` 即可，不影響功能。
+連結 `~/.local/bin/dc` 與 `~/.claude/skills/dr`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
 
 **相依**：`wo-verify`、`deep-lint` 收在本 repo `bin/`，dc 直接用同目錄那份，不需要裝 `deep-agent`／deepclaude。`DC_BIN=<dir>` 只用來覆寫（測試注入假閘）。
 
@@ -189,7 +179,7 @@ hermes --provider opencode-go -m longcat-2.5-preview-free -z '...' # PONG, rc=0
 `dc` 一次一張。`dcq` 是它的佇列前端：工單丟進去，N 個 slot 併發跑，成敗總表出來。
 
 ```bash
-dcq add /abs/path/task.md [cwd]   # 入列（先過 deep-lint + wo-verify <task.md> --dry 准入閘）
+dcq add /abs/path/task.md [cwd] [easy|mid|hard]   # 入列（先過 deep-lint + wo-verify <task.md> --dry 准入閘；沒給難度由本機 Laya 判）
 dcq start -j 4                    # 同 run，但進獨立 tmux（-L dcq）脫離呼叫端；agent session 派工用這個
 dcq run -j 4                      # 前景跑到 pending 清空（預設 4，硬上限 8）
 dcq status                        # 各狀態計數與失敗清單
@@ -204,7 +194,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 |---|---|
 | **slot 分配** | `pending/ → running/ → done\|failed/`，搶單靠 `mv` 的 atomic rename，不另加鎖 |
 | **per-job cwd 互斥** | 唯一會讓併發出「錯誤結果」而非只是變慢的項目：opencode 對工作目錄做 snapshot、`wo-verify` 斷言又是相對路徑，兩張工單共用 cwd 會互相汙染。鎖本身與 `dc` 共用同一把（見上），dcq 這邊只負責「搶不到就換下一張，不阻塞 worker」 |
-| **模型池** | 2026-10-09 起 `DCQ_POOL_ZEN`（手排 nemotron-3-ultra → space-bunny → step-5 → ling-3.1-flash → mimo）在前、`DCQ_POOL_GO`（預設 `longcat-2.5-preview-free`）殿後當兜底，實際順序每次啟動由 autorank 依 `gaps.tsv` 重算（`dcq rank` 印表）：longcat 19 跑 9 次 300s 停滯（471 s/pass，已 demoted），space-bunny 25 跑 21 PASS（85 s/pass），nemotron-3-ultra 16 跑 0 停滯（107 s/pass）。降級有兩道：停滯率 ≥`DCQ_RANK_STALL_PCT`（30%）；以及 2026-10-09 加的短路——樣本 ≥`DCQ_RANK_ZERO_N`（3）而 PASS 為 0 就不等 `DCQ_RANK_MIN` 直接降（nemotron-3.5-lightning 5 跑 0 PASS、1 停滯、曾自稱完成而驗收 FAIL）。降級只是移到免費層最後，仍排在付費層前，過一張就自己回昇。muse-spark／mimo／big-pickle／space-bunny-free／free-tools 2026-10-07 實測 420s 無產出已移出池。依序挑「本單沒試過、沒在冷卻、槽沒滿」的第一隻。`rc=1/124`（上游）換下一個；`rc=2`（工單契約錯）不重試。沒訂 Go 就 `DCQ_POOL_GO=`。`DCQ_MODELS` 有設就整條覆寫 |
+| **模型池** | 2026-10-19 起各層預設名單由 `catalog/models.tsv` 組成，見下方「清冊與難度分層」；以下為 2026-10-09 版的歷史紀錄。2026-10-09 起 `DCQ_POOL_ZEN`（手排 nemotron-3-ultra → space-bunny → step-5 → ling-3.1-flash → mimo）在前、`DCQ_POOL_GO`（預設 `longcat-2.5-preview-free`）殿後當兜底，實際順序每次啟動由 autorank 依 `gaps.tsv` 重算（`dcq rank` 印表）：longcat 19 跑 9 次 300s 停滯（471 s/pass，已 demoted），space-bunny 25 跑 21 PASS（85 s/pass），nemotron-3-ultra 16 跑 0 停滯（107 s/pass）。降級有兩道：停滯率 ≥`DCQ_RANK_STALL_PCT`（30%）；以及 2026-10-09 加的短路——樣本 ≥`DCQ_RANK_ZERO_N`（3）而 PASS 為 0 就不等 `DCQ_RANK_MIN` 直接降（nemotron-3.5-lightning 5 跑 0 PASS、1 停滯、曾自稱完成而驗收 FAIL）。降級只是移到免費層最後，仍排在付費層前，過一張就自己回昇。muse-spark／mimo／big-pickle／space-bunny-free／free-tools 2026-10-07 實測 420s 無產出已移出池。依序挑「本單沒試過、沒在冷卻、槽沒滿」的第一隻。`rc=1/124`（上游）換下一個；`rc=2`（工單契約錯）不重試。沒訂 Go 就 `DCQ_POOL_GO=`。`DCQ_MODELS` 有設就整條覆寫 |
 | **per-model 冷卻** | 借鏡 LiteLLM Router 的 `allowed_fails`／`cooldown_time`：同一隻連續 `DCQ_ALLOWED_FAILS`（2）次上游失敗或停滯，冷卻 `DCQ_COOLDOWN_S`（120）秒，期間不派給它。只罰那一隻 —— 舊版是全隊熔斷，一隻掛全隊停 |
 | **權重：免費優先** | 免費池整輪試過 `DCQ_FREE_ROUNDS`（2）輪都失敗，**或**免費模型全在冷卻，才 fallback 到 `DCQ_POOL_PAID`（預設 7 隻，依實測「寫得對＞反應快」排序：`opencode-go/glm-5.3-flash opencode-go/deepseek-v4.1-flash opencode-go/deepseek-v4-pro opencode-go/minimax-m3 opencode-go/qwen3.8-flash opencode-go/kimi-k2.7-code opencode-go/glm-5.3`。Go 額度 per-model 各自計，多放＝容量相加；與 Zen 免費同底模的 muse／mimo Go 版不收；deepseek-v4-flash 上游退役，2026-10-03 移除）。用過訂閱層的工單在 jobfile 標 `PAID=1`。`DCQ_POOL_PAID=` 設空＝永不動用，免費全冷卻時就等 |
 | **per-model 併發槽** | 單一模型同時最多 `DCQ_MODEL_MAX`（3）張，滿了直接分給下一隻，不在忙的模型上排隊 |
@@ -223,6 +213,30 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 
 自檢（都用假的下游，不打上游）：`./test/dcq_test.sh`（佇列、模型池、權重 fallback、冷卻、併發槽、watchdog、cancel）、`./test/dc_lock_test.sh`（cwd 鎖）、`./test/dc_model_test.sh`（模型閘：哪些准派、哪些要拒）
 
+### 清冊與難度分層（2026-10-19）
+
+`catalog/models.tsv` 是本機確實可調用模型的唯一清冊，每列標 `free`（免費）／`sub`（付費訂閱）／`api`（付費 API）。dcq 依清冊組層，順序固定為免費 → 訂閱 → API：
+
+- 免費層：`free` 且 `dc_id` 無斜線（Zen 免費，只能經 `opencode run`）。
+- 兜底層：`free` 且 `dc_id` 有斜線（`omniroute/or-free`）。
+- 訂閱層：`sub`（`opencode-go/*`）。
+- API 層：`api`，`DCQ_ALLOW_API=1` 才接，預設不用。
+
+Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型，dcq 不派；由主 session 的 Agent 工具或 `codex exec` 直接用。
+
+難度在 `dcq add` 時判一次（`bin/triage`，jev-gate 的 Laya 本機分類器，零 token、約 2～3 秒；判不出就 mid），同一張工單中途不換：
+
+- `hard` 工單跳過清冊 `fit=easy` 的模型（有改錯、假扮工具、無限迴圈或隨機分配的前科）。
+- `gaps.tsv` 第 7 欄記難度，autorank 依難度各排一份；舊紀錄沒有這欄，算進每個難度。`dcq rank hard` 看 hard 的排名。
+
+併發有三層：全域 `DCQ_JOBS`、per-model `DCQ_MODEL_MAX`，以及 per-provider 上限 `catalog/providers.tsv`（zen 2、opencode-go 4、omniroute 3）。Zen 免費池共用同一個 IP 閘，同時開太多會被判 abusive traffic 整池 403。
+
+層級順序每張工單入列時記下（`DCQ_ORDER`）：`default` 免費優先（派dr）、`free` 只用免費（派drf）、`sub` 訂閱優先（派drs）。`dcq plan <task.md>...` 在派工前印出每張的難度和會走的層，不入列。
+
+系統一模型（Laya、Jev）只回結構化判斷，不生成文字，另列在 `catalog/judges.tsv`，dcq 不派。
+
+輪子裁決：LiteLLM／Portkey／plano 是第二個閘道，跟 OmniRoute 重疊；RouteLLM、NotDiamond 已停更或封存。所以只借設計：LiteLLM `complexity_router` 的難度分層、oh-my-opencode 的 `providerConcurrency`。Thompson sampling 延後到任一難度有 ≥5 隻各 ≥20 筆紀錄（2026-10-19 只有 118 筆、3 隻 ≥10 筆）。
+
 ## 已知坑
 
 - 免費端點會突然掛：實測 `ling-3.0-flash-fin-free` 回 `Upstream unavailable`。dc 不做自動 fallback。
@@ -239,31 +253,13 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
   & "C:\Program Files\Git\bin\bash.exe" -i -c "dc /c/path/to/task.md /c/path/to/repo"
   ```
 
-## 每日探測（oc-free-check）
+## 每日探測
 
-launchd job `dcq-probe`（`launchd/` 內的 plist）每天 06:00 跑 `oc-free-check -p opencode --tsv ~/.dcq/logs/probe.tsv`：起一個 `opencode serve`，對每個免費模型送「Reply with just: ok」，記狀態、秒數、原因（TSV 第 6 欄）。免費額度 00:00 UTC（08:00 本地）才重置，06:00 量到額度用完的記 QUOTA，dcq rank 當沒資料不判 down。最新一批也驅動名單同步：GONE 移出池、新上架 OK 的接進池（`DCQ_POOL_SKIP` 排除）；訂閱層讀 opencode-go-sync state 同步。
-
-狀態分級（`prompt_async` 後輪詢 `/session/status`，opencode 遇限流會自己重試，同步呼叫只會卡到逾時）：
-
-| 狀態 | 意思 | 通知 |
-|---|---|---|
-| OK | 有回文字 | — |
-| QUOTA / RATELIMIT | 免費額度用完（附重置時間）／限流，模型沒壞 | 由 OK 轉入報一句「額度用完」 |
-| FAIL | 上游回錯 | 由 OK 轉入立刻報「掛了」 |
-| GONE | 快取標 deprecated、官方 Zen 清單已沒有、或上游回 deprecated，不送請求 | 由 OK 轉入報「已下架」 |
-| NOCLIENT | 官方 Zen 清單（`opencode.ai/zen/v1/models`，同後台 Models 頁）有、本機模型快取沒有，dc 叫不到 | 第一次出現報一次 |
-| TIMEOUT / ERR | 沒回話（附最後重試原因） | 連兩批才報；一批 ≥3 個同時轉入只報共因 |
-
-建 session 時帶 title，否則 opencode 會另叫 small model 產標題，多吃一份免費額度。
-（腳本源自 Ether-secrets `oc-free-check.py`，這裡加了計時與 `--tsv`。）
-
-`dcq rank` 合併規則（只用最新一批、≤`DCQ_PROBE_MAX_H`=36 小時）：
+探測免費模型（`oc-free-check`、`probe-sync`、launchd 06:00）另外維護，不在本 repo。`dcq rank` 讀它寫的 `~/.dcq/logs/probe.tsv`（TSV：時間 provider 模型 狀態 秒數 原因），只用最新一批、≤`DCQ_PROBE_MAX_H`=36 小時：
 
 - 探測非 OK → 移到免費層最後（明天回 OK 自動回來）
 - 樣本不足（manual）的位置依探測秒數排
 - 真實工單的「每 PASS 秒數」仍是主排序——探測量得到活著與快慢，量不到寫碼能力
-
-手動跑：`oc-free-check -p opencode`；看排名：`dcq rank`（多一欄 `probe`）。
 
 ### 懲罰層（累犯排在免費層之後）
 

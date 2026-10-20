@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-10-19：清冊驅動＋難度分層＋provider 併發
+
+- `catalog/models.tsv`：本機模型清冊（free／sub／api），加 `dc_id`、`fit` 欄；dcq 各層預設名單改由清冊組，不再寫死。
+- Agnes 2.0 Flash 7 天 0/801 成功，移出兜底層。
+- `bin/triage`：入列時用本機 Laya 判 easy／mid／hard；hard 不派 `fit=easy`；`gaps.tsv` 加第 7 欄難度，autorank 依難度分開排。
+- `catalog/providers.tsv`：per-provider 併發槽（zen 2，防 Zen IP 閘判濫用）。
+- API 層接在訂閱層後，`DCQ_ALLOW_API=1` 才開。
+- 測試：`test/dcq_tier_test.sh` 23 項；弄壞 fit 過濾與 provider 槽各一次，測試都會 fail。
+
 ## 2026-10-01 ～ 10-03：oc-agent → dispatch-router
 
 ### 做了什麼

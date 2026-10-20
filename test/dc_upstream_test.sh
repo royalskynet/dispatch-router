@@ -11,9 +11,12 @@ export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
 # DC_NEGCTL=0：這些測試的 wo-verify 是 `exit 0` 的假貨，do-nothing 對照會當場中止派工。
 # 負向對照本身由 dc_verify_gate_test.sh 驗。
 export DC_FREECHECK=off DC_NO_TIMEOUT_WARN=1 DC_NEGCTL=0
-export VERIFIED="$T/verified"
+export VERIFIED="$T/verified" DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"
 
-cat > "$T/bin/opencode" <<'X'
+cat > "$T/bin/opencode" <<X
+T=$T
+X
+cat >> "$T/bin/opencode" <<'X'
 #!/usr/bin/env bash
 [ "$1" = debug ] && { echo '{}'; exit 0; }
 e='timestamp=2026-10-11T02:48:47.936Z level=ERROR run=b4472e2a message="stream error" providerID=opencode modelID=x session.id=ses_x small=false agent=build mode=primary error.error="AI_APICallError:'
@@ -22,6 +25,9 @@ case "$FAKE" in
   endpoint) echo '> build · x'; echo "$e Upstream request failed: Endpoint is unavailable.\""; sleep 30 ;;
   gone)     echo '> build · x'; echo "$e Model exo-free has been deprecated.\""; sleep 30 ;;
   ratelimit) echo '> build · x'; echo "$e Rate limit exceeded\""; sleep 30 ;;
+  abuse)    : > "$T/called"; echo '> build · x'; echo "$e Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic\""; sleep 30 ;;
+  abuse2)   echo '> build · x'; echo "Error: OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address."; sleep 30 ;;
+  ok)       : > "$T/called"; echo '> build · x'; echo done ;;
   hang)     sleep 30 ;;
   slow)     echo '> build · x'; sleep 4; echo done ;;
   title)    echo "${e/small=false/small=true} Upstream request failed: Model is unavailable.\""; echo '> build · x'; echo done ;;
@@ -53,4 +59,28 @@ chk "啟動卡住在 DC_START_S 內結束"         "$(try 8 '沒開工' FAKE=han
 chk "已開工的慢模型不誤殺"                 "$(try 15 '提早結束\|沒開工' FAKE=slow DC_START_S=2)" 0:yes:fast:nokey
 # 只認主 agent：small=true（取標題等小模型）的上游錯誤不算
 chk "小模型錯誤不觸發"                     "$(try 8 '上游不可用' FAKE=title)" 0:yes:fast:nokey
+# Zen 判濫用：提早結束、寫全域閘檔；閘檔有效期間 Zen 模型不送請求（opencode 不被呼叫），非 Zen 模型照跑
+chk "判濫用提早結束"                       "$(try 8 '判濫用' FAKE=abuse)" 1:no:fast:key
+chk "判濫用寫閘檔"                         "$([ "$(cat "$T/zen-gate" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] && echo y)" y
+rm -f "$T/called"
+chk "閘內 Zen 不送請求"                    "$(try 8 '冷卻中' FAKE=ok)" 1:no:fast:key
+chk "閘內 opencode 未被呼叫"               "$([ -e "$T/called" ] && echo called || echo none)" none
+chk "閘內非 Zen 照跑"                      "$(try 8 '冷卻中' FAKE=ok DC_FREE_MODEL=omniroute/or-free)" 0:yes:fast:nokey
+echo 0 > "$T/zen-gate"; rm -f "$T/jev-zen.json"   # dc 判濫用兩份閘都寫，過期要兩份都過
+chk "閘過期 Zen 恢復"                      "$(try 8 '冷卻中' FAKE=ok)" 0:yes:fast:nokey
+# 10-18 起的新措辭（IP 判濫用，連官方客戶端也擋）同樣要整池停用
+chk "新措辭判濫用提早結束"                 "$(try 8 '判濫用' FAKE=abuse2)" 1:no:fast:key
+chk "新措辭寫閘檔"                         "$([ "$(cat "$T/zen-gate" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] && echo y)" y
+# 10-19：閘有兩份（dc 秒／Jev 毫秒＋blocked）。06:00 dc 閘已過期、Jev 閘仍封鎖，dc 系仍照打。
+# 任一份封鎖都要擋；Jev 的額度冷卻（blocked=false）不是 IP 封鎖，不擋。
+echo 0 > "$T/zen-gate"; rm -f "$T/called"
+printf '{"ok":false,"blocked":true,"cooldown_until":%s}' "$(( ($(date +%s) + 3600) * 1000 ))" > "$T/jev-zen.json"
+chk "Jev 閘封鎖時 dc 也不送 Zen"          "$(try 8 '冷卻中' FAKE=ok)" 1:no:fast:key
+chk "Jev 閘封鎖時 opencode 未被呼叫"      "$([ -e "$T/called" ] && echo called || echo none)" none
+printf '{"ok":false,"blocked":false,"cooldown_until":%s}' "$(( ($(date +%s) + 3600) * 1000 ))" > "$T/jev-zen.json"
+chk "Jev 額度冷卻不擋 dc"                 "$(try 8 '冷卻中' FAKE=ok)" 0:yes:fast:nokey
+# dc 判濫用時兩份閘都要寫，Jev 那邊才會停打
+echo '{"ok":true,"model":"jev-1.13-free"}' > "$T/jev-zen.json"
+try 8 '判濫用' FAKE=abuse2 >/dev/null
+chk "dc 判濫用也寫 Jev 閘"                "$(jq -r '"\(.blocked):\(.cooldown_until > (now*1000)):\(.model)"' "$T/jev-zen.json" 2>/dev/null)" "true:true:jev-1.13-free"
 exit "$fail"

@@ -1,0 +1,7 @@
+# dcq 的 per-provider 併發上限（dcq 啟動時讀；DCQ_PROV_MAX="zen=1 omniroute=2" 可覆寫）。
+# 欄位：provider<TAB>max_parallel<TAB>note
+# provider 取 dc_id 第一個斜線前的字；沒有斜線＝zen。沒列到的 provider 不設上限（只受 per-model 與全域 JOBS 限制）。
+# 借鏡 oh-my-opencode background_task.providerConcurrency；上游 RPM／429 退避交給 OmniRoute 自己的限流與冷卻。
+zen	2	Zen 免費池共用同一個 IP 閘，2026-10-19 06:00 被判 abusive traffic 整池 403（fixindex 11041）
+opencode-go	4	Go 額度 per-model 各自計，provider 層只防同時開太多 opencode 進程
+omniroute	6	go-free＋or-free 共用此 key（2026-10-20 使用者定 6）；or-free 單模型仍受 per-model 上限，OpenRouter :free 20 RPM 撞到由 OmniRoute 退避
