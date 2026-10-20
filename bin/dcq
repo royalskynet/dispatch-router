@@ -97,7 +97,7 @@ rank_free() {  # $1=手排順序（空白分隔）；$2 mode=table 時印統計�
       nm=split(order, L, " ")
       for (i=1; i<=nm; i++) {
         m=L[i]; n=0; p=0; s=0; d=0; st=cnt[m]-win+1; if (st<1) st=1
-        for (k=st; k<=cnt[m]; k++) { if (R[m,k]==2 || W[m,k]=="upstream") continue; n++; d+=D[m,k]; if (R[m,k]==0) p++; if (W[m,k]=="stall" || W[m,k]=="slow") s++ }
+        for (k=st; k<=cnt[m]; k++) { if (R[m,k]==2 || W[m,k]=="upstream") continue; n++; d+=D[m,k]; if (R[m,k]==0) p++; if (W[m,k]=="stall" || W[m,k]=="slow" || W[m,k]=="spin") s++ }
         N[i]=n; P[i]=p; S[i]=s; pr[i]=(n ? p/n : 0)
         sp_[i]=(p ? d/p : 1e9); sc[i]=-sp_[i]   # 分數越大越前：每 PASS 秒數取負
         st_="manual"
@@ -282,6 +282,11 @@ JOB_MAX="${DCQ_JOB_MAX:-2700}"       # 整張工單（含所有模型）的總�
 # 沒有這道就一路吃到 JOB_MAX、整張判 jobmax 不換模型——fallback 鏈形同沒有。
 # 600 ≈ gaps.tsv PASS 單次最長 294s ×2（2026-10-13，n=11）。撞到＝why=slow，罰冷卻、換下一隻。
 ATTEMPT_MAX="${DCQ_ATTEMPT_MAX:-600}"
+# 防空轉：模型一直講話卻不改檔（讀檔繞圈、反覆重試同一招）不觸發 STALL_S，要等 ATTEMPT_MAX。
+# cwd 是 git 工作樹時，這次嘗試 SPIN_S 秒內 HEAD＋改動＋未追蹤檔都沒變 → why=spin，跟 stall 一樣罰冷卻換手。
+# 進驗收（.out 出現「dc: 驗收 →」）就不再看，慢驗收不會被誤殺。0＝關；入列時 DCQ_SPIN_S 會記進工單，可逐張關。
+# ponytail: 唯讀工單（只產報告到 cwd 外）在 git cwd 裡跑超過 SPIN_S 會被誤殺；這類工單入列帶 DCQ_SPIN_S=0。
+SPIN_S="${DCQ_SPIN_S:-420}"
 POLL_S="${DCQ_POLL_S:-5}"
 # .out 是模型 transcript 原文，可能有憑證：先建 600 空檔、跑完遮罩、過期刪除（issue #5）
 MASK="${DCQ_MASK-$HOME/.claude/tools/fi-mask-transcript.mjs}"
@@ -428,6 +433,7 @@ cmd_add() {
   case "$order" in default|free|sub) ;; *) die "DCQ_ORDER 只能是 default／free／sub：$order" ;; esac
   local id="$(date +%s)-$$-$(basename "${task%.md}")"
   printf 'TASK=%s\nCWD=%s\nTIER=%s\nORDER=%s\n' "$task" "$cwd" "$tier" "$order" > "$Q/pending/$id.job"
+  [ -n "${DCQ_SPIN_S:-}" ] && echo "SPIN=$DCQ_SPIN_S" >> "$Q/pending/$id.job"   # 逐張關防空轉（唯讀工單帶 0）
   echo "dcq: 難度 ${tier}，順序 $order" >&2
   echo "$id"
 }
@@ -440,6 +446,11 @@ cmd_add() {
 #   124 逾時 —— 可換模型重試
 #   其他 驗收失敗行的 rc —— 模型做錯了，換模型再給一次機會
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || now; }
+# 工作樹指紋：HEAD（模型自己 commit 也算有動）＋追蹤檔改動＋未追蹤檔內容
+tree_sig() {
+  { git -C "$1" rev-parse HEAD; git -C "$1" diff HEAD
+    (cd "$1" && git ls-files -o --exclude-standard -z | xargs -0 cat); } 2>/dev/null | _sha1 | cut -c1-16
+}
 
 # 停滯時殺之前先匯出 opencode session（只診斷，不改判定）。STALL_S 調門檻只是止血（fix 10309）：
 # 停滯都停在連續數個 Read 之後、log 無 ERROR、chunkTimeout=120s 也沒觸發，兩個假設待分辨——
@@ -475,12 +486,15 @@ stall_dump() {
   echo "dcq: stall_dump $model $sid 最後一則[role done tools reasoning字數]=${sum}" >&2
 }
 
-# 跑一隻模型並盯著它。印 "<rc> <why>"，why ∈ exit|stall|slow|jobmax。
+# 跑一隻模型並盯著它。印 "<rc> <why>"，why ∈ exit|stall|slow|spin|jobmax。
 # 判活看 .out 的 mtime：opencode 每完成一個 part 就寫一行。dc 收尾的 wo-verify 期間
 # 也算在內——驗收指令本身若靜默超過 STALL_S 會被誤判，STALL_S 要比最慢的驗收寬。
 watch_oc() {
   local id="$1" model="$2" task="$3" cwd="$4" t0="$5" paid="$6" out pid rc why=exit gap maxgap=0 t ta
+  local spin_s="${JOB_SPIN_S:-$SPIN_S}" sig="" sig_t s
   ta=$(now)  # 這次嘗試的起點（t0 是整張工單的起點），算每隻模型實際花的秒數
+  sig_t=$ta
+  { [ "$spin_s" -gt 0 ] && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 && sig="$(tree_sig "$cwd")"; } || spin_s=0
   out="$Q/logs/$id.$(fk "$model").out"
   # 先建 600 空檔：底下的 `> "$out"` 只截斷不改權限，沒先建的話 .out 會吃預設 umask（644）
   ( umask 077; : > "$out" )
@@ -495,6 +509,13 @@ watch_oc() {
     if [ "$gap" -ge "$STALL_S" ]; then why=stall
     elif [ $(( t - t0 )) -ge "$JOB_MAX" ]; then why=jobmax
     elif [ $(( t - ta )) -ge "$ATTEMPT_MAX" ]; then why=slow
+    elif [ "$spin_s" -gt 0 ]; then
+      if grep -q '^dc: 驗收 → ' "$out" 2>/dev/null; then spin_s=0; continue; fi
+      s="$(tree_sig "$cwd")"
+      [ "$s" != "$sig" ] && { sig=$s; sig_t=$t; continue; }
+      [ $(( t - sig_t )) -ge "$spin_s" ] || continue
+      why=spin
+      echo "dcq[$id] watchdog: $model 空轉（$(( t - sig_t ))s 沒改任何檔，cwd=${cwd}）" >&2
     else continue; fi
     echo "dcq[$id] watchdog: $model ${why}（${gap}s 無輸出／已跑 $(( t - t0 ))s），殺掉" >&2
     STALL_UPSTREAM=0; [ "$why" = stall ] && stall_dump "$out" "$cwd" "$ta" "$model"
@@ -524,6 +545,7 @@ run_job() {
   cwd="$(sed -n 's/^CWD=//p' "$jobfile")"
   # 難度（入列時判一次，中途不換）。JOB_TIER 是全域：watch_oc 寫 gaps.tsv 第 7 欄要用；每個 worker 是獨立 subshell
   JOB_TIER="$(sed -n 's/^TIER=//p' "$jobfile")"
+  JOB_SPIN_S="$(sed -n 's/^SPIN=//p' "$jobfile")"
   case "$JOB_TIER" in easy) pool="$MODELS_easy" pen_pool="$PEN_easy" ;; hard) pool="$MODELS_hard" pen_pool="$PEN_hard" ;;
     *) JOB_TIER=mid pool="$MODELS_mid" pen_pool="$PEN_mid" ;; esac
   pool="$(fit_pool "$pool")"; pen_pool="$(fit_pool "$pen_pool")"
@@ -593,7 +615,7 @@ run_job() {
       jobmax:*) rc=124; break ;;
       upstream:*) rc=124; cool_upstream "$model"
          echo "dcq[$id] $model upstream，換下一個模型" >&2 ;;
-      stall:*|slow:*) rc=124; bump_fail "$model"
+      stall:*|slow:*|spin:*) rc=124; bump_fail "$model"
          echo "dcq[$id] $model ${why}，冷卻計數＋1，換下一個模型" >&2 ;;
       exit:2) echo "dcq[$id] FATAL rc=2（工單契約錯，不重試）" >&2
          break ;;
@@ -861,6 +883,8 @@ case "${1:-}" in
   DCQ_STALL_S        輸出靜默幾秒判定停滯並換模型（預設 200；校準看 logs/gaps.tsv，dcq rank 近邊會警告）
   DCQ_JOB_MAX        單張工單總時限秒數，含所有模型（預設 2700）
   DCQ_ATTEMPT_MAX    單隻模型一次嘗試的上限秒數，撞到就換下一隻（預設 600）
+  DCQ_SPIN_S         防空轉：git cwd 的工作樹幾秒沒變就殺這次嘗試換下一隻（預設 420；進驗收後不看；0＝關。
+                     入列時有設會記進工單，唯讀工單 dcq add 前帶 DCQ_SPIN_S=0）
   DCQ_MASK           .out 遮罩器（預設 ~/.claude/tools/fi-mask-transcript.mjs）
   DCQ_LOG_DAYS       .out 保留幾天，過期刪（預設 14）
 EOF
