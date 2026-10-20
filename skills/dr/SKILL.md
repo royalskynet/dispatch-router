@@ -70,11 +70,17 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 
 模型池來源是 `catalog/models.tsv`（free／sub／api 標籤），per-provider 併發上限在 `catalog/providers.tsv`。系統一模型（Laya、Jev）在 `catalog/judges.tsv`，只做判斷題，不能派工。
 
-## OC 模型只准 opencode run（2026-10-20 使用者定，fixindex 11041）
+## Zen 與 Go 分清楚（2026-10-20 使用者定，fixindex 11041）
 
-派dr 的順序照上表：免費 → 訂閱 → 付費（API）。這節不改順序，只管呼叫方式。
+派dr 的順序照上表：免費 → 訂閱 → 付費（API）。這節只管呼叫方式，判準是**端點／前綴，不是模型名**。
 
-- 凡是 OC 模型（`opencode/…`、`opencode-go/…`），一律經 `opencode run`／`dc`／`dcq` 呼叫，不准 curl 或 HTTP 直打。API 沒回應不代表壞，不准判失效，也不准重試探測：OpenCode 會判濫用、封整個 IP 的 Zen 池（10-19 整池 403）。要知道能不能用，看 06:00 probe 排名。
+| 前綴 | 端點 | 能不能走 API |
+|---|---|---|
+| `opencode/…`（dc_id 無前綴，Zen） | `opencode.ai/zen/v1` | 不能。只准 `opencode run`／`dc`／`dcq` |
+| `opencode-go/…`（Go，含 Go 上的 `*-free`） | `opencode.ai/zen/go/v1` | 可以（OmniRoute go-free／go-sub、Hermes opencode-go） |
+
+- 模型名會撞：`minimax-m3.1-flash-free`、`beam-free`、`longcat-2.5-preview-free` 在 Zen 和 Go 都有。看到裸名先判是哪個端點，不要憑名字推。
+- Zen 的 API 沒回應不代表壞，不准判失效、不准重試探測：會被判濫用、封整個 IP 的 Zen 池（10-19 整池 403）。要知道能不能用，看 06:00 probe 排名。
 - 工單的 `ORDER` 入列時寫進 job 檔；重啟 runner 改不到排隊中的單，正在跑的單也不會中途換鏈。要改派法就改 job 檔或重新 `dcq add`。
 
 ## 多張工單就用 dcq（併發跑者）
