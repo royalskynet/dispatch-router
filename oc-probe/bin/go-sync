@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""go-sync（oc-probe 選配，原 agent-tools/opencode-go-sync.py）: OpenCode Go 上游模型清單 → dr（dcq）訂閱層名單。不動 OmniRoute。
+2026-10-07 起因：muse-spark-1.x-contributor 在 Go 清單還列著但實打回空回應(502)、space-bunny-free 從 Go 下架。
+2026-10-21 改：OmniRoute 內 OC 模型 10-20 已全刪（go-sub/go-free 不存在），本腳本只寫 state 給 dcq，不讀寫 OmniRoute。
+- 每 7 天（SCAN_EVERY_D）抓一次 /zen/go/v1/models，寫 state（upstream、first_seen、at）；dcq 讀它增減訂閱層與兜底層的 opencode-go/*-free（≤8 天才採用）。
+- 推文由 oc-probe x（每 4h）讀，本腳本不讀（2026-10-21 移除，避免同一則推兩次）。
+由 oc-probe daily（每天 06:00）呼叫，未滿 7 天直接結束。零 token：不叫 LLM，不實打模型。
+絕不印任何憑證值。用法：go-sync [--dry-run] [--scan] [--selftest]
+"""
+import os, json, shutil, subprocess, sys, urllib.request, urllib.error
+from datetime import datetime, timedelta
+
+H = os.path.expanduser
+STATE = os.environ.get('DCQ_GO_STATE', H('~/.dcq/logs/go-models.json'))  # dcq 讀同一個 env／預設
+UPSTREAM = 'https://opencode.ai/zen/go/v1/models'
+SCAN_EVERY_D = 7
+log = lambda *a: print(datetime.now().strftime('%F %T'), 'go-sync', *a, flush=True)
+
+
+def scan_due(last_at, now, force=False):
+    """距上次掃描滿 SCAN_EVERY_D 天才掃。容差 1 小時：launchd 09:00 起跑時間會飄，不能因此晚一天。"""
+    if force or not last_at:
+        return True
+    try:
+        last = datetime.fromisoformat(last_at)
+    except ValueError:
+        return True
+    return now - last >= timedelta(days=SCAN_EVERY_D) - timedelta(hours=1)
+
+
+def scan_diff(prev, upstream, first_seen_prev, today):
+    """純函式。回 (added, removed, first_seen)。
+    first_seen：dcq 用它判斷訂閱層新模型。首次寫入時既有模型一律 base（不自動收），之後新出現的記當天日期。"""
+    added = sorted(upstream - prev) if prev else []
+    removed = sorted(prev - upstream)
+    fs = first_seen_prev
+    first_seen = {m: (fs.get(m) or today) if fs is not None else 'base' for m in upstream}
+    return added, removed, first_seen
+
+
+def selftest():
+    now = datetime(2026, 10, 27, 9, 0, 3)
+    assert scan_due('', now) and scan_due('bad', now) and scan_due('2026-10-26T09:00:00', now, force=True)
+    assert scan_due('2026-10-20T09:00:15', now)                # 滿 7 天（差幾秒）→ 掃
+    assert scan_due('2026-10-20T09:40:00', now)                # 1 小時容差內 → 掃
+    assert not scan_due('2026-10-21T09:00:00', now)            # 6 天 → 不掃
+    a, r, fs = scan_diff({'a', 'b', 'x-free'}, {'a', 'n', 'x-free'}, {'a': 'base', 'b': 'base', 'x-free': 'base'}, '2026-10-27')
+    assert a == ['n'] and r == ['b'], (a, r)
+    assert fs == {'a': 'base', 'n': '2026-10-27', 'x-free': 'base'}, fs
+    a, r, fs = scan_diff(set(), {'a'}, None, '2026-10-27')
+    assert a == [] and r == [] and fs == {'a': 'base'}, (a, r, fs)  # 首次：不算新增，全標 base
+    print('selftest ok')
+
+
+def http(url, body=None, tok=None, method=None, timeout=90):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={'Content-Type': 'application/json', 'User-Agent': 'oc-probe-go-sync'})
+    if tok:
+        req.add_header('Authorization', 'Bearer ' + tok)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode(errors='replace')
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors='replace')
+    except Exception as e:
+        return 0, type(e).__name__
+
+
+def notify(msg):
+    # 跟 oc-free-check 同一個推播出口：PATH 上有 hpush 才推，沒有就只寫 log
+    if shutil.which('hpush'):
+        subprocess.run(['hpush', '[go-sync] ' + msg], capture_output=True, timeout=60)
+
+
+def scan(saved, dry):
+    """週掃描。回 (rc, lines)。"""
+    c, b = http(UPSTREAM, timeout=30)
+    if c != 200:
+        log('upstream /models http', c)
+        return 1, [f'Go /models 抓取失敗 http {c}，本週未更新，明天再試']
+    upstream = {x['id'] for x in json.loads(b)['data']}
+    today = datetime.now().date().isoformat()
+    added, removed, first_seen = scan_diff(set(saved.get('upstream', [])), upstream, saved.get('first_seen'), today)
+    log('upstream', len(upstream), 'added', added, 'removed', removed)
+    lines = []
+    if added:
+        lines.append('上架 ' + ', '.join(added) + ('（dcq 自動接尾：-free 進兜底層、其餘進訂閱層）'))
+    if removed:
+        lines.append('下架 ' + ', '.join(removed) + '（dcq 訂閱層／兜底層自動移出）')
+    if dry:
+        log('dry-run，不寫入 state')
+        return 0, lines
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump({'date': today, 'upstream': sorted(upstream), 'first_seen': first_seen, 'at': datetime.now().isoformat()},
+              open(STATE, 'w'), indent=1)
+    # 2026-10-21：dcq 依新 state 算出的增刪回寫 dr 清冊 catalog/models.tsv（無變動不改檔；清冊乾淨才自動 commit）
+    r = subprocess.run([os.environ.get('DCQ_BIN', os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'bin', 'dcq')), 'sync-catalog', '--source', 'go-sync 週掃'],
+                       capture_output=True, text=True, timeout=60)
+    out = (r.stdout + r.stderr).strip()
+    log('dcq sync-catalog rc', r.returncode, out)
+    if r.returncode != 0 or '無變動' not in out:
+        lines.append(f'dr 清冊：{out or "（無輸出）"}（rc={r.returncode}）')
+    return 0, lines
+
+
+def main(dry, force):
+    saved = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    rc, lines = 0, []
+    if scan_due(saved.get('at', ''), datetime.now(), force):
+        rc, lines = scan(saved, dry)
+    else:
+        log('距上次掃描未滿', SCAN_EVERY_D, '天，略過')
+    if lines and not dry:
+        notify('\n'.join(lines))
+    log('\n'.join(lines) or '無變動')
+    return rc
+
+
+if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        selftest(); sys.exit(0)
+    sys.exit(main('--dry-run' in sys.argv, '--scan' in sys.argv))

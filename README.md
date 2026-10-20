@@ -253,9 +253,19 @@ Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型
   & "C:\Program Files\Git\bin\bash.exe" -i -c "dc /c/path/to/task.md /c/path/to/repo"
   ```
 
-## 每日探測
+## 週探測（選配 `oc-probe/`）
 
-探測免費模型（`oc-free-check`、`probe-sync`、launchd 06:00）另外維護，不在本 repo。`dcq rank` 讀它寫的 `~/.dcq/logs/probe.tsv`（TSV：時間 provider 模型 狀態 秒數 原因），只用最新一批、≤`DCQ_PROBE_MAX_H`=36 小時：
+`oc-probe/` 偵測 opencode 模型清單變化，自動改 dr 的清冊，不碰 OmniRoute。安裝：先跑本 repo `./install.sh`，再跑 `oc-probe/install.sh`（macOS launchd）。不裝也能用 dc／dcq，只是名單要手動維護。
+
+| 來源 | 頻率 | 改什麼 |
+|---|---|---|
+| Zen 免費層實打（`oc-free-check`，經 `opencode run`） | 每 7 天，zen-gate 閘外 | `probe.tsv`：排序、GONE 移出 |
+| Go 上游 `/models`（`go-sync`，零 token） | 每 7 天 | `go-models.json`：訂閱層與 `opencode-go/*-free` 增刪 |
+| @opencode 推文（`oc-probe x`） | 每 4 小時 | `x-pool.tsv`：改名／上下架 |
+
+三者偵測到變化都會跑 `dcq sync-catalog`，把增刪寫回 `catalog/models.tsv`。每日 job 最後跑選配 hook（`~/.config/oc-probe/hook`，存在才跑），給本機自己的後續動作用。
+
+`dcq rank` 讀 `~/.dcq/logs/probe.tsv`（TSV：時間 provider 模型 狀態 秒數 原因），只用最新一批、≤`DCQ_PROBE_MAX_H`=192 小時（8 天，配合週探測）：
 
 - 探測非 OK → 移到免費層最後（明天回 OK 自動回來）
 - 樣本不足（manual）的位置依探測秒數排

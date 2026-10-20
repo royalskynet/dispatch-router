@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# oc-probe — dr 選配：偵測 opencode 模型清單變化，自動改 dr 的 OC 模型（catalog/models.tsv）。不碰 OmniRoute。
+#   oc-probe        每日 06:00（launchd local.opencode-probe），兩個各自的週閘：
+#                   1. Zen 免費層探測：距上次滿 PROBE_EVERY_D 天（預設 7）且 zen-gate 閘外，才用 opencode run 實打。
+#                   2. go-sync：距上次滿 7 天才抓 Go 上游 /models（零 token，不實打）。
+#                   之後跑選配 hook（OC_PROBE_HOOK，預設 ~/.config/oc-probe/hook；不存在就略過）。
+#   oc-probe x      每 4 小時（launchd local.opencode-probe.x）：讀 @opencode 新推文；能讀出的改名／上下架記 x-pool.tsv。
+#   oc-probe probe  強制探測一次；oc-probe sync 強制 go-sync 掃一次。
+# 偵測到變化 → dcq sync-catalog 把增刪回寫清冊（無變動不改檔；清冊乾淨才自動 commit）。
+# 只用 opencode run 探測，不 API 直打：Zen 免費層只認 opencode 客戶端，重試會被判濫用鎖 IP。
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+LOGD="$HOME/.dcq/logs"
+STAMP="$LOGD/oc-probe.last"
+PROBE_EVERY_D="${PROBE_EVERY_D:-7}"
+DCQ="${DCQ_BIN:-$HERE/../../bin/dcq}"
+mkdir -p "$LOGD"
+
+catalog_sync() {
+  "$DCQ" sync-catalog --source "$1" || echo "oc-probe: dcq sync-catalog 失敗（rc=$?）"
+}
+
+full() {
+  date +%s > "$STAMP"
+  "$HERE/oc-free-check" -p opencode -j 4 -t 60 --tsv "$LOGD/probe.tsv"
+  local probe_rc=$?
+  catalog_sync "oc-probe 週探測"
+  return $probe_rc
+}
+
+x_read() {
+  "$HERE/oc-free-check" --x-only "$LOGD"
+  local rc=$?
+  [ "$rc" -eq 3 ] && { echo "oc-probe x: 推文提到清單變動，已記 x-pool（不提前探測）"; catalog_sync "@opencode 推文"; rc=0; }
+  return $rc
+}
+
+hook() {
+  local h="${OC_PROBE_HOOK:-$HOME/.config/oc-probe/hook}"
+  [ -x "$h" ] || return 0
+  "$h" || echo "oc-probe: hook 失敗（rc=$?）"
+}
+
+daily() {
+  local last gap rc=0
+  last=$(cat "$STAMP" 2>/dev/null || stat -f %m "$LOGD/probe.tsv" 2>/dev/null || echo 0)
+  gap=$(( $(date +%s) - last ))
+  # 留 1 小時餘裕，06:00:01 寫的 stamp 下週 06:00 才不會差一秒錯過
+  if [ "$gap" -ge $(( PROBE_EVERY_D * 86400 - 3600 )) ]; then
+    # 閘內不探測也不寫 stamp，隔天閘外再補，不讓一次封鎖吃掉整週
+    if zen-gate check >/dev/null 2>&1; then full || rc=$?
+    else echo "oc-probe: 該做週探測，但 Zen 共用閘冷卻中，改明天再試"; fi
+  else
+    echo "oc-probe: 距上次探測 $((gap / 86400)) 天（每 ${PROBE_EVERY_D} 天一次），今天不探測"
+  fi
+  "$HERE/go-sync" || { echo "oc-probe: go-sync 失敗"; rc=1; }
+  hook
+  return $rc
+}
+
+case "${1:-daily}" in
+  daily) daily; exit $? ;;
+  probe) full; exit $? ;;
+  sync) "$HERE/go-sync" --scan; exit $? ;;
+  x) x_read; exit $? ;;
+  *) echo "用法：oc-probe [daily|probe|sync|x]" >&2; exit 64 ;;
+esac

@@ -77,7 +77,7 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 | 前綴 | 端點 | 能不能走 API |
 |---|---|---|
 | `opencode/…`（dc_id 無前綴，Zen） | `opencode.ai/zen/v1` | 不能。只准 `opencode run`／`dc`／`dcq` |
-| `opencode-go/…`（Go，含 Go 上的 `*-free`） | `opencode.ai/zen/go/v1` | 可以（OmniRoute go-free／go-sub、Hermes opencode-go） |
+| `opencode-go/…`（Go，含 Go 上的 `*-free`） | `opencode.ai/zen/go/v1` | 可以，但 dcq 只走 opencode run（10-20 起 OmniRoute 不含 OC，go-free／go-sub combo 已刪） |
 
 - 模型名會撞：`minimax-m3.1-flash-free`、`beam-free`、`longcat-2.5-preview-free` 在 Zen 和 Go 都有。看到裸名先判是哪個端點，不要憑名字推。
 - Zen 的 API 沒回應不代表壞，不准判失效、不准重試探測：會被判濫用、封整個 IP 的 Zen 池（10-19 整池 403）。要知道能不能用，看 06:00 probe 排名。

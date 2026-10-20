@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>local.opencode-probe.x</string>
+<key>ProgramArguments</key><array><string>__HOME__/.local/bin/oc-probe</string><string>x</string></array>
+<key>EnvironmentVariables</key><dict><key>LANG</key><string>en_US.UTF-8</string><key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:__HOME__/.local/bin</string></dict>
+<key>StartInterval</key><integer>14400</integer>
+<key>StandardOutPath</key><string>__HOME__/.dcq/logs/probe-x.log</string>
+<key>StandardErrorPath</key><string>__HOME__/.dcq/logs/probe-x.log</string>
+</dict></plist>

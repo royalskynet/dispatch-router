@@ -25,8 +25,8 @@ pen="$(DCQ_MODELS= DCQ_POOL_ZEN="c b d a e f g" DCQ_POOL_GO="" dcq rank | sed -n
 [ "$got" = "$want" ] || { echo "FAIL order: got [$got] want [$want]"; fail=1; }
 got="$(DCQ_AUTORANK=0 DCQ_POOL_ZEN="c b d a e" DCQ_POOL_GO="" dcq status 2>&1 | awk '/busy=/{printf "%s ", $1}')"
 case "$got" in "c b d a e "*) ;; *) echo "FAIL autorank=0: [$got]"; fail=1 ;; esac
-# 4) 每日探測（probe.tsv 最新一批）：非 OK 的移到最後；manual 位置依探測秒數排；舊批次（>36h）不算
-P="$DCQ_HOME/logs/probe.tsv"; now="$(date +%F_%T)"; old="$(date -v-3d +%F_%T 2>/dev/null || date -d '-3 days' +%F_%T)"
+# 4) 每日探測（probe.tsv 最新一批）：非 OK 的移到最後；manual 位置依探測秒數排；舊批次（>8 天）不算
+P="$DCQ_HOME/logs/probe.tsv"; now="$(date +%F_%T)"; old="$(date -v-9d +%F_%T 2>/dev/null || date -d '-9 days' +%F_%T)"
 printf '%s\topencode\tx\tOK\t50\n%s\topencode\ty\tOK\t5\n%s\topencode\tz\tOK\t9\n' "$old" "$old" "$old" > "$P"
 printf '%s\topencode\tx\tOK\t9\n%s\topencode\ty\tTIMEOUT\t60\n%s\topencode-go\ty\tFAIL\t1\n%s\topencode\tw\tOK\t3\n' "$now" "$now" "$now" "$now" >> "$P"
 got="$(DCQ_MODELS= DCQ_POOL_ZEN="a x y z w" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
@@ -35,6 +35,10 @@ want="a w x z y"   # y 最新一批全掛→最後；w 3s 先於 x 9s；z 只有
 : > "$P"; printf '%s\topencode\ty\tTIMEOUT\t60\n' "$old" > "$P"   # 只有過期批次 → 不降級
 got="$(DCQ_MODELS= DCQ_POOL_ZEN="y a" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
 [ "$got" = "y a" ] || { echo "FAIL stale probe: got [$got] want [y a]"; fail=1; }
+wk="$(date -v-5d +%F_%T 2>/dev/null || date -d '-5 days' +%F_%T)"   # 週探測：5 天前的批次仍要採用
+: > "$P"; printf '%s\topencode\ty\tTIMEOUT\t60\n' "$wk" > "$P"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="y a" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
+[ "$got" = "a y" ] || { echo "FAIL weekly probe: got [$got] want [a y]"; fail=1; }
 # 5) 假釋：累犯最近一筆 >7 天 → 回免費層 manual；7 天內 → 留懲罰層
 : > "$P"; old="$(date -v-10d +%F 2>/dev/null || date -d '-10 days' +%F)_00:00:00"
 for i in 1 2 3; do printf '%s\th\t10\t1\texit\n' "$old" >> "$G"; printf '%s\tk\t10\t1\texit\n' "$D" >> "$G"; done
@@ -78,6 +82,19 @@ got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1
 printf '{"at":"2000-01-01T00:00:00","upstream":["g1"]}' > "$DCQ_GO_STATE"
 got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1 opencode-go/g2" dcq rank | sed -n 's/^訂閱層：//p')"
 [ "$got" = "opencode-go/g1 opencode-go/g2" ] || { echo "FAIL stale go state: [$got]"; fail=1; }
+# Go 免費同步：兜底層 upstream 沒有的 opencode-go/*-free 移出、新 -free 接 opencode-go 段尾；omniroute/* 不動
+printf '{"at":"%s","upstream":["f1-free","newf-free","oldf-free"],"first_seen":{"f1-free":"base","oldf-free":"base","newf-free":"2026-10-15"}}' "$(date +%FT%T)" > "$DCQ_GO_STATE"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="" DCQ_POOL_TAIL="opencode-go/f1-free opencode-go/gone-free omniroute/nim-pool" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$got" = "opencode-go/f1-free opencode-go/newf-free omniroute/nim-pool" ] || { echo "FAIL go free sync: [$got]"; fail=1; }
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="" DCQ_POOL_TAIL="opencode-go/gone-free" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$got" = "opencode-go/newf-free" ] || { echo "FAIL go free sync replace: [$got]"; fail=1; }
+# 週掃：5 天前的 state 仍採用，9 天前的不採用（有效期 8 天）
+printf '{"at":"%s","upstream":["g1"]}' "$(date -v-120H +%FT%T 2>/dev/null || date -d '-120 hours' +%FT%T)" > "$DCQ_GO_STATE"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1 opencode-go/g2" dcq rank | sed -n 's/^訂閱層：//p')"
+[ "$got" = "opencode-go/g1" ] || { echo "FAIL 5-day go state not adopted: [$got]"; fail=1; }
+printf '{"at":"%s","upstream":["g1"]}' "$(date -v-216H +%FT%T 2>/dev/null || date -d '-216 hours' +%FT%T)" > "$DCQ_GO_STATE"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1 opencode-go/g2" dcq rank | sed -n 's/^訂閱層：//p')"
+[ "$got" = "opencode-go/g1 opencode-go/g2" ] || { echo "FAIL 9-day go state adopted: [$got]"; fail=1; }
 # 10) 上游不回：why=upstream 不算模型樣本（5 筆 upstream 不觸發 0 PASS 短路）；5 筆 stall 照樣觸發
 : > "$G"; rep 5 u 124 upstream; rep 5 s 124 stall
 out="$(DCQ_MODELS= DCQ_POOL_ZEN="u s a" DCQ_POOL_GO="" dcq rank)"

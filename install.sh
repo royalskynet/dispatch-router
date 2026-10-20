@@ -11,8 +11,8 @@ ln -sfn "$REPO/bin/dcq" ~/.local/bin/dcq
 ln -sfn "$REPO/bin/zen-gate" ~/.local/bin/zen-gate
 # PATH 上的 wo-verify 也由本 repo 提供（手動驗收、其他腳本用）；dc 自己不走 PATH
 ln -sfn "$REPO/bin/wo-verify" ~/.local/bin/wo-verify
-# 每日探測（oc-free-check／probe-sync／launchd）10-19 起移到私有 ~/dev/opencode-probe，由它的 install.sh 裝；
-# dcq rank 照讀 ~/.dcq/logs/probe.tsv。
+# 週探測（oc-free-check／go-sync／launchd）是選配，在 oc-probe/，由 oc-probe/install.sh 裝；
+# dcq rank 照讀 ~/.dcq/logs/probe.tsv，沒裝就沒有探測資料。
 
 # ~/.claude/skills/dr：若已是實體目錄（非 symlink），先備份進 repo 再連結
 if [ -d ~/.claude/skills/dr ] && [ ! -L ~/.claude/skills/dr ]; then
