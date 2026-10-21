@@ -255,6 +255,21 @@ oc_declared() {
   echo "${out# }"
 }
 POOL_TAIL="$(oc_declared "$POOL_TAIL")"
+# 2026-10-21：兜底層與訂閱層也做層內排序，規則與免費層相同（依「每 PASS 一張平均花幾秒」升冪排，
+# 停滯率過高或 0 PASS 的降到該層最後；樣本不足的留原位）。
+# 為什麼：這兩層以前照清冊固定順序，永遠先派第一隻。實例：兜底層 opencode-go/longcat 12 跑 2 過，
+# 排在 11 跑 8 過的 opencode-go/beam 前面 —— 比較慢的那隻先跑，每張工單都在替它白等。
+# 只在層內排：不跨層搬移（不把免費層的模型搬進兜底層、也不把兜底層的搬去訂閱層），也不分難度（層內用全部紀錄）。
+# DCQ_MODELS 有設、或 DCQ_AUTORANK=0 就不排（跟免費層同一個開關）。
+rank_layer() {  # $1=該層手排順序（空白分隔）；印「順序|懲罰」接回來的完整順序：懲罰墊該層最後
+  local r o p
+  r="$(rank_free "$1")"; o="${r%%|*}"; p="${r#*|}"
+  o="${o# }"; o="${o% }"; p="${p# }"; p="${p% }"
+  if [ -n "$o" ] && [ -n "$p" ]; then echo "$o $p"; else echo "${o}${p}"; fi
+}
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
+  POOL_TAIL="$(rank_layer "$POOL_TAIL")"; POOL_PAID="$(rank_layer "$POOL_PAID")"
+fi
 # API 層（按量扣錢）：訂閱層之後，DCQ_ALLOW_API=1 才用；清冊 billing=api 且有 dc_id 的列。預設不開。
 POOL_API=""; [ "${DCQ_ALLOW_API:-0}" = 1 ] && POOL_API="${DCQ_POOL_API-$(cat_pool api slash) $(cat_pool api zen)}"
 POOL_API="${POOL_API# }"; POOL_API="${POOL_API% }"
@@ -293,7 +308,7 @@ MASK="${DCQ_MASK-$HOME/.claude/tools/fi-mask-transcript.mjs}"
 LOG_DAYS="${DCQ_LOG_DAYS:-14}"
 
 die() { echo "dcq: $*" >&2; exit 2; }
-init() { mkdir -p "$Q"/{pending,running,done,failed,logs} "$Q/.cwdlock" "$Q/.cancel" "$Q/.health" "$Q/.inuse"; }
+init() { mkdir -p "$Q"/{pending,running,done,failed,logs} "$Q/.cwdlock" "$Q/.cancel" "$Q/.health" "$Q/.inuse" "$Q/.preflight"; }
 # git-bash 只有 sha1sum，macOS/Linux 只有 shasum；兩者同為 SHA-1，鎖 key 跨平台一致
 _sha1() { if command -v shasum >/dev/null 2>&1; then shasum; else sha1sum; fi; }
 hash12() { printf '%s' "$1" | _sha1 | cut -c1-12; }
@@ -344,6 +359,10 @@ take_slot() {
   local k p pm="" ps="" kv
   p="$(prov_of "$1")"
   for kv in $PROV_MAX; do [ "${kv%%=*}" = "$p" ] && pm="${kv#*=}"; done
+  # 10-21：半開只放 1 個探測（借鏡 OmniRoute circuitBreaker 的 halfOpenRequests=1）。
+  # Zen 閘已到期但還有被封的紀錄 → zen 這個 provider 的上限壓到 1，
+  # 避免整池同時探測、探測完又被判濫用，退避輪數白長。
+  if [ "$p" = zen ] && "$ZG" halfopen >/dev/null 2>&1; then pm=1; fi
   if [ -n "$pm" ]; then
     for k in $(seq 1 "$pm"); do mkdir "$Q/.inuse/@$p.$k" 2>/dev/null && { ps="$Q/.inuse/@$p.$k"; break; }; done
     [ -n "$ps" ] || return 1
@@ -446,6 +465,17 @@ cmd_add() {
 #   124 逾時 —— 可換模型重試
 #   其他 驗收失敗行的 rc —— 模型做錯了，換模型再給一次機會
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || now; }
+# $1（dc）底下的 opencode 有子程序＝工具正在跑（多半是測試），rc 0。
+# 2026-10-21 實測：bash 工具是 opencode→/bin/zsh→指令；--pure 閒置時 opencode 沒有任何子程序。
+# comm 可能是完整路徑（macOS），取 basename 比對。
+oc_busy() {
+  ps -Ao pid=,ppid=,comm= 2>/dev/null | awk -v root="$1" '
+    { p[$1] = $2; n = $3; sub(/.*\//, "", n); c[$1] = n }
+    END { for (x in p) { if (c[p[x]] != "opencode" && c[p[x]] != "opencode.exe") continue
+            y = p[x]; while (y != root && (y in p) && y > 1) y = p[y]
+            if (y == root) exit 0 }
+          exit 1 }'
+}
 # 工作樹指紋：HEAD（模型自己 commit 也算有動）＋追蹤檔改動＋未追蹤檔內容
 tree_sig() {
   { git -C "$1" rev-parse HEAD; git -C "$1" diff HEAD
@@ -491,9 +521,9 @@ stall_dump() {
 # 也算在內——驗收指令本身若靜默超過 STALL_S 會被誤判，STALL_S 要比最慢的驗收寬。
 watch_oc() {
   local id="$1" model="$2" task="$3" cwd="$4" t0="$5" paid="$6" out pid rc why=exit gap maxgap=0 t ta
-  local spin_s="${JOB_SPIN_S:-$SPIN_S}" sig="" sig_t s
+  local spin_s="${JOB_SPIN_S:-$SPIN_S}" sig="" sig_t s alive=0 tp
   ta=$(now)  # 這次嘗試的起點（t0 是整張工單的起點），算每隻模型實際花的秒數
-  sig_t=$ta
+  sig_t=$ta; tp=$ta
   { [ "$spin_s" -gt 0 ] && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 && sig="$(tree_sig "$cwd")"; } || spin_s=0
   out="$Q/logs/$id.$(fk "$model").out"
   # 先建 600 空檔：底下的 `> "$out"` 只截斷不改權限，沒先建的話 .out 會吃預設 umask（644）
@@ -504,7 +534,13 @@ watch_oc() {
   echo "$pid" > "$Q/running/$id.pid"
   while kill -0 "$pid" 2>/dev/null; do
     sleep "$POLL_S"
-    t=$(now); gap=$(( t - $(mtime "$out") ))
+    t=$(now)
+    # 工具還在跑：算活著，stall 從工具結束起算、spin 不計這段，只剩 JOB_MAX／ATTEMPT_MAX。
+    # 10-21 前模型自跑 164s 的測試沒輸出也沒改檔，被判 spin／slow（WO-1/2 二十個嘗試）。
+    # 暫停上限＝opencode bash 逾時（dc 注入 300s），卡死的工具不會無限暫停。maxgap 也不計這段，免得墊高 STALL_S 校準。
+    if oc_busy "$pid"; then alive=$t; sig_t=$(( sig_t + t - tp )); fi
+    tp=$t
+    gap=$(mtime "$out"); [ "$alive" -gt "$gap" ] && gap=$alive; gap=$(( t - gap ))
     [ "$gap" -gt "$maxgap" ] && maxgap=$gap
     if [ "$gap" -ge "$STALL_S" ]; then why=stall
     elif [ $(( t - t0 )) -ge "$JOB_MAX" ]; then why=jobmax
@@ -517,7 +553,7 @@ watch_oc() {
       why=spin
       echo "dcq[$id] watchdog: $model 空轉（$(( t - sig_t ))s 沒改任何檔，cwd=${cwd}）" >&2
     else continue; fi
-    echo "dcq[$id] watchdog: $model ${why}（${gap}s 無輸出／已跑 $(( t - t0 ))s），殺掉" >&2
+    echo "dcq[$id] watchdog: $model ${why}（${gap}s 無輸出／本次已跑 $(( t - ta ))s，整張 $(( t - t0 ))s），殺掉" >&2
     STALL_UPSTREAM=0; [ "$why" = stall ] && stall_dump "$out" "$cwd" "$ta" "$model"
     [ "$STALL_UPSTREAM" = 1 ] && { why=upstream; echo "dcq[$id] $model 整段 0 輸出，判上游不回（額度／排隊），不記模型的帳" >&2; }
     killtree "$pid"; break
@@ -543,6 +579,16 @@ run_job() {
   id="$(basename "$jobfile" .job)"
   task="$(sed -n 's/^TASK=//p' "$jobfile")"
   cwd="$(sed -n 's/^CWD=//p' "$jobfile")"
+  # 2026-10-21 前置檢查憑證：同一張工單的每次嘗試共用一個目錄。
+  # 為什麼：dc 每派一次工就重跑整套前置檢查（deep-lint ＋ do-nothing 對照，上限 120s），
+  # 而且評分器是「當下」從工單重抽的 —— 前一隻模型若改過工單的驗收區塊，
+  # 下一次重抽會把改過的版本釘成新基準（自己改自己過）。也不能用「第幾次嘗試」判斷
+  # 有沒有驗過：lint 失敗是 exit 1（會被重試），watchdog 也可能在對照跑完前就殺掉 dc。
+  # 第一次前置檢查全過的那次會把評分器快照（pin）留在這個目錄裡，後面換模型時
+  # dc 直接沿用同一份：不重跑整套驗收，也不重抽評分器。工單結束（PASS／FAIL／取消）
+  # 就刪掉 —— 憑證只對這一張工單有效。
+  export DC_PREFLIGHT_DIR="$Q/.preflight/$id"
+  mkdir -p "$DC_PREFLIGHT_DIR" 2>/dev/null
   # 難度（入列時判一次，中途不換）。JOB_TIER 是全域：watch_oc 寫 gaps.tsv 第 7 欄要用；每個 worker 是獨立 subshell
   JOB_TIER="$(sed -n 's/^TIER=//p' "$jobfile")"
   JOB_SPIN_S="$(sed -n 's/^SPIN=//p' "$jobfile")"
@@ -610,6 +656,7 @@ run_job() {
       exit:0) reset_fail "$model"
          mv "$jobfile" "$Q/done/$id.job"
          echo "dcq[$id] PASS model=$model" >&2
+         rm -rf "$DC_PREFLIGHT_DIR"   # 前置檢查憑證只對這張工單有效，結案就收掉
          return 0 ;;
       # 總時限是工單的問題不是模型的：不罰模型、不再換
       jobmax:*) rc=124; break ;;
@@ -646,6 +693,7 @@ run_job() {
     echo "dcq[$id] FAIL rc=${rc}（試過 $n 個模型：${tried# }）" >&2
   fi
   mv "$jobfile" "$Q/failed/$id.job"
+  rm -rf "$DC_PREFLIGHT_DIR"   # 前置檢查憑證只對這張工單有效，結案就收掉（FAIL／取消都走這裡）
   return 1
 }
 
@@ -827,7 +875,7 @@ cmd_wait() {
   [ ${#ids[@]} -eq 0 ] && { cmd_status | sed -n 1,4p; [ -n "$(ls "$Q"/failed/*.job 2>/dev/null)" ] && rc=1; }
   return $rc
 }
-cmd_clear() { rm -f "$Q"/{pending,running,done,failed}/*.job "$Q"/logs/*.out "$Q"/running/*.pid 2>/dev/null; rm -rf "$Q"/.cwdlock/* 2>/dev/null; rm -rf "$Q"/.health/* "$Q"/.inuse/* "$Q"/.cancel/* 2>/dev/null; echo "dcq: 已清空"; }
+cmd_clear() { rm -f "$Q"/{pending,running,done,failed}/*.job "$Q"/logs/*.out "$Q"/running/*.pid 2>/dev/null; rm -rf "$Q"/.cwdlock/* 2>/dev/null; rm -rf "$Q"/.health/* "$Q"/.inuse/* "$Q"/.cancel/* "$Q"/.preflight/* 2>/dev/null; echo "dcq: 已清空"; }
 
 init
 case "${1:-}" in

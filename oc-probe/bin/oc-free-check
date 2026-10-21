@@ -199,7 +199,24 @@ def zen_gate(*args):
         return 0
 
 
+# 推播只給正式排程：狀態目錄（--tsv 所在目錄或 --x-only）是 ~/.dcq/logs、閘檔沒被改指才推。
+# 測試、手動試跑把它們指到暫存就不推，DC_PUSH=1 強制推（同 zen-gate；10-21 模型手動 trip 發出 5 則誤報）。
+STATE_DIR = None  # main() 依參數設定
+
+
+def push_ok():
+    if os.environ.get("DC_PUSH") == "1":
+        return True
+    home = os.path.expanduser("~")
+    return (STATE_DIR is not None and os.path.abspath(STATE_DIR) == os.path.join(home, ".dcq", "logs")
+            and os.environ.get("DC_ZEN_GATE", os.path.join(home, ".dcq", ".zen-gate")) == os.path.join(home, ".dcq", ".zen-gate")
+            and os.environ.get("JEV_ZEN_STATUS_FILE", os.path.join(home, ".jevgate", "zen-free-status.json"))
+            == os.path.join(home, ".jevgate", "zen-free-status.json"))
+
+
 def notify(msg):
+    if not push_ok():
+        return
     if subprocess.run(["sh", "-c", "command -v hpush"], capture_output=True).returncode == 0:
         subprocess.run(["hpush", msg], capture_output=True)
 
@@ -427,6 +444,8 @@ def main():
     if a.help:
         print(__doc__)
         return
+    global STATE_DIR
+    STATE_DIR = a.x_only if a.x_only is not None else (os.path.dirname(a.tsv) if a.tsv else None)
     if a.x_only is not None:
         ups = x_updates(os.path.join(a.x_only, f"x-{a.x_handle}.seen"), a.x_handle, posts_out=(allp := []))
         if ups is None:

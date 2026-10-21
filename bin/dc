@@ -82,9 +82,24 @@ OCBIN="${DC_BIN:-$(dirname "$(readlink -f "$0")")}"
 WV="$OCBIN/wo-verify"; DL="$OCBIN/deep-lint"
 [ -x "$WV" ] || { echo "dc: 找不到 wo-verify：${WV}" >&2; exit 2; }
 
+# --- 前置檢查憑證（DC_PREFLIGHT_DIR）-------------------------------------------
+# 2026-10-21：dc 每派一次工就重跑整套前置檢查（deep-lint ＋ do-nothing 負向對照，
+# 對照上限 120s），評分器也是「當下」從工單重抽的 —— 前一隻模型若改過工單的驗收區塊，
+# 下一次重抽會把改過的版本釘成新基準（自己改自己過）。也不能用「第幾次嘗試」判斷有沒有驗過：
+# lint 失敗是 exit 1（會被重試），watchdog 也可能在對照跑完前就殺掉 dc。
+# 憑證＝第一次前置檢查全過時留下的評分器快照：同一張工單的後續嘗試沿用同一份評分器，
+# 不重跑 lint 與負向對照；工單當下的驗收區塊照舊跟它比對，不一致照樣 exit 3。
+# 沒設這個變數時行為完全不變（下面每一段都留著舊路徑）。
+pf_dir="${DC_PREFLIGHT_DIR:-}"
+pf_pin=""
+[ -n "$pf_dir" ] && [ -f "$pf_dir/pin" ] && pf_pin="$pf_dir/pin"
+
 # 沒有可跑的驗收區塊就不派工：模型做完也無法判定成敗，等於燒時間換一個不知道對不對的結果。
-if [ "${DC_SKIP_LINT:-0}" != 1 ] && [ -x "$DL" ]; then
+# 有憑證就不重跑 lint：第一次已經過了，再跑一次只是讓換模型的嘗試白等。
+lint_ok=0
+if [ -z "$pf_pin" ] && [ "${DC_SKIP_LINT:-0}" != 1 ] && [ -x "$DL" ]; then
   "$DL" "$f" || { echo "dc: deep-lint 未過（DC_SKIP_LINT=1 可強制派工）" >&2; exit 1; }
+  lint_ok=1
 fi
 "$WV" "$f" --dry >/dev/null 2>&1 || { echo "dc: 驗收區塊語法錯，wo-verify --dry 失敗" >&2; exit 2; }
 
@@ -93,22 +108,51 @@ fi
 # （fixindex 0372 §4 偽造 git status、0373 在 fixsnap 植入刪檔後門 + 偽造註解）。
 # executor-rules.md 第 8 條「不修改驗收區塊」是提示詞，本機實測 Documentation 層
 # 符合率 ≈ 0%。這裡改成機械偵測：驗收跑 pin 這份，並比對工單當下的版本，不一致 exit 3。
-pin="$(mktemp)" || { echo "dc: mktemp 失敗（pin）" >&2; exit 2; }
-trap 'rm -f "$pin"' EXIT
-"$WV" "$f" --dump > "$pin" || { echo "dc: 抽不出驗收區塊（wo-verify --dump 失敗）" >&2; exit 2; }
+# pintmp＝這次自己抽的暫存檔（EXIT 時刪）；pin＝要餵給 wo-verify --pinned 的那份。
+# 有前置檢查憑證就沿用憑證（不重新 --dump：重抽等於把前一隻模型改過的驗收區塊
+# 釘成新基準）；憑證本身不能被 EXIT trap 刪掉，所以刪的對象是 pintmp 不是 pin。
+pintmp="$(mktemp)" || { echo "dc: mktemp 失敗（pin）" >&2; exit 2; }
+trap 'rm -f "$pintmp"' EXIT
+if [ -n "$pf_pin" ]; then
+  pin="$pf_pin"
+  echo "dc: 沿用本單前置檢查憑證" >&2
+else
+  pin="$pintmp"
+  "$WV" "$f" --dump > "$pintmp" || { echo "dc: 抽不出驗收區塊（wo-verify --dump 失敗）" >&2; exit 2; }
+fi
 
 # --- do-nothing 負向對照：驗收必須在未動工前失敗 -----------------------------
 # 一個「什麼都不做也會通過」的驗收不是驗收。派工前在同一個 cwd 跑一次 pin，
 # 預期非零；若此刻就通過，代表驗收是空包彈或工單本身是 no-op，派下去只會
 # 拿到一個不知道對不對的 PASS。驗收規則本來就要求唯讀，所以提前跑是安全的。
 # 逃生門：確認既有狀態型的工單寫一行 `NEG-CONTROL: n/a`，或 DC_NEGCTL=0。
-if [ "${DC_NEGCTL:-1}" = 1 ] && ! grep -q '^NEG-CONTROL: *n/a' "$f"; then
+# 有前置檢查憑證就不重跑：這張工單已經對照過一次，再跑只是白等 120s。
+negctl_ok=0
+if [ -z "$pf_pin" ] && [ "${DC_NEGCTL:-1}" = 1 ] && ! grep -q '^NEG-CONTROL: *n/a' "$f"; then
   if ( cd "$d" && WO_VERIFY_TIMEOUT="${DC_NEGCTL_TIMEOUT:-120}" "$WV" "$f" --pinned "$pin" >/dev/null 2>&1 ); then
     echo "dc: 中止——驗收在未動工前就通過（do-nothing 對照失敗）。" >&2
     echo "    驗收是空包彈、或工單要求的狀態已經存在。確認既有狀態型的工單請加一行 NEG-CONTROL: n/a；" >&2
     echo "    要強制派工用 DC_NEGCTL=0。cwd=${d} task=${f}" >&2
     exit 2
   fi
+  negctl_ok=1
+fi
+
+# --- 前置檢查憑證：閘都過了才留 ------------------------------------------------
+# lint 或負向對照沒過、或中途被殺（watchdog 可能在對照跑完前就殺掉 dc），
+# 都不能留下 pin：留下來下一次就會拿「沒驗過」的評分器當基準。
+# 用 DC_SKIP_LINT／DC_NEGCTL／NEG-CONTROL: n/a 關掉某一關時不算「通過」，
+# 那就不留憑證（維持舊行為：每次都重跑閘）。
+if [ -n "$pf_dir" ] && [ -z "$pf_pin" ] && [ "$lint_ok" = 1 ] && [ "$negctl_ok" = 1 ]; then
+  pftmp=""
+  if mkdir -p "$pf_dir" 2>/dev/null; then
+    pftmp="$(mktemp "$pf_dir/.pin.XXXXXX" 2>/dev/null || true)"
+    if [ -n "$pftmp" ] && cp "$pintmp" "$pftmp" 2>/dev/null && mv "$pftmp" "$pf_dir/pin" 2>/dev/null; then
+      pftmp=""
+    fi
+  fi
+  [ -z "$pftmp" ] || rm -f "$pftmp"
+  [ -f "$pf_dir/pin" ] || echo "dc: 寫不了前置檢查憑證（不影響派工）：${pf_dir}" >&2
 fi
 
 # 未指定模型就釘死預設免費模型（不讓 opencode config 的 per-agent 付費 model 生效）；
@@ -133,7 +177,8 @@ fi
 # Zen 免費閘道判濫用（2026-10-18：opencode 蒸餾攻擊事件後收緊）：被判一次就整個 Zen 免費池停用
 # ZEN_GATE_S，所有佇列共用（同一個出口 IP）。被擋後換模型連打正是濫用特徵，故不換 Zen 模型重試。
 # 10-18 起另一種措辭：IP 判濫用（"detected abusive traffic from this IP address"），連官方客戶端也擋。
-ABUSE_RE='Detect Abuse Traffic|Free Model Gateway.*Forbidden|Forbidden.*Free Model Gateway|detected abusive traffic'
+# 只認 opencode 自己的錯誤行（level=ERROR log／終端 Error:），模型輸出的原始碼或文件不算；首字母 [] 防本行比中自己。
+ABUSE_RE='(level=ERROR|Error: ).*([D]etect Abuse Traffic|[d]etected abusive traffic)'
 ZEN_GATE="${DC_ZEN_GATE:-$HOME/.dcq/.zen-gate}"
 ZEN_GATE_S="${DC_ZEN_GATE_S:-21600}"
 # 10-19：閘有兩份（本檔與 Jev 的 zen-free-status.json），讀寫一律經 zen-gate 取聯集，見該檔頭
@@ -158,8 +203,8 @@ if [ "$t" != free ]; then
     prev=$(cat "$ST" 2>/dev/null || echo "$((n - 1))"); skipped=$((n - 1 - prev))
     [ "$skipped" -gt 0 ] && msg="${msg}（另有 ${skipped} 筆被限流，見 billing.tsv）"
     echo "$n" > "$ST"
-    # 背景送：TG 慢或掛了都不該拖住派工
-    command -v hpush >/dev/null && { hpush "$msg" >/dev/null 2>&1 & }
+    # 背景送：TG 慢或掛了都不該拖住派工。帳目錄不是正式路徑（測試把 DCQ_HOME 指到暫存）不推，DC_PUSH=1 強制推（同 zen-gate）
+    { [ "${DC_PUSH:-}" = 1 ] || [ "$BL" = "$HOME/.dcq/logs" ]; } && command -v hpush >/dev/null && { hpush "$msg" >/dev/null 2>&1 & }
   fi
 fi
 
@@ -178,6 +223,10 @@ esac
 # 實測同一句 prompt 輸入 21.6k → 7.2k token（關讀 ＋ permission.skill=deny 一起上）。官方文件：https://opencode.ai/docs/rules 、https://opencode.ai/docs/cli
 # $0 可能是 symlink（install.sh link 到 ~/.local/bin/dc），readlink -f 跟到 repo 實體路徑。
 export OPENCODE_DISABLE_CLAUDE_CODE=1
+# opencode bash 工具預設 120s 就砍指令（1.18.35 原始碼 `bashDefaultTimeoutMs ?? 120000`，旗標 10-21 實測生效）。
+# 模型自跑慢測試（dcq_test 實測 164s）被砍後會重跑同一條，撞 dcq 的 spin／slow（10-21 WO-1/2 二十個嘗試）。
+# 300s ≈ 164s×1.8。dcq watchdog 在工具跑時暫停 stall／spin，暫停時間的上限就是這個值。
+export OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS="${OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS:-300000}"
 _cc="${OPENCODE_CONFIG_CONTENT:-}"; [ -n "$_cc" ] || _cc='{}'
 # 用 jq 深度合併（*）而不是整份覆蓋：opencode-go 分支剛設進來的 enabled_providers 不能被蓋掉。
 _cc="$(printf '%s' "$_cc" | jq -c --arg f "$(dirname "$(dirname "$(readlink -f "$0")")")/executor-rules.md" '. * {permission:{skill:"deny"}, instructions:[$f]}' 2>/dev/null)"
@@ -244,7 +293,7 @@ if [ "${DC_LOCK_HELD:-0}" != 1 ]; then
     fi
     sleep 1; waited=$((waited + 1))
   done
-  trap 'release_lock; rm -f "$pin"' EXIT
+  trap 'release_lock; rm -f "$pintmp"' EXIT
 fi
 # INT/TERM 只負責退出，清理交給 EXIT trap。handler 裡不 exit 的話 bash 跑完清理會「繼續往下」，
 # 拿半成品去跑 wo-verify：被殺的工單可能被判 PASS 或算成模型做錯（2026-10-03 實證）。
@@ -282,9 +331,10 @@ _wt_snap() {
 }
 wt_before="$(_wt_snap)"
 
-RL_RE='small=false.*(Rate limit exceeded|FreeUsageLimitError)'
+# 偵測字串首字母加 []：模型 cat 本檔時，這幾行原始碼不可比中自己（10-21 改 dc 的工單誤判濫用）。
+RL_RE='small=false.*([R]ate limit exceeded|[F]reeUsageLimitError)'
 # 上游不可用（Model/Endpoint is unavailable、已下架）opencode 一樣在程序內重試約 67s 才 rc=1（2026-10-11 實測），提早結束讓 dcq 換模型。
-UA_RE='small=false.*(Upstream request failed|has been deprecated)'
+UA_RE='small=false.*([U]pstream request failed|has been [d]eprecated)'
 # opencode 開工就印「> <agent> · <model>」，在模型回應之前（上游不可用時也照印）。
 # DC_START_S 秒內沒出現＝卡在送出請求前，ERROR log 也是空的（2026-10-11 實證：400s 零輸出）。
 # 首輸出之後的停滯歸 dcq 的 STALL_S 管（fix 9775 §23），這裡不重複。
@@ -294,7 +344,7 @@ pidf="$out.pid"; rcf="$out.rc"
 # --title：沒給標題時 opencode 會另叫 small model（nemotron-3-ultra-free）產標題，每張工單白吃一份免費額度
 # 連子程序一起殺：子程序（MCP／LSP 等）還握著 stdout 的話，tee 不會結束，wait 會卡住。
 kill_oc() { local p; p=$(cat "$pidf" 2>/dev/null) || return 0; pkill -TERM -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; return 0; }
-trap 'release_lock; kill_oc; rm -f "$out" "$pidf" "$rcf" "$pin"' EXIT
+trap 'release_lock; kill_oc; rm -f "$out" "$pidf" "$rcf" "$pintmp"' EXIT
 { sh -c 'echo $$ > "$0"; exec "$@"' "$pidf" opencode run \
   "你是執行人。任務與驗收都在附加的檔案裡，先完整讀完再動手。
 驗收由外部 wo-verify 機械執行，你的自述不影響成敗判定。
@@ -340,6 +390,15 @@ fi
 [ "$rl" = 4 ] && { echo "dc: Zen 免費閘道判濫用（Detect Abuse Traffic），整個 Zen 免費池停用 ${ZEN_GATE_S}s（${ZEN_GATE}），已提早結束" >&2; exit 1; }
 [ "$rl" = 3 ] && { echo "dc: opencode ${START_S}s 內沒開工（無「> agent · model」行），判定卡住，已結束" >&2; exit 1; }
 [ "$rc" -eq 0 ] || { echo "dc: opencode run rc=${rc}（常見：上游掛=1、逾時=124、權限拒絕）" >&2; exit "$rc"; }
+# 10-21：Zen 閘的延遲倍增要靠「上游有正常回應」解封（借鏡 circuitBreaker 的半開探測）。
+# 恢復判準是「請求被上游正常回應」，不是「工單通過」——驗收過不過跟 IP 有沒有被解封無關，
+# 所以這裡在跑驗收之前就清掉失敗計數，驗收失敗也不影響退避歸零。
+# 只認 opencode/*（Zen 池；opencode-go 是自己的額度，不共用這個閘）。
+case "$m" in opencode/*)
+  if ! grep -q -E "$ABUSE_RE" "$out" 2>/dev/null && [ -s "$out" ]; then
+    "$ZG" ok >/dev/null 2>&1
+  fi ;;
+esac
 # 模型回報工單瑕疵（issue #4）：不跑驗收，直接 exit 2 走既有的契約錯分支 ——
 # dcq 的 exit:2 是 FATAL、不重試、不罰模型，工單的錯不會算到模型頭上。
 # 錨行首：模型引用工單原文或印出程式碼時不能誤判。

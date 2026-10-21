@@ -26,7 +26,8 @@ alarm() {
   printf '%s\n' "$1" > "$ALARM"
   echo "freecheck: 警報 —— $1" >&2
   echo "freecheck: 已寫 ${ALARM}，dcq 會停止收單。確認是誤報就刪掉它。" >&2
-  command -v hpush >/dev/null && hpush "🚨 dispatch-router freecheck: $1" >/dev/null 2>&1
+  # 狀態目錄不是正式路徑（測試把 DCQ_HOME 指到暫存）不推，DC_PUSH=1 強制推（同 zen-gate）
+  { [ "${DC_PUSH:-}" = 1 ] || [ "$STATE" = "$HOME/.dcq" ]; } && command -v hpush >/dev/null && hpush "🚨 dispatch-router freecheck: $1" >/dev/null 2>&1
   exit 3
 }
 

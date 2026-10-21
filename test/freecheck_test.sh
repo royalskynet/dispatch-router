@@ -23,4 +23,11 @@ chk() { # name usage want_rc want_alarm
 chk "percent>0 加白只 WARN" '{"usage":{"weekly":{"status":"ok","percent":5}}}' 0 N
 chk "額度窗受限仍警報"      '{"usage":{"weekly":{"status":"limited","percent":100}}}' 3 Y
 chk "全 0 放行"             '{"usage":{"weekly":{"status":"ok","percent":0}}}' 0 N
+# 警報推播：DCQ_HOME 是暫存路徑不推，DC_PUSH=1 才推（10-21，測試不發真 TG）
+printf '#!/bin/sh\necho x >> "%s/push"\n' "$T" > "$T/bin/hpush"
+lim='{"usage":{"weekly":{"status":"limited","percent":100}}}'
+FAKE_USAGE="$lim" bin/freecheck longcat-2.5-preview-free >/dev/null 2>&1
+[ ! -s "$T/push" ] && echo "PASS 暫存狀態目錄不推播" || { echo "FAIL 暫存狀態目錄推播了"; fail=1; }
+FAKE_USAGE="$lim" DC_PUSH=1 bin/freecheck longcat-2.5-preview-free >/dev/null 2>&1
+[ -s "$T/push" ] && echo "PASS DC_PUSH=1 照推" || { echo "FAIL DC_PUSH=1 沒推"; fail=1; }
 exit $fail

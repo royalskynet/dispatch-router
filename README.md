@@ -21,6 +21,11 @@ git clone https://github.com/royalskynet/dispatch-router && cd dispatch-router &
 - The acceptance script is pinned before the run; if the executor edits it, the run is judged as tampering (rc=3). Acceptance is re-run K times (default 2) to catch flaky results.
 - `dcq` runs many work orders in parallel with per-directory locks, a model pool with per-model cooldown, and a stall watchdog.
 - Model billing tiers are checked before each dispatch; paid models still run but trigger a Telegram warning.
+- The watchdog does not kill an attempt while opencode has a tool subprocess running (usually a slow test), and `dc` raises opencode's bash tool timeout from 120 s to 300 s.
+- `zen-gate` handles Zen free-tier IP blocks: the block lasts 6 h for the first 3 consecutive rounds, then doubles each round up to 48 h. When it expires, one half-open probe decides whether to reopen.
+- When a work order is retried on another model, lint and the do-nothing control run are skipped if the first attempt passed them, and the first pinned grader is reused.
+- The fallback and subscription tiers are ranked by seconds per pass, the same way as the free tier.
+- Telegram pushes fire only when state lives in the default paths (`~/.dcq`, `~/.jevgate`). Tests that point state at a temp directory stay silent unless `DC_PUSH=1`.
 
 Use plain `opencode run` if you only need a model to try something once. dc is for when "done" has to be decided by a script, not by the model.
 
@@ -36,7 +41,7 @@ The rest of this README is in Traditional Chinese.
 | 1 | **exit code ＝ `wo-verify` 的 rc** | opencode 的 exit code 反映它自己有沒有跑完，不反映任務對不對。dc 把成敗綁在驗收腳本上。 |
 | 2 | **派工前 `deep-lint` 閘** | 沒有可跑的驗收區塊就不派工 —— 否則模型做完也無法判定成敗。 |
 | 3 | **計費分級警示** | 有 key 之後 `opencode models` 會列出付費模型；dc 把實際要派的模型分級，非免費照派但發 TG。 |
-| 4 | **評分器釘住（`--pinned`，rc=3）** | 驗收區塊就在工單裡，執行人改得到的評分器他早晚會改到過關。派工前拍一份 pin，驗收跑 pin 並逐行比對；不一致即判篡改，不跑被改過的版本。 |
+| 4 | **評分器釘住（`--pinned`，rc=3）** | 驗收區塊就在工單裡，執行人改得到的評分器他早晚會改到過關。派工前拍一份 pin，驗收跑 pin 並逐行比對；不一致即判篡改，不跑被改過的版本。dcq 換模型重試同一張時，沿用第一次留下的前置檢查憑證（`$DCQ_HOME/.preflight/<id>/pin`）：lint 與負向對照不重跑，評分器也不重抽，前一隻模型改過的驗收不會被釘成新基準（2026-10-21）。 |
 | 5 | **do-nothing 負向對照（派工前，rc=2）** | 什麼都不做也會通過的驗收不是驗收。派工前先在同一 cwd 跑一次，此刻就過＝空包彈或 no-op，不派工。逃生門 `NEG-CONTROL: n/a`。 |
 | 6 | **驗收重跑 K 次（`DC_VERIFY_K`，預設 2）** | 單次通過只代表「至少成功過一次」。重跑才抓得到時好時壞的驗收與副作用。 |
 
@@ -52,7 +57,7 @@ The rest of this README is in Traditional Chinese.
 
 ## 計費分級（不擋，非免費發 TG）
 
-每次派工先把模型分成 free／sub（扣訂閱額度）／metered（按量計費，或沒查過的組合），跟 provider 無關。**全部照派**，非 free 一律先記 `~/.dcq/logs/billing.tsv`，再 `hpush` 發 TG 警示（背景送，TG 掛了不影響派工；`DC_TG_EVERY` 秒內只發一則，預設 600，下一則附被壓掉的筆數）：
+每次派工先把模型分成 free／sub（扣訂閱額度）／metered（按量計費，或沒查過的組合），跟 provider 無關。**全部照派**，非 free 一律先記 `~/.dcq/logs/billing.tsv`，再 `hpush` 發 TG 警示（背景送，TG 掛了不影響派工；`DC_TG_EVERY` 秒內只發一則，預設 600，下一則附被壓掉的筆數）。帳目錄不是 `~/.dcq/logs`（測試把 `DCQ_HOME` 指到暫存）就不推，`DC_PUSH=1` 強制推；`zen-gate`、`freecheck`、`oc-probe` 的推播同一規則：
 
 - free：opencode 系（`opencode/`、`opencode-go/`）id 以 `-free` 結尾，加上明列的 `big-pickle`。
 - 未指定模型時釘死 `space-bunny-free`（2026-10-09 起；此前是 longcat，19 跑 9 停滯故換掉。Go 版 space-bunny 已改付費，這裡走 Zen 的 `opencode/` 免費端點），**不吃 opencode config 的 per-agent 付費 model**。
@@ -198,7 +203,7 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 | **per-model 冷卻** | 借鏡 LiteLLM Router 的 `allowed_fails`／`cooldown_time`：同一隻連續 `DCQ_ALLOWED_FAILS`（2）次上游失敗或停滯，冷卻 `DCQ_COOLDOWN_S`（120）秒，期間不派給它。只罰那一隻 —— 舊版是全隊熔斷，一隻掛全隊停 |
 | **權重：免費優先** | 免費池整輪試過 `DCQ_FREE_ROUNDS`（2）輪都失敗，**或**免費模型全在冷卻，才 fallback 到 `DCQ_POOL_PAID`（預設 7 隻，依實測「寫得對＞反應快」排序：`opencode-go/glm-5.3-flash opencode-go/deepseek-v4.1-flash opencode-go/deepseek-v4-pro opencode-go/minimax-m3 opencode-go/qwen3.8-flash opencode-go/kimi-k2.7-code opencode-go/glm-5.3`。Go 額度 per-model 各自計，多放＝容量相加；與 Zen 免費同底模的 muse／mimo Go 版不收；deepseek-v4-flash 上游退役，2026-10-03 移除）。用過訂閱層的工單在 jobfile 標 `PAID=1`。`DCQ_POOL_PAID=` 設空＝永不動用，免費全冷卻時就等 |
 | **per-model 併發槽** | 單一模型同時最多 `DCQ_MODEL_MAX`（3）張，滿了直接分給下一隻，不在忙的模型上排隊 |
-| **watchdog** | opencode 的 `chunkTimeout` 有洞（[#43519](https://github.com/anomalyco/opencode/issues/43519) SSE keepalive 會歸零計時、[#48675](https://github.com/anomalyco/opencode/issues/48675) 一個 chunk 都沒送就卡住不報錯），外面再看一層：每 `DCQ_POLL_S`（5）秒看 `.out` 的 mtime，靜默 ≥ `DCQ_STALL_S`（200；2026-10-09 起，依 gaps.tsv 39 張 PASS 最大靜默 162s 留 25% 餘量）秒判停滯 → 殺整棵樹、冷卻計數＋1、換下一隻。單隻模型一次嘗試超過 `DCQ_ATTEMPT_MAX`（600，≈PASS 單次最長 294s×2）秒也一樣換手——一直有輸出的無限迴圈不會觸發停滯。整張工單超過 `DCQ_JOB_MAX`（2700）秒也殺，但**不罰模型、不換**（防 [#52092](https://github.com/anomalyco/opencode/issues/52092) 失控迴圈燒光 Go 額度） |
+| **watchdog** | opencode 的 `chunkTimeout` 有洞（[#43519](https://github.com/anomalyco/opencode/issues/43519) SSE keepalive 會歸零計時、[#48675](https://github.com/anomalyco/opencode/issues/48675) 一個 chunk 都沒送就卡住不報錯），外面再看一層：每 `DCQ_POLL_S`（5）秒看 `.out` 的 mtime，靜默 ≥ `DCQ_STALL_S`（200；2026-10-09 起，依 gaps.tsv 39 張 PASS 最大靜默 162s 留 25% 餘量）秒判停滯 → 殺整棵樹、冷卻計數＋1、換下一隻。單隻模型一次嘗試超過 `DCQ_ATTEMPT_MAX`（600，≈PASS 單次最長 294s×2）秒也一樣換手——一直有輸出的無限迴圈不會觸發停滯。整張工單超過 `DCQ_JOB_MAX`（2700）秒也殺，但**不罰模型、不換**（防 [#52092](https://github.com/anomalyco/opencode/issues/52092) 失控迴圈燒光 Go 額度）。2026-10-21 起，opencode 底下有工具子程序在跑（多半是模型自己跑的慢測試）時，停滯與防空轉都不計時；`dc` 也把 opencode bash 工具的預設逾時從 120s 拉到 300s（`OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`，已設就不覆寫）。之前慢測試會先被 120s 砍掉，再被 watchdog 判 slow／spin 換模型 |
 | **取消** | `dcq cancel <id>`：先寫 `.cancel/<id>` 標記再殺程序樹，順序不能反 —— 反過來 `run_job` 會把 kill 的 rc 當成模型失敗，直接換下一個模型重跑同一張，人工中止永遠停不下來。`dc` 是 bash 殼，殺它不會帶走 opencode，所以殺整棵樹 |
 
 併發上限硬夾 8：社群實測 1–5 穩、10–32 崩，官方只說 "traffic is monitored for abuse" 沒給數字。衝高併發的期望值是被 ban，不是更快。
@@ -212,6 +217,8 @@ dcq cancel <job-id>               # 取消一張（殺整棵程序樹、階梯�
 環境變數：`DCQ_HOME`（預設 `~/.dcq`）、`DCQ_JOBS`、`DCQ_POOL_GO`、`DCQ_POOL_ZEN`、`DCQ_POOL_PAID`、`DCQ_FREE_ROUNDS`、`DCQ_MODELS`、`DCQ_MODEL_MAX`、`DCQ_ALLOWED_FAILS`、`DCQ_COOLDOWN_S`、`DCQ_STALL_S`、`DCQ_JOB_MAX`、`DCQ_ATTEMPT_MAX`、`DCQ_POLL_S`。舊名 `DCQ_BREAK_N`／`DCQ_BREAK_S` 仍可用，對應到 `DCQ_ALLOWED_FAILS`／`DCQ_COOLDOWN_S`。
 
 自檢（都用假的下游，不打上游）：`./test/dcq_test.sh`（佇列、模型池、權重 fallback、冷卻、併發槽、watchdog、防空轉、cancel）、`./test/dc_lock_test.sh`（cwd 鎖）、`./test/dc_model_test.sh`（模型閘：哪些准派、哪些要拒）
+
+跑全套時每支的 rc 要先存進變數再印：`for f in test/*.sh; do bash "$f" >/dev/null 2>&1; rc=$?; echo "$f rc=$rc"; done`。寫成 `echo "$(basename $f) rc=$?"` 的話，`$?` 拿到的是 `basename` 的 0，全部會顯示通過（2026-10-21 踩過）。
 
 ### 同一個 repo 的多張工單要併發：一張一個 git worktree
 
@@ -242,6 +249,8 @@ dcq 的停滯判定只看 `.out` 有沒有輸出。模型一直講話卻不改�
 - 訂閱層：`sub`（`opencode-go/*`）。
 - API 層：`api`，`DCQ_ALLOW_API=1` 才接，預設不用。
 
+兜底層與訂閱層也做層內排序（2026-10-21），規則同免費層：依每 PASS 秒數升冪，停滯率過高或 0 PASS 的墊該層最後，樣本不足留原位。只在層內排，不跨層搬。`DCQ_MODELS` 有設或 `DCQ_AUTORANK=0` 就不排。
+
 Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型，dcq 不派；由主 session 的 Agent 工具或 `codex exec` 直接用。
 
 難度在 `dcq add` 時判一次（`bin/triage`，jev-gate 的 Laya 本機分類器，零 token、約 2～3 秒；判不出就 mid），同一張工單中途不換：
@@ -250,6 +259,14 @@ Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型
 - `gaps.tsv` 第 7 欄記難度，autorank 依難度各排一份；舊紀錄沒有這欄，算進每個難度。`dcq rank hard` 看 hard 的排名。
 
 併發有三層：全域 `DCQ_JOBS`、per-model `DCQ_MODEL_MAX`，以及 per-provider 上限 `catalog/providers.tsv`（zen 2、opencode-go 4、omniroute 3）。Zen 免費池共用同一個 IP 閘，同時開太多會被判 abusive traffic 整池 403。
+
+### Zen 封鎖閘（`zen-gate`）
+
+`dc` 或 `oc-free-check` 偵測到 Zen 判濫用（403 Detect Abuse Traffic）就 `zen-gate trip`，本機所有 Zen 免費消費端停打。官方不公布解封期限，所以封鎖時間照連續輪數倍增（借鏡 OmniRoute `circuitBreaker`，2026-10-21）：
+
+- 連續 3 輪內封 `DC_ZEN_GATE_S`（預設 21600＝6h），之後每輪 ×2，上限 `DC_ZEN_GATE_MAX_S`（預設 172800＝48h）。連敗計數存在 `~/.dcq/.zen-gate.streak`。
+- 半開：閘到期但還有連敗計數時，dcq 把 zen 的併發上限壓到 1，只放一個探測。
+- 探測的請求被上游正常回應（rc=0、沒有濫用字樣）就 `zen-gate ok` 清掉計數。判準是請求成功，不是驗收通過。
 
 層級順序每張工單入列時記下（`DCQ_ORDER`）：`default` 免費優先（派dr）、`free` 只用免費（派drf）、`sub` 訂閱優先（派drs）。`dcq plan <task.md>...` 在派工前印出每張的難度和會走的層，不入列。
 

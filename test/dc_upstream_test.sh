@@ -28,6 +28,7 @@ case "$FAKE" in
   abuse)    : > "$T/called"; echo '> build · x'; echo "$e Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic\""; sleep 30 ;;
   abuse2)   echo '> build · x'; echo "Error: OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address."; sleep 30 ;;
   ok)       : > "$T/called"; echo '> build · x'; echo done ;;
+  selfcat)  echo '> build · x'; cat "$DCSRC"; echo done ;;
   hang)     sleep 30 ;;
   slow)     echo '> build · x'; sleep 4; echo done ;;
   title)    echo "${e/small=false/small=true} Upstream request failed: Model is unavailable.\""; echo '> build · x'; echo done ;;
@@ -68,6 +69,9 @@ chk "閘內 opencode 未被呼叫"               "$([ -e "$T/called" ] && echo c
 chk "閘內非 Zen 照跑"                      "$(try 8 '冷卻中' FAKE=ok DC_FREE_MODEL=omniroute/or-free)" 0:yes:fast:nokey
 echo 0 > "$T/zen-gate"; rm -f "$T/jev-zen.json"   # dc 判濫用兩份閘都寫，過期要兩份都過
 chk "閘過期 Zen 恢復"                      "$(try 8 '冷卻中' FAKE=ok)" 0:yes:fast:nokey
+# 10-21：模型 cat 了 dc 原始碼（改 dc 的工單），原始碼裡的偵測字串不可觸發判濫用／限流／不可用
+chk "模型印出 dc 原始碼不誤判"             "$(try 8 '^dc: .*\(判濫用\|上游限流\|上游不可用\)' FAKE=selfcat DCSRC="$DC")" 0:yes:fast:nokey
+chk "模型印出 dc 原始碼不寫閘"             "$(cat "$T/zen-gate")" 0
 # 10-18 起的新措辭（IP 判濫用，連官方客戶端也擋）同樣要整池停用
 chk "新措辭判濫用提早結束"                 "$(try 8 '判濫用' FAKE=abuse2)" 1:no:fast:key
 chk "新措辭寫閘檔"                         "$([ "$(cat "$T/zen-gate" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] && echo y)" y
@@ -83,4 +87,13 @@ chk "Jev 額度冷卻不擋 dc"                 "$(try 8 '冷卻中' FAKE=ok)" 0
 echo '{"ok":true,"model":"jev-1.13-free"}' > "$T/jev-zen.json"
 try 8 '判濫用' FAKE=abuse2 >/dev/null
 chk "dc 判濫用也寫 Jev 閘"                "$(jq -r '"\(.blocked):\(.cooldown_until > (now*1000)):\(.model)"' "$T/jev-zen.json" 2>/dev/null)" "true:true:jev-1.13-free"
+# 10-21：Zen 閘的延遲倍增靠「上游有正常回應」解封（zen-gate ok 清掉失敗計數）。
+# 恢復判準是「請求被上游正常回應」，不是「工單通過」——驗收過不過不影響退避歸零。
+echo 0 > "$T/zen-gate"; rm -f "$T/jev-zen.json"; echo 3 > "$T/zen-gate.streak"
+try 8 'x' FAKE=ok >/dev/null
+chk "上游正常回應後清掉失敗計數"            "$([ -f "$T/zen-gate.streak" ] && echo yes || echo no)" "no"
+# 判濫用那一路相反：是 trip（計數 +1），不能把計數清掉
+echo 0 > "$T/zen-gate"; rm -f "$T/jev-zen.json"; echo 3 > "$T/zen-gate.streak"
+try 8 '判濫用' FAKE=abuse2 >/dev/null
+chk "判濫用不清計數（反而 +1）"            "$(cat "$T/zen-gate.streak" 2>/dev/null)" "4"
 exit "$fail"
