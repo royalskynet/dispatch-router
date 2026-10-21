@@ -7,7 +7,7 @@ set -u
 T=$(mktemp -d); trap 'kill $SP 2>/dev/null; rm -rf "$T"' EXIT
 BIN="$(cd "$(dirname "$0")/.." && pwd)/bin"
 printf '#!/bin/sh\necho "$1" >> %s/pushed\n' "$T" > "$T/hpush"; chmod +x "$T/hpush"
-export PATH="$T:$PATH" DC_ZEN_GATE="$T/gate" JEV_ZEN_STATUS_FILE="$T/jev.json"
+export PATH="$T:$PATH" DC_ZEN_GATE="$T/gate" JEV_ZEN_STATUS_FILE="$T/jev.json" DC_PUSH=1  # 暫存路徑預設不推，驗推播要強制
 echo '{"opencode-go":{"models":{"a-free":{"cost":{"input":0,"output":0}},"b-free":{"cost":{"input":0,"output":0}},"c-free":{"cost":{"input":0,"output":0}}}}}' > "$T/models.json"
 export MODELS_JSON="$T/models.json"
 fail=0

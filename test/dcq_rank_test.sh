@@ -116,5 +116,28 @@ cool_upstream "opencode/u1" 2>/dev/null; left=$(cool_left "opencode/u1")
 [ "$left" -ge 890 ] && [ "$left" -le 900 ] || { echo "FAIL cool_upstream left=$left want ~900"; fail=1; }
 bump_fail "s1" 2>/dev/null; left=$(cool_left "s1")
 [ "$left" = 0 ] || { echo "FAIL bump_fail cooled on first fail: $left"; fail=1; }
+# 13) 兜底層與訂閱層的層內排序（2026-10-21）：規則與免費層相同；只在層內排，不跨層、不分難度
+: > "$G"; : > "$P"
+export DCQ_GO_STATE="$T/none2.json"      # 不採用 go-sync state（它會改兜底／訂閱層清單）
+rep 8 x/hi 0 exit; rep 2 x/hi 1 exit      # x/hi：10 跑 8 過
+rep 2 x/lo 0 exit; rep 8 x/lo 1 exit      # x/lo：10 跑 2 過
+rep 3 x/z 1 exit                          # x/z：3 跑 0 過 → 0 PASS 短路，降到該層最後
+T1="x/z x/lo x/hi"
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="$T1" DCQ_POOL_PAID="" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$got" = "x/hi x/lo x/z" ] || { echo "FAIL tail rank: got [$got] want [x/hi x/lo x/z]"; fail=1; }
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="" DCQ_POOL_PAID="$T1" dcq rank | sed -n 's/^訂閱層：//p')"
+[ "$got" = "x/hi x/lo x/z" ] || { echo "FAIL paid rank: got [$got] want [x/hi x/lo x/z]"; fail=1; }
+got="$(DCQ_AUTORANK=0 DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="$T1" DCQ_POOL_PAID="" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$got" = "$T1" ] || { echo "FAIL tail autorank=0: got [$got] want [$T1]"; fail=1; }
+# 耗時反例：x/fast 10 跑 6 過（每筆 30s）vs x/slow 10 跑 10 過（每筆 300s）→ 排的是每 PASS 秒數，不是通過率
+: > "$G"
+for i in $(seq 6); do rowd x/fast 0 30; done
+for i in $(seq 4); do rowd x/fast 1 30; done
+for i in $(seq 10); do rowd x/slow 0 300; done
+got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="x/slow x/fast" DCQ_POOL_PAID="" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$got" = "x/fast x/slow" ] || { echo "FAIL tail s/pass: got [$got] want [x/fast x/slow]"; fail=1; }
+# DCQ_MODELS 有設 → 不排序（照 DCQ_POOL_TAIL 原順序）
+got="$(DCQ_MODELS="m1" DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="$T1" DCQ_POOL_PAID="" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$got" = "$T1" ] || { echo "FAIL tail DCQ_MODELS: got [$got] want [$T1]"; fail=1; }
 [ "$fail" = 0 ] && echo PASS
 exit "$fail"

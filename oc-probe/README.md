@@ -17,7 +17,7 @@
 
 - 只用 `opencode run`／`opencode serve` 探測。Zen 免費層 API 直打不回應，不代表模型壞了。不要重試探測，會被判濫用鎖 IP。
 - 先單打 1 隻當探針，回濫用 403 就 trip `zen-gate` 停手，不打其餘模型。
-- 通知走 PATH 上的 `hpush`，沒有就只寫 log。
+- 通知走 PATH 上的 `hpush`，沒有就只寫 log。狀態不在正式路徑（`--tsv`／`--x-only` 不在 `~/.dcq/logs`、`DC_ZEN_GATE`／`JEV_ZEN_STATUS_FILE`／`DCQ_GO_STATE` 指到別處）就不推，`DC_PUSH=1` 強制推（2026-10-21）。
 
 ## 為什麼不用 models.dev
 

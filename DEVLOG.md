@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-10-21：慢測試不誤殺、Zen 閘退避、重試只驗一次、推播閘
+
+- **慢測試誤殺**（80184d1）：opencode bash 工具內建 120s 逾時，模型自己跑的慢測試先被砍，再被 watchdog 判 slow／spin 換模型。`dc` 設 `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=300000`；dcq 的 `oc_busy` 看到 opencode 底下有工具子程序就不計停滯與防空轉。
+- **WO-1 zen-gate 延遲倍增＋半開**（df303ed）：連續 3 輪後封鎖時間每輪 ×2，上限 48h；到期只放一個探測，上游正常回應才清計數。借鏡 OmniRoute `circuitBreaker`。
+- **WO-3 前置檢查憑證**（3eddc84）：第一次 lint 與負向對照都過就存下 pin，重試沿用，不重跑也不重抽評分器。
+- **WO-2 層內排序**（4427735）：兜底層與訂閱層照免費層的 `rank_free` 排。
+- **推播閘**（d9bb54f、e2c6e7b）：狀態路徑不是正式路徑就不送 TG，`DC_PUSH=1` 強制推。起因是工單模型把 `DC_ZEN_GATE` 指到暫存後手動 trip 5 次，發出 5 則誤報。涵蓋 zen-gate、dc 帳單、freecheck、oc-free-check、go-sync；go-sync 補了第一支推播測試。
+- **踩坑**：測試迴圈寫成 `echo "$(basename $f) rc=$?"`，`$?` 取到 `basename` 的 0，一度把全套誤報成全過。rc 要先存變數。
+
 ## 2026-10-19：清冊驅動＋難度分層＋provider 併發
 
 - `catalog/models.tsv`：本機模型清冊（free／sub／api），加 `dc_id`、`fit` 欄；dcq 各層預設名單改由清冊組，不再寫死。

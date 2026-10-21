@@ -9,6 +9,7 @@ mkdir -p "$T/bin" "$T/w" "$T/cfg/opencode"
 export DC_BIN="$T/bin" PATH="$T/bin:$PATH"
 export DCQ_HOME="$T/q" XDG_CONFIG_HOME="$T/cfg"
 export DC_TG_EVERY=0  # 逐條驗警示內容；限流另外測
+export DC_PUSH=1      # DCQ_HOME 是暫存目錄，dc 預設不推；這裡要驗推播內容（配假 hpush）
 # DC_NEGCTL=0：這些測試的 wo-verify 是 `exit 0` 的假貨，do-nothing 對照會當場中止派工。
 # 負向對照本身由 dc_verify_gate_test.sh 驗。
 export DC_FREECHECK=off DC_NO_TIMEOUT_WARN=1 DC_NEGCTL=0
@@ -45,6 +46,8 @@ chk "Zen 按量照派＋警示 metered"            "$(try DC_FREE_MODEL=opencode
 # *-free 只在 opencode 系算數：別家組合名帶 -free 不代表成員全免費
 chk "omniroute 其他組合(名字帶 -free)要警示" "$(try DC_FREE_MODEL=omniroute/auto/best-free)" ran:metered
 chk "陌生 provider 帶 -free 要警示"         "$(try DC_FREE_MODEL=openrouter/x-free)" ran:metered
+# 帳目錄是暫存路徑（非 ~/.dcq）且沒 DC_PUSH=1：不推播（測試、手動試跑不發真 TG，10-21）
+chk "暫存帳目錄不推播"                      "$(try DC_PUSH= DC_FREE_MODEL=opencode/kimi-k3)" ran:-
 : > "$TRACE"; : > "$PUSH"; "$DC" "$T/t.md" "$T/w" -- -m opencode/kimi-k3 >/dev/null 2>&1; sleep 0.3
 chk "-m 旗標指定的付費模型也要警示"         "$(grep -c 'opencode/kimi-k3（metered）' "$PUSH")" 1
 # TG 限流：窗口內第二筆只落帳不發，窗口過後的那則附上被壓掉的筆數

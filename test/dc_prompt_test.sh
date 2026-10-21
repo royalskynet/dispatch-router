@@ -24,6 +24,7 @@ if [ "$1" = debug ]; then echo '{"enabled_providers":["opencode"]}'; exit 0; fi
   echo "RUN"
   echo "DISABLE=${OPENCODE_DISABLE_CLAUDE_CODE-<unset>}"
   echo "CONFIG=${OPENCODE_CONFIG_CONTENT-<unset>}"
+  echo "BASHTO=${OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS-<unset>}"
 } >> "$TRACE"
 X
 for g in deep-lint wo-verify hpush; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$g"; done
@@ -46,6 +47,10 @@ core() {
 run DC_FREE_MODEL=opencode/longcat-2.5-preview-free
 chk "免費 Zen 派工有走到 opencode run" "$([ -s "$TRACE" ] && echo ran || echo skipped)" "ran"
 core "Zen"
+# bash 工具預設 120s 會砍掉模型自跑的慢測試（10-21）；呼叫端自己設的值不能被蓋掉
+chk "bash 工具逾時注入 300s" "$(field BASHTO)" "300000"
+run DC_FREE_MODEL=opencode/longcat-2.5-preview-free OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1234
+chk "呼叫端設的 bash 逾時保留" "$(field BASHTO)" "1234"
 
 # Go 分支：dc 自己設了 enabled_providers，合併必須是深合併，兩邊都要活著
 run DC_FREE_MODEL=opencode-go/space-bunny-free

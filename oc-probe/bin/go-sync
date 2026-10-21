@@ -67,7 +67,10 @@ def http(url, body=None, tok=None, method=None, timeout=90):
 
 
 def notify(msg):
-    # 跟 oc-free-check 同一個推播出口：PATH 上有 hpush 才推，沒有就只寫 log
+    # 跟 oc-free-check 同一個推播出口：PATH 上有 hpush 才推，沒有就只寫 log。
+    # state 不是正式路徑（測試、手動試跑把 DCQ_GO_STATE 指到暫存）不推，DC_PUSH=1 強制推（同 zen-gate）
+    if os.environ.get('DC_PUSH') != '1' and STATE != H('~/.dcq/logs/go-models.json'):
+        return
     if shutil.which('hpush'):
         subprocess.run(['hpush', '[go-sync] ' + msg], capture_output=True, timeout=60)
 

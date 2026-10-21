@@ -21,7 +21,10 @@ cat > "$T/bin/dc" <<'EOF'
 #!/usr/bin/env bash
 task="$1"; cwd="$2"; n="$(basename "$task" .md)"
 echo "IN $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
-case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; spin*:m1|vspin*:m1) case "$n" in v*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)" ;; esac; for i in $(seq 8); do echo tick; sleep 1; done ;; wspin*:m1) for i in $(seq 8); do echo $i > "$cwd/f$i"; echo tick; sleep 1; done ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; *) sleep 1 ;; esac
+# 2026-10-21 前置檢查憑證：記下這次收到的 DC_PREFLIGHT_DIR（寫另一個檔，
+# 不塞進 TRACE —— TRACE 的 IN/OUT 配對被別的斷言用 awk 算並行度）
+[ -n "${DC_PREFLIGHT_DIR:-}" ] && echo "$n $DC_PREFLIGHT_DIR" >> "$PFLOG"
+case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; spin*:m1|vspin*:m1) case "$n" in v*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)" ;; esac; for i in $(seq 8); do echo tick; sleep 1; done ;; wspin*:m1) for i in $(seq 8); do echo $i > "$cwd/f$i"; echo tick; sleep 1; done ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; ho*:*) sleep 3 ;; *) sleep 1 ;; esac
 echo "OUT $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
 case "$n" in
   local*) echo "Error: Unexpected error"; echo "no such column: project_id"; echo "dc: opencode run rc=1" ;;
@@ -34,6 +37,7 @@ case "$n:$DC_FREE_MODEL" in tl*:t/*) exit 0 ;; tl*) exit 1 ;; up*:go/*) exit 0 ;
 EOF
 chmod +x "$T/bin/dc"
 export TRACE="$T/trace"; : > "$TRACE"
+export PFLOG="$T/pflog"; : > "$PFLOG"
 
 # 假 opencode：只給 stall_dump 用。session 在當前目錄、建立於現在；最後一則 assistant 卡在 read running
 cat > "$T/bin/opencode" <<'EOF'
@@ -355,8 +359,41 @@ echo "$ida" | grep -q a11 && chk "wait 指定通過的 id 回 0" "$rc" "0"
 rc=0; dcq wait nope-id >/dev/null || rc=$?
 chk "wait 不存在的 id 回 1" "$rc" "1"
 mk slow9 "$T/wa"
-rc=0; dcq wait --timeout 1 >/dev/null || rc=$?
+rc=0; dcq wait --timeout 1 >/dev/null 2>&1 || rc=$?
 chk "wait 逾時回 124" "$rc" "124"
+dcq clear >/dev/null
+
+# 21) 10-21：半開只放 1 個探測 —— Zen 閘已到期但還有被封紀錄（streak）時，
+#     zen 這個 provider 的併發上限壓到 1；不是半開時照 providers.tsv 的上限（2）。
+#     對照組先跑：兩個 zen job 可以併發；半開組則要排隊。
+zen_par() { awk '$4 !~ /\// {if($1=="IN")c++;else c--; if(c>m)m=c} END{print m+0}' "$TRACE"; }
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk ho1 "$T/wa"; mk ho2 "$T/wb"
+echo $(( $(date +%s) - 10 )) > "$DC_ZEN_GATE"; rm -f "$DC_ZEN_GATE.streak" "$JEV_ZEN_STATUS_FILE"
+DCQ_MODELS="m1 m2" DCQ_PROV_MAX="zen=2" DCQ_ALLOWED_FAILS=99 dcq run -j 2 >"$T/ho1.out" 2>&1
+chk "對照：非半開時 zen 可併發 2" "$(zen_par)" "2"
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk ho3 "$T/wa"; mk ho4 "$T/wb"
+echo $(( $(date +%s) - 10 )) > "$DC_ZEN_GATE"; echo 3 > "$DC_ZEN_GATE.streak"; rm -f "$JEV_ZEN_STATUS_FILE"
+DCQ_MODELS="m1 m2" DCQ_PROV_MAX="zen=2" DCQ_ALLOWED_FAILS=99 dcq run -j 2 >"$T/ho2.out" 2>&1
+chk "半開時 zen 只放 1 個探測" "$(zen_par)" "1"
+chk "半開時兩張都跑完" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "2"
+dcq clear >/dev/null
+
+# 22) 2026-10-21 前置檢查憑證：同一張工單的每次嘗試收到同一個 DC_PREFLIGHT_DIR；
+#     工單結束（PASS／FAIL）後那個目錄要被刪掉（憑證只對這張工單有效）。
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"; : > "$PFLOG"
+mk up5 "$T/wb"; mk pf2 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/pf.out" 2>&1
+chk "up5 換過一次模型（兩次嘗試）" "$(grep -c '^IN up5 ' "$TRACE")" "2"
+pfpath="$(awk '$1=="up5"{print $2}' "$PFLOG" | head -1)"
+chk "兩次嘗試收到同一個 DC_PREFLIGHT_DIR" "$(awk '$1=="up5"{print $2}' "$PFLOG" | sort -u | wc -l | tr -d ' ')" "1"
+case "$pfpath" in "$DCQ_HOME"/.preflight/*) pfok=yes ;; *) pfok=no ;; esac
+chk "DC_PREFLIGHT_DIR 在 .preflight/ 下" "$pfok" "yes"
+chk "FAIL 結束後該目錄已刪" "$([ -e "$pfpath" ] && echo yes || echo no)" "no"
+pfpath2="$(awk '$1=="pf2"{print $2}' "$PFLOG" | head -1)"
+chk "PASS 的工單也有收到 DC_PREFLIGHT_DIR" "$([ -n "$pfpath2" ] && echo yes || echo no)" "yes"
+chk "PASS 結束後該目錄已刪" "$([ -e "$pfpath2" ] && echo yes || echo no)" "no"
 dcq clear >/dev/null
 
 exit $fail

@@ -11,7 +11,7 @@ cat > "$T/bin/hpush" <<'EOF'
 printf '%s\n' "$*" >> "$HPUSH_LOG"
 EOF
 chmod +x "$T/bin/hpush"
-export PATH="$T/bin:$PATH"
+export PATH="$T/bin:$PATH" DC_PUSH=1  # 暫存路徑預設不推，驗推播要強制
 
 fail=0
 chk() { # name tsv_history results_py want_grep
