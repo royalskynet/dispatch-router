@@ -24,16 +24,18 @@ echo "IN $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
 # 2026-10-21 前置檢查憑證：記下這次收到的 DC_PREFLIGHT_DIR（寫另一個檔，
 # 不塞進 TRACE —— TRACE 的 IN/OUT 配對被別的斷言用 awk 算並行度）
 [ -n "${DC_PREFLIGHT_DIR:-}" ] && echo "$n $DC_PREFLIGHT_DIR" >> "$PFLOG"
-case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; spin*:m1|vspin*:m1) case "$n" in v*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)" ;; esac; for i in $(seq 8); do echo tick; sleep 1; done ;; wspin*:m1) for i in $(seq 8); do echo $i > "$cwd/f$i"; echo tick; sleep 1; done ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; ho*:*) sleep 3 ;; *) sleep 1 ;; esac
+case "$n:$DC_FREE_MODEL" in defect*) echo "DC_TASK_DEFECT: line 3 x"; sleep 30 ;; slow*|hang*:m1) sleep 30 ;; spin*:m1|vspin*:m1) case "$n" in v*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)" ;; esac; for i in $(seq 8); do echo tick; sleep 1; done ;; wspin*:m1) for i in $(seq 8); do echo $i > "$cwd/f$i"; echo tick; sleep 1; done ;; busy*:m1) for i in $(seq 30); do echo tick; sleep 1; done ;; jm*:m1) sleep 30 ;; ho*:*) sleep 3 ;; *) sleep 1 ;; esac
 echo "OUT $n $cwd $DC_FREE_MODEL $(date +%s.%N)" >> "$TRACE"
 case "$n" in
   local*) echo "Error: Unexpected error"; echo "no such column: project_id"; echo "dc: opencode run rc=1" ;;
   diff*) echo "Error: boom from $DC_FREE_MODEL"; echo "dc: opencode run rc=1" ;;
+  # 真 dc 上游提早結束時 .out 末尾＝bash 殺子程序的 Terminated 回顯（同一段 prompt），每隻模型都一樣
+  ux*) echo "dc: 上游不可用（Upstream request failed: Endpoint is unavailable.），已提早結束"; echo "Terminated: 15 sh -c opencode run 你是執行人。"; echo "驗收由外部 wo-verify 機械執行"; echo "--pure --print-logs" ;;
   vf*) echo "dc: 驗收 → wo-verify --pinned (cwd=$cwd, K=2)"; echo "verify fail $DC_FREE_MODEL" ;;
   # 假憑證值執行期拼出，檔案內不出現完整字面值（sensitive-canary 會擋讀檔，fix 9880）
   leak*) echo "FAKE_TOKEN=sk-$(printf 'x%.0s' $(seq 16))" ;;
 esac
-case "$n:$DC_FREE_MODEL" in tl*:t/*) exit 0 ;; tl*) exit 1 ;; up*:go/*) exit 0 ;; up*) exit 1 ;; bad*|defect*) exit 2 ;; local*|diff*|vf*) exit 1 ;; leak*) exit 0 ;; *) exit 0 ;; esac
+case "$n:$DC_FREE_MODEL" in tl*:t/*) exit 0 ;; tl*) exit 1 ;; up*:go/*) exit 0 ;; up*) exit 1 ;; bad*|defect*) exit 2 ;; local*|diff*|vf*|ux*) exit 1 ;; leak*) exit 0 ;; *) exit 0 ;; esac
 EOF
 chmod +x "$T/bin/dc"
 export TRACE="$T/trace"; : > "$TRACE"
@@ -51,7 +53,10 @@ EOF
 chmod +x "$T/bin/opencode"
 
 # dcq add 的准入閘會跑 deep-lint/wo-verify；這裡測佇列不測閘，用假的放行
-for g in deep-lint wo-verify; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$g"; chmod +x "$T/bin/$g"; done
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/deep-lint"; chmod +x "$T/bin/deep-lint"
+# 假 wo-verify：--dry（入列閘）一律過；jmf*／slow* 工單的正式驗收不過（10、10a'、16b 要的是
+# 「總時限到且沒交件」；總時限到但驗收過的新路徑由 16a 用 jm1 測）
+printf '#!/bin/sh\ncase "$*" in *--dry*) exit 0 ;; *jmf*|*slow*) exit 1 ;; esac\nexit 0\n' > "$T/bin/wo-verify"; chmod +x "$T/bin/wo-verify"
 
 mk() { printf '# %s\n' "$1" > "$T/$1.md"; dcq add "$T/$1.md" "$2" >/dev/null || echo "add failed: $1"; }
 dcq() { "$(cd "$(dirname "$0")/.." && pwd)/bin/dcq" "$@"; }
@@ -170,6 +175,21 @@ chk "超時進 failed rc=124" "$(grep -h '^LAST_RC=' "$DCQ_HOME"/failed/*.job)" 
 chk "超時不換模型" "$(grep -c '^IN slow3' "$TRACE")" "1"
 chk "超時不罰 m1" "$(DCQ_MODELS="m1 m2" dcq status | grep -c cooling)" "0"
 
+# 10a') 逐張總時限：入列帶 DCQ_JOB_MAX=3，runner 用預設 2700 也要 3s 收
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+printf '# slowjm\n' > "$T/slowjm.md"; DCQ_JOB_MAX=3 dcq add "$T/slowjm.md" "$T/wb" >/dev/null
+DCQ_MODELS="m1 m2" DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=1 dcq run -j 1 >"$T/jm2.out" 2>&1
+chk "逐張總時限生效（只試 1 隻）" "$(grep -c '^IN slowjm' "$TRACE")" "1"
+chk "逐張總時限判失敗" "$(ls -1 "$DCQ_HOME/failed" | grep -c slowjm)" "1"
+
+# 10a'') 飽和停損：每隻都 slow 且不改檔，SAT=2 → 試 2 次就停，不跑滿 3 隻×輪次
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"; mkdir -p "$T/ws"
+printf '# slowsat\n' > "$T/slowsat.md"; DCQ_SAT_N=2 dcq add "$T/slowsat.md" "$T/ws" >/dev/null
+DCQ_MODELS="m1 m2 m3" DCQ_ATTEMPT_MAX=2 DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/sat.out" 2>&1
+chk "飽和試 2 次就停" "$(grep -c '^IN slowsat' "$TRACE")" "2"
+chk "飽和有印原因" "$(grep -c '飽和' "$T/sat.out")" "1"
+: > "$DCQ_HOME/logs/gaps.tsv"   # 上面兩段的 slow 紀錄不要算進 10b
+
 # 10b) 單隻上限：m1 一直有輸出（不觸發 stall）但不收工 → 撞 ATTEMPT_MAX 被殺、換 m2 過關，不是整張吃滿 JOB_MAX
 dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
 mk busy1 "$T/wb"
@@ -177,6 +197,12 @@ DCQ_MODELS="m1 m2" DCQ_ATTEMPT_MAX=4 DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=1 dcq run 
 chk "單隻超時換 m2 過關" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "1"
 chk "m1 沒跑滿 30s" "$(grep -c '^OUT busy1 .* m1 ' "$TRACE")" "0"
 chk "gaps.tsv 記 slow" "$(grep -c $'\tm1\t.*\tslow\t' "$DCQ_HOME/logs/gaps.tsv")" "1"
+# 10b') 看進度：非 git cwd 裡 m1 超過 ATTEMPT_MAX 但一直在寫檔 → 不判 slow，跑完 8s 才收工
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"; mkdir -p "$T/wp"
+mk wspin4 "$T/wp"
+DCQ_MODELS="m1 m2" DCQ_ATTEMPT_MAX=3 DCQ_PROGRESS_S=4 DCQ_STALL_S=99 DCQ_ALLOWED_FAILS=1 dcq run -j 1 >"$T/wp.out" 2>&1
+chk "有進度的 m1 不被 slow 砍" "$(grep -c '^OUT wspin4 .* m1 ' "$TRACE")" "1"
+chk "有進度不換 m2" "$(grep -c '^IN wspin4 .* m2 ' "$TRACE")" "0"
 
 # 10c) 防空轉：git cwd 裡 m1 一直有輸出但不改檔 → SPIN_S 到就殺、換 m2；有改檔／進驗收／逐張關掉都不殺
 for w in g1 g2 g3 g4; do git init -q "$T/$w"; done
@@ -394,6 +420,29 @@ chk "FAIL 結束後該目錄已刪" "$([ -e "$pfpath" ] && echo yes || echo no)"
 pfpath2="$(awk '$1=="pf2"{print $2}' "$PFLOG" | head -1)"
 chk "PASS 的工單也有收到 DC_PREFLIGHT_DIR" "$([ -n "$pfpath2" ] && echo yes || echo no)" "yes"
 chk "PASS 結束後該目錄已刪" "$([ -e "$pfpath2" ] && echo yes || echo no)" "no"
+dcq clear >/dev/null
+
+# 16) 總時限到但模型已交件：殺掉後 dcq 自己用 pin 跑一次驗收，過就 PASS（10-22 cabinet R1／R8 做完仍記 FAIL rc=124）
+# 16a) 驗收過 → done，不換第二隻
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk jm1 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_POOL_PAID="" DCQ_JOB_MAX=3 dcq run -j 1 >"$T/jm.out" 2>&1
+chk "總時限到但驗收過 → done" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "1"
+grep -q '總時限.*驗收通過' "$T/jm.out" || { echo "FAIL jm1 沒印「總時限到但驗收通過」"; fail=1; }
+chk "jm1 沒換第二隻模型" "$(grep -c '^IN jm1 .* m2 ' "$TRACE")" "0"
+# 16b) 驗收不過 → 照舊 FAIL rc=124
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk jmf1 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_POOL_PAID="" DCQ_JOB_MAX=3 dcq run -j 1 >"$T/jmf.out" 2>&1
+chk "總時限到且驗收不過 → failed" "$(ls -1 "$DCQ_HOME/failed" | wc -l | tr -d ' ')" "1"
+chk "jmf1 rc=124" "$(grep -h '^LAST_RC=' "$DCQ_HOME"/failed/*.job)" "LAST_RC=124"
+
+# 17) 上游不可用提早結束：簽章是同一段 prompt 回顯，不同模型必相同 → 不得判同錯（10-22 cabinet R4 兩次誤停）
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk ux1 "$T/wb"
+DCQ_MODELS="m1 m2 m3" DCQ_POOL_PAID="" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/ux.out" 2>&1
+chk "上游提早結束三隻都試" "$(grep -h '^TRIED=' "$DCQ_HOME"/failed/*.job)" "TRIED=3"
+grep -q 'FATAL rc=2' "$T/ux.out" && { echo "FAIL ux1 被誤判同錯"; fail=1; }
 dcq clear >/dev/null
 
 exit $fail

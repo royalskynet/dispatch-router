@@ -292,11 +292,14 @@ MODEL_MAX="${DCQ_MODEL_MAX:-3}"      # 單一模型同時最多幾張；滿了�
 # ponytail: 全域單一門檻；dcq rank 會在 PASS 最大靜默 ≥ 0.9×STALL_S 時警告——出現就是門檻太緊，
 # 再改 per-model 門檻（該模型 PASS 最大靜默 ×1.3）。
 STALL_S="${DCQ_STALL_S:-200}"
-JOB_MAX="${DCQ_JOB_MAX:-2700}"       # 整張工單（含所有模型）的總時限，防失控迴圈燒 Go 額度（#52092）
+JOB_MAX="${DCQ_JOB_MAX:-2700}"; JOB_MAX_G="$JOB_MAX"       # 整張工單（含所有模型）的總時限，防失控迴圈燒 Go 額度（#52092）
 # 單隻模型一次嘗試的上限。一直有輸出（無限 Glob/Read，opencode#50678）不會觸發 STALL_S，
 # 沒有這道就一路吃到 JOB_MAX、整張判 jobmax 不換模型——fallback 鏈形同沒有。
 # 600 ≈ gaps.tsv PASS 單次最長 294s ×2（2026-10-13，n=11）。撞到＝why=slow，罰冷卻、換下一隻。
+# 看進度（2026-10-21）：cwd 最近 PROGRESS_S 秒內有改檔就不判 slow，繼續跑到沒進度或 JOB_MAX。
+# 研究類工單（逐頁抓原文存檔）單次常超過 600s，硬切會丟掉模型已讀的上下文、換下一隻重讀。
 ATTEMPT_MAX="${DCQ_ATTEMPT_MAX:-600}"
+PROGRESS_S="${DCQ_PROGRESS_S:-300}"
 # 防空轉：模型一直講話卻不改檔（讀檔繞圈、反覆重試同一招）不觸發 STALL_S，要等 ATTEMPT_MAX。
 # cwd 是 git 工作樹時，這次嘗試 SPIN_S 秒內 HEAD＋改動＋未追蹤檔都沒變 → why=spin，跟 stall 一樣罰冷卻換手。
 # 進驗收（.out 出現「dc: 驗收 →」）就不再看，慢驗收不會被誤殺。0＝關；入列時 DCQ_SPIN_S 會記進工單，可逐張關。
@@ -308,7 +311,7 @@ MASK="${DCQ_MASK-$HOME/.claude/tools/fi-mask-transcript.mjs}"
 LOG_DAYS="${DCQ_LOG_DAYS:-14}"
 
 die() { echo "dcq: $*" >&2; exit 2; }
-init() { mkdir -p "$Q"/{pending,running,done,failed,logs} "$Q/.cwdlock" "$Q/.cancel" "$Q/.health" "$Q/.inuse" "$Q/.preflight"; }
+init() { mkdir -p "$Q"/{pending,running,done,failed,logs} "$Q/.cwdlock" "$Q/.cancel" "$Q/.health" "$Q/.inuse" "$Q/.preflight" "$Q/.wt"; }
 # git-bash 只有 sha1sum，macOS/Linux 只有 shasum；兩者同為 SHA-1，鎖 key 跨平台一致
 _sha1() { if command -v shasum >/dev/null 2>&1; then shasum; else sha1sum; fi; }
 hash12() { printf '%s' "$1" | _sha1 | cut -c1-12; }
@@ -339,7 +342,20 @@ cool_upstream() {
 }
 # 錯誤簽章：.out 去掉 dc:/dcq 開頭的行後取最後 3 行。真 dc 每次都印
 # "dc: opencode run rc=1"，不排除的話任何上游失敗都會撞成同簽章。
-err_sig() { grep -v -e '^dc:' -e '^dcq' "$1" 2>/dev/null | tail -3; }
+# dc 因上游（限流／不可用／濫用閘）提早結束時，.out 末尾是 bash 殺子程序的 Terminated 回顯＝
+# 同一段 prompt，換哪隻模型都一樣，不是本機確定性錯誤 → 簽章給空（10-22 cabinet R4 兩次誤停）。
+err_sig() {
+  grep -qE '^dc: .*(上游|提早結束)' "$1" 2>/dev/null && return 0
+  grep -v -e '^dc:' -e '^dcq' "$1" 2>/dev/null | tail -3
+}
+# 總時限到＝工單的問題不是模型的；但模型可能已交件、只差 dc 來不及驗收（10-22 cabinet R1／R8
+# 做完仍記 FAIL rc=124）。殺掉後用同一份 pin 自己跑一次驗收，過就 PASS。$1 task $2 cwd $3 preflight dir
+jobmax_verify() {
+  local wv="${DC_BIN:-$(dirname "$(readlink -f "$0")")}/wo-verify"
+  [ -x "$wv" ] || return 1
+  if [ -f "$3/pin" ]; then ( cd "$2" && "$wv" "$1" --pinned "$3/pin" ) >/dev/null 2>&1
+  else ( cd "$2" && "$wv" "$1" ) >/dev/null 2>&1; fi
+}
 # Zen 免費閘道判濫用時 dc 寫全域閘檔（見 dc 的 ABUSE_RE）：沒有 provider 前綴的模型（Zen／Go 免費）一律視同冷卻，
 # 直接落到兜底層，不再逐隻換 Zen 模型連打。
 ZEN_GATE="${DC_ZEN_GATE:-$HOME/.dcq/.zen-gate}"
@@ -453,6 +469,9 @@ cmd_add() {
   local id="$(date +%s)-$$-$(basename "${task%.md}")"
   printf 'TASK=%s\nCWD=%s\nTIER=%s\nORDER=%s\n' "$task" "$cwd" "$tier" "$order" > "$Q/pending/$id.job"
   [ -n "${DCQ_SPIN_S:-}" ] && echo "SPIN=$DCQ_SPIN_S" >> "$Q/pending/$id.job"   # 逐張關防空轉（唯讀工單帶 0）
+  # 逐張預算（研究類長工單用，2026-10-21）：JOBMAX＝這張的總時限；SAT＝連續幾次嘗試 cwd 沒有新產出就停
+  [ -n "${DCQ_JOB_MAX:-}" ] && echo "JOBMAX=$DCQ_JOB_MAX" >> "$Q/pending/$id.job"
+  [ -n "${DCQ_SAT_N:-}" ] && echo "SAT=$DCQ_SAT_N" >> "$Q/pending/$id.job"
   echo "dcq: 難度 ${tier}，順序 $order" >&2
   echo "$id"
 }
@@ -477,9 +496,17 @@ oc_busy() {
           exit 1 }'
 }
 # 工作樹指紋：HEAD（模型自己 commit 也算有動）＋追蹤檔改動＋未追蹤檔內容
+if stat -f %m / >/dev/null 2>&1; then STATFMT=(-f '%m %z %N'); else STATFMT=(-c '%Y %s %n'); fi
+# 非 git cwd 用檔案 mtime＋大小當指紋，只給 slow 的進度判定用，spin 仍只看 git cwd。
+# ponytail: 每 POLL_S 掃整個 cwd；cwd 很大（上萬檔）會吃 IO，屆時改成只掃 maxdepth 或改 fswatch。
 tree_sig() {
-  { git -C "$1" rev-parse HEAD; git -C "$1" diff HEAD
-    (cd "$1" && git ls-files -o --exclude-standard -z | xargs -0 cat); } 2>/dev/null | _sha1 | cut -c1-16
+  if git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    { git -C "$1" rev-parse HEAD; git -C "$1" diff HEAD
+      (cd "$1" && git ls-files -o --exclude-standard -z | xargs -0 cat); } 2>/dev/null | _sha1 | cut -c1-16
+  else
+    find "$1" -type f -not -path '*/.git/*' -not -path '*/node_modules/*' -print0 2>/dev/null \
+      | xargs -0 stat "${STATFMT[@]}" 2>/dev/null | sort | _sha1 | cut -c1-16
+  fi
 }
 
 # 停滯時殺之前先匯出 opencode session（只診斷，不改判定）。STALL_S 調門檻只是止血（fix 10309）：
@@ -521,10 +548,11 @@ stall_dump() {
 # 也算在內——驗收指令本身若靜默超過 STALL_S 會被誤判，STALL_S 要比最慢的驗收寬。
 watch_oc() {
   local id="$1" model="$2" task="$3" cwd="$4" t0="$5" paid="$6" out pid rc why=exit gap maxgap=0 t ta
-  local spin_s="${JOB_SPIN_S:-$SPIN_S}" sig="" sig_t s alive=0 tp
+  local spin_s="${JOB_SPIN_S:-$SPIN_S}" sig="" sig_t s alive=0 tp chg_t=0
   ta=$(now)  # 這次嘗試的起點（t0 是整張工單的起點），算每隻模型實際花的秒數
   sig_t=$ta; tp=$ta
-  { [ "$spin_s" -gt 0 ] && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 && sig="$(tree_sig "$cwd")"; } || spin_s=0
+  git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || spin_s=0
+  sig="$(tree_sig "$cwd")"
   out="$Q/logs/$id.$(fk "$model").out"
   # 先建 600 空檔：底下的 `> "$out"` 只截斷不改權限，沒先建的話 .out 會吃預設 umask（644）
   ( umask 077; : > "$out" )
@@ -542,13 +570,13 @@ watch_oc() {
     tp=$t
     gap=$(mtime "$out"); [ "$alive" -gt "$gap" ] && gap=$alive; gap=$(( t - gap ))
     [ "$gap" -gt "$maxgap" ] && maxgap=$gap
+    s="$(tree_sig "$cwd")"
+    [ "$s" != "$sig" ] && { sig=$s; sig_t=$t; chg_t=$t; }
     if [ "$gap" -ge "$STALL_S" ]; then why=stall
     elif [ $(( t - t0 )) -ge "$JOB_MAX" ]; then why=jobmax
-    elif [ $(( t - ta )) -ge "$ATTEMPT_MAX" ]; then why=slow
+    elif [ $(( t - ta )) -ge "$ATTEMPT_MAX" ] && { [ "$chg_t" = 0 ] || [ $(( t - chg_t )) -ge "$PROGRESS_S" ]; }; then why=slow
     elif [ "$spin_s" -gt 0 ]; then
       if grep -q '^dc: 驗收 → ' "$out" 2>/dev/null; then spin_s=0; continue; fi
-      s="$(tree_sig "$cwd")"
-      [ "$s" != "$sig" ] && { sig=$s; sig_t=$t; continue; }
       [ $(( t - sig_t )) -ge "$spin_s" ] || continue
       why=spin
       echo "dcq[$id] watchdog: $model 空轉（$(( t - sig_t ))s 沒改任何檔，cwd=${cwd}）" >&2
@@ -592,6 +620,11 @@ run_job() {
   # 難度（入列時判一次，中途不換）。JOB_TIER 是全域：watch_oc 寫 gaps.tsv 第 7 欄要用；每個 worker 是獨立 subshell
   JOB_TIER="$(sed -n 's/^TIER=//p' "$jobfile")"
   JOB_SPIN_S="$(sed -n 's/^SPIN=//p' "$jobfile")"
+  # watch_oc 讀的是 JOB_MAX：這裡 local 覆寫，動態作用域讓它看到逐張值
+  local JOB_MAX sat_n nonew=0 lastsig
+  JOB_MAX="$(sed -n 's/^JOBMAX=//p' "$jobfile")"; JOB_MAX="${JOB_MAX:-$JOB_MAX_G}"
+  sat_n="$(sed -n 's/^SAT=//p' "$jobfile")"; sat_n="${sat_n:-0}"
+  lastsig="$(tree_sig "$cwd")"
   case "$JOB_TIER" in easy) pool="$MODELS_easy" pen_pool="$PEN_easy" ;; hard) pool="$MODELS_hard" pen_pool="$PEN_hard" ;;
     *) JOB_TIER=mid pool="$MODELS_mid" pen_pool="$PEN_mid" ;; esac
   pool="$(fit_pool "$pool")"; pen_pool="$(fit_pool "$pen_pool")"
@@ -609,7 +642,13 @@ run_job() {
     # 人工中止不是模型失敗：沒有這個檢查，kill 掉 dc 只會讓階梯換下一個模型重跑
     # 同一張工單，工單永遠停不下來（issue #2）。
     [ -e "$Q/.cancel/$id" ] && { rc=130; break; }
-    [ $(( $(now) - t0 )) -ge "$JOB_MAX" ] && { rc=124; echo "dcq[$id] 超過總時限 ${JOB_MAX}s" >&2; break; }
+    if [ $(( $(now) - t0 )) -ge "$JOB_MAX" ]; then
+      if jobmax_verify "$task" "$cwd" "$DC_PREFLIGHT_DIR"; then
+        mv "$jobfile" "$Q/done/$id.job"; rm -rf "$DC_PREFLIGHT_DIR"
+        echo "dcq[$id] PASS（總時限 ${JOB_MAX}s 到，但驗收通過）model=$model" >&2; return 0
+      fi
+      rc=124; echo "dcq[$id] 超過總時限 ${JOB_MAX}s" >&2; break
+    fi
     pick=$(pick_model "$tried" "$pool")
     case "$pick" in
       BUSY) sleep 2; continue ;;
@@ -659,7 +698,11 @@ run_job() {
          rm -rf "$DC_PREFLIGHT_DIR"   # 前置檢查憑證只對這張工單有效，結案就收掉
          return 0 ;;
       # 總時限是工單的問題不是模型的：不罰模型、不再換
-      jobmax:*) rc=124; break ;;
+      jobmax:*) if jobmax_verify "$task" "$cwd" "$DC_PREFLIGHT_DIR"; then
+           mv "$jobfile" "$Q/done/$id.job"; rm -rf "$DC_PREFLIGHT_DIR"
+           echo "dcq[$id] PASS（總時限 ${JOB_MAX}s 到，但驗收通過）model=$model" >&2; return 0
+         fi
+         rc=124; break ;;
       upstream:*) rc=124; cool_upstream "$model"
          echo "dcq[$id] $model upstream，換下一個模型" >&2 ;;
       stall:*|slow:*|spin:*) rc=124; bump_fail "$model"
@@ -682,6 +725,15 @@ run_job() {
           prevsig=$sig prevmodel=$model ;;
       *) echo "dcq[$id] 驗收未過 rc=${rc}，換下一個模型" >&2 ;;
     esac
+    # 飽和停損（借鏡 /research「兩次無新證據即關閉缺口」）：模型真的跑了（slow／spin／驗收未過）
+    # 但 cwd 跟上一次嘗試結束時一模一樣，連續 SAT 次就停，不再換模型燒時間。上游失敗不算。
+    if [ "$sat_n" -gt 0 ]; then
+      case "$why:$rc" in slow:*|spin:*|exit:[0-9]*) case "$why:$rc" in exit:1|exit:124) ;; *)
+        s="$(tree_sig "$cwd")"
+        if [ "$s" = "$lastsig" ]; then nonew=$((nonew + 1)); else nonew=0; lastsig=$s; fi
+        [ "$nonew" -ge "$sat_n" ] && { rc=124; echo "dcq[$id] 飽和：連續 ${nonew} 次嘗試沒有新產出，停止" >&2; break; } ;;
+      esac ;; esac
+    fi
   done
 
   printf 'LAST_RC=%s\nTRIED=%s\nVERIFY_RUNS=%s\n' "$rc" "$n" "$vr" >> "$jobfile"
@@ -697,12 +749,100 @@ run_job() {
   return 1
 }
 
+# --- worktree 模式（2026-10-22，使用者定「同 repo 要併發」）--------------------------
+# 同一個 cwd 的工單以前只能靠 .cwdlock 序列（頂端註解 #2：相對路徑驗收互汙）。乾淨的 git cwd
+# 改成每張工單一個 git worktree：工單裡的 cwd 絕對路徑改寫成 worktree 路徑（10-08 教訓：模型照
+# 絕對路徑寫回主 checkout，dc 的越界偵測會判 FATAL），鎖改鎖 worktree 路徑（必唯一，不再排隊），
+# PASS 後在 worktree commit 再 merge 回主 checkout；衝突就 abort、留分支 dcq/<id> 給主 session。
+# cwd 髒／非 repo 根目錄／還沒 commit → 照舊序列，log 說原因。DCQ_WORKTREE=0 整個關掉。
+WORKTREE="${DCQ_WORKTREE:-1}"
+re_esc() { printf '%s' "$1" | sed 's/[][\.*^$#\\]/\\&/g'; }   # s#..#..# 的 pattern 側：路徑裡的 . [ # 不當 regex
+rp_esc() { printf '%s' "$1" | sed 's/[&#\\]/\\&/g'; }          # replacement 側只有 & # \ 要逃
+# 不走 worktree 的原因印到 stdout；印空＝可以走
+wt_reason() {
+  local cwd="$1" top
+  [ "$WORKTREE" = 1 ] || { echo "DCQ_WORKTREE=0"; return 0; }
+  top="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)" || { echo "cwd 不是 git repo"; return 0; }
+  [ "$top" = "$(cd "$cwd" && pwd -P)" ] || { echo "cwd 不是 repo 根目錄"; return 0; }
+  git -C "$cwd" rev-parse --verify -q HEAD >/dev/null 2>&1 || { echo "repo 還沒有 commit"; return 0; }
+  [ -z "$(git -C "$cwd" status --porcelain 2>/dev/null)" ] || { echo "cwd 有未 commit 的改動"; return 0; }
+}
+# 收掉一個 worktree；$4=keep 保留分支（衝突時給人看），否則連分支一起刪
+wt_drop() {
+  local main="$1" wt="$2" id="$3"
+  git -C "$main" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  git -C "$main" worktree prune >/dev/null 2>&1
+  [ "${4:-}" = keep ] || git -C "$main" branch -D "dcq/$id" >/dev/null 2>&1
+  rm -f "$Q/.wt/$id.task.md"
+}
+# 把 job 切到 worktree：TASK=／CWD= 改成 worktree 版，原值留在 TASK0=／CWD0=，WT= 標記。失敗回 1（呼叫端走序列）
+wt_setup() {
+  local job="$1" id="$2" cwd="$3" wt="$Q/.wt/$2" task tcopy
+  task="$(sed -n 's/^TASK=//p' "$job")"; tcopy="$Q/.wt/$id.task.md"
+  git -C "$cwd" worktree add -q "$wt" -b "dcq/$id" >/dev/null 2>&1 || return 1
+  wt="$(cd "$wt" && pwd -P)"
+  sed "s#$(re_esc "$cwd")#$(rp_esc "$wt")#g" "$task" > "$tcopy" || { wt_drop "$cwd" "$wt" "$id"; return 1; }
+  { grep -v '^TASK=\|^CWD=' "$job"; printf 'TASK=%s\nCWD=%s\nTASK0=%s\nCWD0=%s\nWT=%s\n' "$tcopy" "$wt" "$task" "$cwd" "$wt"; } > "$job.tmp" \
+    && mv "$job.tmp" "$job"
+}
+# 被殺的 runner 留下的 worktree job 搬回 pending 前還原成原工單（worktree 本身由 wt_gc 收掉，從頭重跑）
+wt_restore_job() {
+  local job="$1" t0 c0
+  t0="$(sed -n 's/^TASK0=//p' "$job")"; c0="$(sed -n 's/^CWD0=//p' "$job")"
+  [ -n "$t0" ] || return 0
+  { grep -v '^TASK=\|^CWD=\|^TASK0=\|^CWD0=\|^WT=' "$job"; printf 'TASK=%s\nCWD=%s\n' "$t0" "$c0"; } > "$job.tmp" && mv "$job.tmp" "$job"
+}
+# 孤兒 worktree：沒有 running job 指到它的一律收掉（分支一起刪）
+wt_gc() {
+  local d id common main t
+  for d in "$Q"/.wt/*/; do
+    [ -d "$d" ] || continue; d="${d%/}"; id="$(basename "$d")"
+    grep -qs "^WT=$d\$" "$Q"/running/*.job 2>/dev/null && continue
+    common="$(cd "$d" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || common=""
+    [ -n "$common" ] && main="$(cd "$d" && cd "$common" && pwd -P)" && main="${main%/.git}" || main=""
+    if [ -n "$main" ] && [ -d "$main/.git" ]; then wt_drop "$main" "$d" "$id"; else rm -rf "$d"; fi
+  done
+  for t in "$Q"/.wt/*.task.md; do [ -e "$t" ] && [ ! -d "${t%.task.md}" ] && rm -f "$t"; done
+  return 0
+}
+# run_job 結束後：PASS → worktree 內 commit → 拿主 checkout 的 cwdlock → merge；衝突 abort、留分支。
+# FAIL／取消 → worktree 與分支全丟（.out 還在 logs/）。非 worktree job 直接返回。
+wt_finish() {
+  local id="$1" rc="$2" job wt cwd0 h waited=0
+  job="$Q/done/$id.job"; [ -e "$job" ] || job="$Q/failed/$id.job"; [ -e "$job" ] || return 0
+  wt="$(sed -n 's/^WT=//p' "$job")"; [ -n "$wt" ] || return 0
+  cwd0="$(sed -n 's/^CWD0=//p' "$job")"
+  if [ "$rc" != 0 ]; then wt_drop "$cwd0" "$wt" "$id"; return 0; fi
+  git -C "$wt" add -A >/dev/null 2>&1
+  # 沒有改動也算 PASS（唯讀／報告類工單）：commit 失敗不是錯
+  git -C "$wt" -c user.name=dcq -c user.email=dcq@localhost commit -qm "dcq $id" >/dev/null 2>&1 || true
+  h="$(hash12 "$cwd0")"
+  # 主 checkout 可能正被序列路徑的工單或直呼的 dc 佔著：等鎖，逾時就當衝突留分支
+  while ! mkdir "$Q/.cwdlock/$h" 2>/dev/null; do
+    if [ "$waited" -ge "${DCQ_WT_MERGE_WAIT:-600}" ]; then
+      echo "dcq[$id] merge 等主 checkout 鎖逾時：主 checkout 不動，分支 dcq/$id 保留（衝突處理同）" >&2
+      echo 'MERGE=conflict' >> "$job"; wt_drop "$cwd0" "$wt" "$id" keep; return 0
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  echo $$ > "$Q/.cwdlock/$h/pid"
+  if git -C "$cwd0" merge -q --no-edit "dcq/$id" >/dev/null 2>&1; then
+    echo 'MERGED=1' >> "$job"; wt_drop "$cwd0" "$wt" "$id"
+    echo "dcq[$id] 已 merge 回 $cwd0" >&2
+  else
+    git -C "$cwd0" merge --abort >/dev/null 2>&1
+    echo 'MERGE=conflict' >> "$job"; wt_drop "$cwd0" "$wt" "$id" keep
+    echo "dcq[$id] merge 衝突：主 checkout 不動，分支 dcq/$id 保留，請主 session 處理" >&2
+  fi
+  rm -rf "$Q/.cwdlock/$h"
+}
+
 # --- 搶單 ---------------------------------------------------------------------
 # 同檔系統的 mv 是 atomic rename，兩個 worker 搶同一張只有一個 mv 成功 —— 這本身
 # 就是鎖，不用另外再加一層。cwd 被別人佔就放回 pending 換下一張，不阻塞本 worker。
 # 印 "JOB|<檔>|<hash>"、"WAIT"（還有事在跑但現在搶不到）或 "DRAIN"（真的沒事了）。
 claim_one() {
-  local f id cwd h
+  local f id cwd h why
   # 免費終止是全域事實，不是單張工單的問題：一有警報就全隊停止收單，
   # 已在跑的那張讓它跑完（殺掉會留半套產物，比跑完更難收拾）。
   [ -e "$Q/.ALARM" ] && { echo DRAIN; return 0; }
@@ -711,10 +851,19 @@ claim_one() {
     id="$(basename "$f" .job)"
     mv "$f" "$Q/running/$id.job" 2>/dev/null || continue
     cwd="$(sed -n 's/^CWD=//p' "$Q/running/$id.job")"
+    # 乾淨的 git cwd → 切到自己的 worktree，鎖的是 worktree 路徑（必唯一）；否則照舊鎖 cwd 序列
+    why="$(wt_reason "$cwd")"
+    if [ -z "$why" ]; then
+      if wt_setup "$Q/running/$id.job" "$id" "$cwd"; then
+        cwd="$(sed -n 's/^CWD=//p' "$Q/running/$id.job")"
+        echo "dcq[$id] worktree 模式：${cwd}（分支 dcq/${id}）" >&2
+      else why="git worktree add 失敗"; fi
+    fi
     h="$(hash12 "$cwd")"
     if mkdir "$Q/.cwdlock/$h" 2>/dev/null; then
       # pid 要寫：dc 也搶同一把鎖，看不到 pid 會把這把當孤兒清掉
       echo $$ > "$Q/.cwdlock/$h/pid"
+      [ -n "$why" ] && echo "dcq[$id] 同目錄序列（${why}）：${cwd}" >&2
       echo "JOB|$Q/running/$id.job|$h"; return 0
     fi
     mv "$Q/running/$id.job" "$Q/pending/$id.job" 2>/dev/null
@@ -729,7 +878,7 @@ claim_one() {
 }
 
 worker() {
-  local claim jobfile h
+  local claim jobfile h rc
   while true; do
     claim="$(claim_one)"
     case "$claim" in
@@ -737,7 +886,8 @@ worker() {
       WAIT)  sleep 1; continue ;;
     esac
     jobfile="$(echo "$claim" | cut -d'|' -f2)"; h="$(echo "$claim" | cut -d'|' -f3)"
-    run_job "$jobfile"
+    run_job "$jobfile"; rc=$?
+    wt_finish "$(basename "$jobfile" .job)" "$rc"
     rm -rf "$Q/.cwdlock/$h"
   done
 }
@@ -757,8 +907,9 @@ cmd_run() {
   echo $$ > "$Q/.runner.pid"; trap 'rm -f "$Q/.runner.pid"' EXIT
   # 上一輪被 kill 會留下孤兒：running/ 裡的 job 與沒人持有的 cwdlock。
   # ponytail: 無人重跑 run 就沒人清，開機時無腦全收；同時只准一個 dcq run 在跑。
-  for f in "$Q"/running/*.job; do [ -e "$f" ] && mv "$f" "$Q/pending/"; done
+  for f in "$Q"/running/*.job; do [ -e "$f" ] && { wt_restore_job "$f"; mv "$f" "$Q/pending/"; }; done
   rm -f "$Q"/running/*.pid 2>/dev/null
+  wt_gc   # 上一輪的 worktree 現在都沒人指到：收掉，工單從頭重跑
   rm -rf "$Q"/.inuse/* 2>/dev/null   # 併發槽只屬於 dcq run，上一輪被殺留下的全是孤兒
   # 鎖現在是 dc 和 dcq 共用的：只清沒人持有的，別把別人正在跑的 dc 的鎖掃掉
   for l in "$Q"/.cwdlock/*; do
@@ -822,6 +973,13 @@ cmd_status() {
       echo "  $(basename "$f" .job)  $(sed -n 's/^LAST_RC=/rc=/p' "$f" | tr '\n' ' ')$(grep -q '^CANCELLED=1' "$f" && echo cancelled)"
     done
   }
+  # worktree 模式 PASS 但沒合回主 checkout 的：分支還在，要人處理
+  [ -n "$(grep -ls '^MERGE=conflict' "$Q"/done/*.job 2>/dev/null)" ] && {
+    echo "--- merge 衝突（PASS 但未合回，分支保留）---"
+    for f in $(grep -ls '^MERGE=conflict' "$Q"/done/*.job); do
+      echo "  $(basename "$f" .job)  分支 dcq/$(basename "$f" .job) → $(sed -n 's/^CWD0=//p' "$f")"
+    done
+  }
   echo "--- models ---"
   local m left busy
   for m in $MODELS $POOL_PAID ${POOL_PEN:-} $POOL_TAIL $POOL_API; do
@@ -875,7 +1033,7 @@ cmd_wait() {
   [ ${#ids[@]} -eq 0 ] && { cmd_status | sed -n 1,4p; [ -n "$(ls "$Q"/failed/*.job 2>/dev/null)" ] && rc=1; }
   return $rc
 }
-cmd_clear() { rm -f "$Q"/{pending,running,done,failed}/*.job "$Q"/logs/*.out "$Q"/running/*.pid 2>/dev/null; rm -rf "$Q"/.cwdlock/* 2>/dev/null; rm -rf "$Q"/.health/* "$Q"/.inuse/* "$Q"/.cancel/* "$Q"/.preflight/* 2>/dev/null; echo "dcq: 已清空"; }
+cmd_clear() { rm -f "$Q"/{pending,running,done,failed}/*.job "$Q"/logs/*.out "$Q"/running/*.pid 2>/dev/null; wt_gc; rm -rf "$Q"/.cwdlock/* 2>/dev/null; rm -rf "$Q"/.health/* "$Q"/.inuse/* "$Q"/.cancel/* "$Q"/.preflight/* 2>/dev/null; echo "dcq: 已清空"; }
 
 init
 case "${1:-}" in
