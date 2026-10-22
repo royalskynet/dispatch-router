@@ -31,6 +31,9 @@ cat_pool() {
 }
 # fit=easy＝hard 工單不派（改錯、假扮工具、無限迴圈、隨機分配的前科）
 EASY_ONLY="${DCQ_EASY_ONLY-$( [ -r "$CAT/models.tsv" ] && awk -F'\t' '!/^#/ && $7!="" && $8=="easy" { printf "%s%s", (n++ ? " " : ""), $7 }' "$CAT/models.tsv")}"
+# fit=easy-only＝只派 easy 工單，mid／hard 都不派（2026-10-22：or-free 23 跑 1 過、失敗白等 11262s，mid 工單照樣派到它）
+EASY_STRICT="${DCQ_EASY_STRICT-$( [ -r "$CAT/models.tsv" ] && awk -F'\t' '!/^#/ && $7!="" && $8=="easy-only" { printf "%s%s", (n++ ? " " : ""), $7 }' "$CAT/models.tsv")}"
+EASY_ONLY="${EASY_ONLY}${EASY_STRICT:+${EASY_ONLY:+ }$EASY_STRICT}"
 # 模型池：Go 的兩隻限時無限免費（CLI 走 opencode/ 前綴，2026-09-30 實測可用）為主，
 # Zen 免費池殿後。訂閱沒了就清空 DCQ_POOL_GO。兩池只是依序串接——「池」的意義在
 # 於冷卻與併發上限是 per-model 的，一隻忙或掛不會拖住同池其他隻、更不會停全隊。
@@ -70,6 +73,7 @@ MODELS="${DCQ_MODELS:-$POOL_ZEN${POOL_GO:+ $POOL_GO}}"
 # ponytail: 不分工單難易；簡單工單多的模型會被高估。要更準得記工單大小再加權。
 RANK_MIN="${DCQ_RANK_MIN:-10}"; RANK_WIN="${DCQ_RANK_WIN:-30}"; RANK_STALL_PCT="${DCQ_RANK_STALL_PCT:-30}"
 RANK_ZERO_N="${DCQ_RANK_ZERO_N:-3}"   # 設 0＝停用短路
+RANK_PRIOR_K="${DCQ_RANK_PRIOR_K:-2}"   # 貝氏平滑的虛擬嘗試數；0＝原始 s/pass
 # 週探測（oc-probe/：launchd 06:00 的 oc-probe daily 每 7 天跑一次 oc-free-check --tsv）：只用最新一批、且 ≤PROBE_MAX_H 小時。
 #   - 探測非 OK → 移到免費層最後（比 zero/demoted 更後；明天探測回 OK 就自己回來）
 #   - 樣本不足（manual）的位置裡依探測秒數排序，沒探測資料的排在有資料的後面
@@ -86,29 +90,41 @@ rank_free() {  # $1=手排順序（空白分隔）；$2 mode=table 時印統計�
   local cut; cut="$(date -v-"${PROBE_MAX_H}"H +%F_%T 2>/dev/null || date -d "-${PROBE_MAX_H} hours" +%F_%T)"
   local pc; pc="$(date -v-"${RANK_PAROLE_D}"d +%F_%T 2>/dev/null || date -d "-${RANK_PAROLE_D} days" +%F_%T)"
   awk -F'\t' -v order="$1" -v min="$RANK_MIN" -v win="$RANK_WIN" -v sp="$RANK_STALL_PCT" \
-      -v zn="$RANK_ZERO_N" -v mode="${2:-order}" -v pf="$pf" -v cut="$cut" -v pc="$pc" -v stall="${STALL_S:-200}" -v tier="${3:-}" '
+      -v zn="$RANK_ZERO_N" -v mode="${2:-order}" -v pf="$pf" -v cut="$cut" -v pc="$pc" -v stall="${STALL_S:-200}" -v tier="${3:-}" -v pk="$RANK_PRIOR_K" '
     # QUOTA＝額度用完（08:00 重置），不是壞，當沒資料
     FILENAME==pf { if ($1>=cut && $4!="QUOTA") { if ($1>pl) pl=$1; PT[$1,$3]=PT[$1,$3] (PT[$1,$3]=="" ? "" : ",") $4 ":" $5 } next }
     # 第 7 欄＝工單難度（2026-10-19 起）：別的難度的紀錄不算；舊紀錄沒有這欄，算進每個難度
     tier!="" && $7!="" && $7!=tier { next }
     $4==0 && $3+0>pgmax { pgmax=$3+0; pgm=$2 }
-    { m=$2; LT[m]=$1; k=++cnt[m]; R[m,k]=$4; W[m,k]=$5; D[m,k]=($6!="" ? $6 : $3) }
+    { m=$2; LT[m]=$1; k=++cnt[m]; R[m,k]=$4; W[m,k]=$5; D[m,k]=($6!="" ? $6 : $3); if ($4==0) LP[m]=$1 }
     END {
       nm=split(order, L, " ")
       for (i=1; i<=nm; i++) {
         m=L[i]; n=0; p=0; s=0; d=0; st=cnt[m]-win+1; if (st<1) st=1
         for (k=st; k<=cnt[m]; k++) { if (R[m,k]==2 || W[m,k]=="upstream") continue; n++; d+=D[m,k]; if (R[m,k]==0) p++; if (W[m,k]=="stall" || W[m,k]=="slow" || W[m,k]=="spin") s++ }
-        N[i]=n; P[i]=p; S[i]=s; pr[i]=(n ? p/n : 0)
-        sp_[i]=(p ? d/p : 1e9); sc[i]=-sp_[i]   # 分數越大越前：每 PASS 秒數取負
+        N[i]=n; P[i]=p; S[i]=s; DS[i]=d; pr[i]=(n ? p/n : 0); tn+=n; tp+=p; td+=d
+      }
+      # 貝氏平滑（2026-10-22）：每隻先加 pk 次「全池平均」的虛擬嘗試（平均秒數 mu_d、平均通過率 mu_p），
+      # 估計值＝(總秒數＋pk×mu_d)／(PASS 數＋pk×mu_p)。樣本多的幾乎不變，樣本少的往全池平均拉，
+      # 12 跑 8 過、71s 的模型才比得過 30 跑 17 過的。全池沒有 PASS 時退回原始 s/pass。
+      # 借鏡 LiteLLM latency-based routing 的移動平均＋Beta 先驗；Thompson sampling 仍照 ponytail 延後。
+      mu_d=(tn ? td/tn : 0); mu_p=(tn ? tp/tn : 0)
+      for (i=1; i<=nm; i++) {
+        m=L[i]; n=N[i]; p=P[i]; s=S[i]; d=DS[i]
+        if (pk>0 && mu_p>0) sp_[i]=(d+pk*mu_d)/(p+pk*mu_p); else sp_[i]=(p ? d/p : 1e9)
+        sc[i]=-sp_[i]   # 分數越大越前：每 PASS 秒數取負
         st_="manual"
         if (zn>0 && n>=zn && p==0) st_="zero"   # 短路：一張都沒過，不等 RANK_MIN
         else if (n>=min) { if (s*100>=sp*n) st_="demoted"; else st_="ranked" }
         if ((st_=="zero" || st_=="demoted") && LT[m]<pc) st_="manual"   # 假釋
-        if (st_=="zero" || st_=="demoted") dm[++nd]=i
+        # zero 另放冷宮（兜底層之後、訂閱層之前，2026-10-22 使用者定）：0 PASS 的不該排在會過的免費模型前面
+        if (st_=="demoted") dm[++nd]=i; else if (st_=="zero") zz[++nz]=i
         # 探測：同一 model 多 provider 時任一 OK 就算活著，秒數取最小
         ps[i]=""; pok[i]=1e8
         if (pl!="" && (pl,m) in PT) { ps[i]="down"; np=split(PT[pl,m], pp, ",")
           for (z=1; z<=np; z++) { split(pp[z], kv, ":"); if (kv[1]=="OK") { ps[i]="ok"; if (kv[2]+0<pok[i]) pok[i]=kv[2]+0 } } }
+        # 探測之後真實工單又 PASS 過＝探測過時（10-19 06:00 整池 403 那批，三天後仍把會過的標 down），以工單為準
+        if (ps[i]=="down" && LP[m]>pl) ps[i]="stale"
         # ranked 要等探測判完才進 q：先進 q 再改 probe-down 的話，它會在輸出時佔掉別隻合格者的位置
         #（2026-10-13：nemotron 出現兩次、93% 的 space-bunny 整隻消失）
         if (ps[i]=="down" && st_!="zero" && st_!="demoted") { st_="probe-down"; pd[++npd]=i }
@@ -118,6 +134,10 @@ rank_free() {  # $1=手排順序（空白分隔）；$2 mode=table 時印統計�
       }
       # manual 位置依探測秒數升冪（無資料＝1e8，同分維持手排順序）
       for (a=2; a<=nmq; a++) { x=mq[a]; b2=a-1; while (b2>=1 && pok[mq[b2]]>pok[x]) { mq[b2+1]=mq[b2]; b2-- } mq[b2+1]=x }
+      # 平滑開著時（pk>0 且全池有 PASS）：manual 與 ranked 合成一組，一律依 est 升冪。小樣本已被先驗拉回全池平均，
+      # 不必再靠手排保護；0 樣本的 est＝全池平均，排在中間＝自然的探索位。同分時維持上面探測秒數排好的順序。
+      # 2026-10-22 實例：mid 工單的 deepseek-free（mid 樣本不足、2/10 過）靠手排位置排在 go/beam-free（8/10 過）前面。
+      if (pk>0 && mu_p>0) { for (a=1; a<=nmq; a++) q[++nq]=mq[a]; nmq=0; for (i=1; i<=nm; i++) if (tag[i]=="manual") tag[i]="ranked" }
       # 合格者依每 PASS 秒數升冪（同分維持手排順序；插入排序，n 很小）
       for (a=2; a<=nq; a++) { x=q[a]; b=a-1; while (b>=1 && sc[q[b]]<sc[x]) { q[b+1]=q[b]; b-- } q[b+1]=x }
       for (a=2; a<=nd; a++) { x=dm[a]; b=a-1; while (b>=1 && sc[dm[b]]<sc[x]) { dm[b+1]=dm[b]; b-- } dm[b+1]=x }
@@ -127,15 +147,19 @@ rank_free() {  # $1=手排順序（空白分隔）；$2 mode=table 時印統計�
         out=out (out?" ":"") (tag[i]=="ranked" ? L[q[++j]] : L[mq[++jm]])
       }
       for (a=1; a<=npd; a++) out=out (out?" ":"") L[pd[a]]
+      for (a=2; a<=nz; a++) { x=zz[a]; b=a-1; while (b>=1 && N[zz[b]]>N[x]) { zz[b+1]=zz[b]; b-- } zz[b+1]=x }   # 冷宮裡樣本少的先試
       pen=""; for (a=1; a<=nd; a++) pen=pen (pen?" ":"") L[dm[a]]
+      zero=""; for (a=1; a<=nz; a++) zero=zero (zero?" ":"") L[zz[a]]
       if (mode=="table") {
-        printf "%-34s %4s %4s %4s %6s %8s %7s  %s\n", "model", "n", "pass", "stall", "pass%", "s/pass", "probe", "狀態"
-        for (i=1; i<=nm; i++) printf "%-34s %4d %4d %4d %5.0f%% %8s %7s  %s\n", L[i], N[i], P[i], S[i], pr[i]*100, (P[i] ? sprintf("%.0f", sp_[i]) : "-"), (ps[i]=="ok" ? sprintf("%.0fs", pok[i]) : (ps[i]=="" ? "-" : "down")), tag[i]
+        printf "%-34s %4s %4s %4s %6s %8s %7s  %s\n", "model", "n", "pass", "stall", "pass%", "est", "probe", "狀態"
+        for (i=1; i<=nm; i++) printf "%-34s %4d %4d %4d %5.0f%% %8s %7s  %s\n", L[i], N[i], P[i], S[i], pr[i]*100, (sp_[i]<1e9 ? sprintf("%.0f", sp_[i]) : "-"), (ps[i]=="ok" ? sprintf("%.0fs", pok[i]) : (ps[i]=="" ? "-" : ps[i])), tag[i]
         if (pl!="") print "探測批次：" pl
+        printf "est＝平滑後每 PASS 秒數（先驗 %s 次，全池平均 %.0fs／次、通過率 %.0f%%）\n", pk, mu_d, mu_p*100
         print "順序：" out
         print "懲罰層（免費層之後）：" pen
+        print "冷宮（兜底層之後、訂閱層之前）：" zero
         if (pgmax >= 0.9*stall) printf "⚠ 成功工單最大靜默 %ds（%s）已逼近 STALL_S=%d，門檻可能太緊會誤殺\n", pgmax, pgm, stall
-      } else print out "|" pen
+      } else print out "|" pen "|" zero
     }' "$pf" "$f"
 }
 # 名單同步（每次啟動算，零 token）：官方改名／下架／新上架時免改上面寫死的清單。
@@ -167,19 +191,6 @@ if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_POOLSYNC:-1}" != 0 ]; then
   _s="$(pool_sync_zen "$MODELS")"; [ -z "${_s%%|*}" ] || MODELS="${_s%%|*}"; _s="${_s#*|}"   # 全移光就維持原清單
   [ -z "${_s%%|*}" ] || SYNC_NOTE="新增 ${_s%%|*}；"; [ -z "${_s#*|}" ] || SYNC_NOTE="${SYNC_NOTE}移出 ${_s#*|}；"
   [ -z "${_s%%|*}" ] || SYNC_ADD_ZEN="${_s%%|*}"; [ -z "${_s#*|}" ] || SYNC_RM="${_s#*|}"
-fi
-POOL_PEN="${DCQ_POOL_PEN-}"   # 手動指定只在不自動排名時有效（測試用）；自動排名會覆寫
-if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
-  MODELS_MANUAL="$MODELS"; _r="$(rank_free "$MODELS")"; MODELS="${_r%%|*}"; POOL_PEN="${_r#*|}"
-fi
-# 依難度各排一份（只用同難度＋舊紀錄）：某隻只在 hard 卡住，不該連 easy 工單都把它降級。
-# ponytail: Thompson sampling（LiteLLM complexity_router adaptive 那種）延後：2026-10-19 gaps.tsv 118 筆分散 18 隻、
-# 只有 3 隻 ≥10 筆，拆三個難度後幾乎每格 <10。任一難度有 ≥5 隻各 ≥20 筆時再換掉 s/pass 排序。
-MODELS_easy="$MODELS" PEN_easy="$POOL_PEN" MODELS_mid="$MODELS" PEN_mid="$POOL_PEN" MODELS_hard="$MODELS" PEN_hard="$POOL_PEN"
-if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
-  _r="$(rank_free "$MODELS_MANUAL" order easy)"; MODELS_easy="${_r%%|*}"; PEN_easy="${_r#*|}"
-  _r="$(rank_free "$MODELS_MANUAL" order mid)";  MODELS_mid="${_r%%|*}";  PEN_mid="${_r#*|}"
-  _r="$(rank_free "$MODELS_MANUAL" order hard)"; MODELS_hard="${_r%%|*}"; PEN_hard="${_r#*|}"
 fi
 # 權重：免費層優先。只有免費模型整輪試過 FREE_ROUNDS 次都失敗，或免費模型全部在冷卻
 # （＝免費掛了），才往下走懲罰層 → 兜底層 → 訂閱層（2026-10-13 起訂閱墊底）。訂閱層只准 opencode-go/（扣 Go 訂閱額度）——
@@ -255,17 +266,41 @@ oc_declared() {
   echo "${out# }"
 }
 POOL_TAIL="$(oc_declared "$POOL_TAIL")"
+# Go 免費併進主免費層（2026-10-22）：opencode-go/*-free 一樣免費（docs/go：額度用完仍可用免費模型），
+# 以前只因 dc_id 有斜線就落到兜底層，排在 0 PASS 的 Zen 累犯後面——兜底的 opencode-go/beam-free 12 跑 8 過、中位 71s，
+# 是實測最好的免費模型，卻常輪不到（10-21 wo-r1／r8／r9 撞 JOB_MAX 前都沒試到）。
+# 併進來後與 Zen 免費同一套排名（每 PASS 秒數＋貝氏平滑）；Zen 走 per-IP 的免費閘，Go 走 Go key，
+# 兩條閘分開，免費層併發容量從 zen=2 變成 zen=2＋opencode-go=4。兜底層只剩 omniroute/*。DCQ_GOFREE_MAIN=0 關；
+# DCQ_POOL_ZEN／DCQ_POOL_TAIL 有設（整條覆寫）時照設定的分層，不搬。
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_GOFREE_MAIN:-1}" != 0 ] && [ -z "${DCQ_POOL_ZEN+x}" ] && [ -z "${DCQ_POOL_TAIL+x}" ]; then
+  _g=""; _t=""
+  for _m in $POOL_TAIL; do case "$_m" in opencode-go/*-free) _g="$_g${_g:+ }$_m" ;; *) _t="$_t${_t:+ }$_m" ;; esac; done
+  [ -z "$_g" ] || { MODELS="$MODELS${MODELS:+ }$_g"; POOL_TAIL="$_t"; }
+fi
+POOL_PEN="${DCQ_POOL_PEN-}"   # 手動指定只在不自動排名時有效（測試用）；自動排名會覆寫
+POOL_ZERO="${DCQ_POOL_ZERO-}" # 冷宮：0 PASS 的免費模型，兜底層之後、訂閱層之前；手動指定同 POOL_PEN（測試用），自動排名會覆寫
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
+  MODELS_MANUAL="$MODELS"; _r="$(rank_free "$MODELS")"; MODELS="${_r%%|*}"; _r="${_r#*|}"; POOL_PEN="${_r%%|*}"; POOL_ZERO="${_r#*|}"
+fi
+# 依難度各排一份（只用同難度＋舊紀錄）：某隻只在 hard 卡住，不該連 easy 工單都把它降級。
+# ponytail: Thompson sampling（LiteLLM complexity_router adaptive 那種）延後：2026-10-19 gaps.tsv 118 筆分散 18 隻、
+# 只有 3 隻 ≥10 筆，拆三個難度後幾乎每格 <10。任一難度有 ≥5 隻各 ≥20 筆時再換掉 s/pass 排序。
+MODELS_easy="$MODELS" PEN_easy="$POOL_PEN" ZERO_easy="$POOL_ZERO" MODELS_mid="$MODELS" PEN_mid="$POOL_PEN" ZERO_mid="$POOL_ZERO" MODELS_hard="$MODELS" PEN_hard="$POOL_PEN" ZERO_hard="$POOL_ZERO"
+if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
+  _r="$(rank_free "$MODELS_MANUAL" order easy)"; MODELS_easy="${_r%%|*}"; _r="${_r#*|}"; PEN_easy="${_r%%|*}" ZERO_easy="${_r#*|}"
+  _r="$(rank_free "$MODELS_MANUAL" order mid)";  MODELS_mid="${_r%%|*}";  _r="${_r#*|}"; PEN_mid="${_r%%|*}" ZERO_mid="${_r#*|}"
+  _r="$(rank_free "$MODELS_MANUAL" order hard)"; MODELS_hard="${_r%%|*}"; _r="${_r#*|}"; PEN_hard="${_r%%|*}" ZERO_hard="${_r#*|}"
+fi
 # 2026-10-21：兜底層與訂閱層也做層內排序，規則與免費層相同（依「每 PASS 一張平均花幾秒」升冪排，
 # 停滯率過高或 0 PASS 的降到該層最後；樣本不足的留原位）。
 # 為什麼：這兩層以前照清冊固定順序，永遠先派第一隻。實例：兜底層 opencode-go/longcat 12 跑 2 過，
 # 排在 11 跑 8 過的 opencode-go/beam 前面 —— 比較慢的那隻先跑，每張工單都在替它白等。
 # 只在層內排：不跨層搬移（不把免費層的模型搬進兜底層、也不把兜底層的搬去訂閱層），也不分難度（層內用全部紀錄）。
 # DCQ_MODELS 有設、或 DCQ_AUTORANK=0 就不排（跟免費層同一個開關）。
-rank_layer() {  # $1=該層手排順序（空白分隔）；印「順序|懲罰」接回來的完整順序：懲罰墊該層最後
-  local r o p
-  r="$(rank_free "$1")"; o="${r%%|*}"; p="${r#*|}"
-  o="${o# }"; o="${o% }"; p="${p# }"; p="${p% }"
-  if [ -n "$o" ] && [ -n "$p" ]; then echo "$o $p"; else echo "${o}${p}"; fi
+rank_layer() {  # $1=該層手排順序（空白分隔）；印接回來的完整順序：懲罰、0 PASS 依序墊該層最後
+  local r o p z
+  r="$(rank_free "$1")"; o="${r%%|*}"; r="${r#*|}"; p="${r%%|*}"; z="${r#*|}"
+  echo $o $p $z   # 不加引號：順便收掉空段造成的多餘空白
 }
 if [ -z "${DCQ_MODELS:-}" ] && [ "${DCQ_AUTORANK:-1}" != 0 ]; then
   POOL_TAIL="$(rank_layer "$POOL_TAIL")"; POOL_PAID="$(rank_layer "$POOL_PAID")"
@@ -390,12 +425,15 @@ take_slot() {
   return 1
 }
 
-# hard 工單濾掉 EASY_ONLY（清冊 fit=easy）；其他難度原樣
-fit_pool() {
-  [ "${JOB_TIER:-}" = hard ] || { echo "$1"; return; }
+# $2 裡不在 $1 的模型（保持 $2 順序）；不碰槽位，給「還有沒有可重試的」這類判斷用
+not_in() {
   local m o=""
-  for m in $1; do case " $EASY_ONLY " in *" $m "*) ;; *) o="$o${o:+ }$m" ;; esac; done
+  for m in $2; do case " $1 " in *" $m "*) ;; *) o="$o${o:+ }$m" ;; esac; done
   echo "$o"
+}
+# hard 工單濾掉 EASY_ONLY（清冊 fit=easy／easy-only），mid 工單濾掉 EASY_STRICT（fit=easy-only）；easy 原樣
+fit_pool() {
+  case "${JOB_TIER:-}" in hard) not_in "$EASY_ONLY" "$1" ;; mid) not_in "$EASY_STRICT" "$1" ;; *) echo "$1" ;; esac
 }
 # 從 $2 這個池挑下一隻：依序跳過「本單試過的」「冷卻中的」「槽滿的」。印：
 #   PICK <model> <slot>
@@ -420,7 +458,7 @@ pick_model() {
   else echo NONE; fi
 }
 
-# 派工前預覽（派dr 先給使用者看這份再問要不要派）：每張的難度與會走的層，不入列、不打上游。
+# 派工前預覽（派o 先給使用者看這份再問要不要派）：每張的難度與會走的層，不入列、不打上游。
 # ponytail: 層級順序與 run_job 各寫一份；改 run_job 的階梯要同步改這裡（dcq_tier_test 5b 會抓順序不一致）。
 cmd_plan() {
   local order="${DCQ_ORDER:-default}" task tier ocbin="${DC_BIN:-$(dirname "$(readlink -f "$0")")}" n=0
@@ -430,14 +468,15 @@ cmd_plan() {
     n=$((n + 1)); tier="${DCQ_TIER:-}"
     [ -n "$tier" ] || { [ -x "$ocbin/triage" ] && tier="$("$ocbin/triage" "$task")"; }; tier="${tier:-mid}"
     JOB_TIER="$tier"
-    local f p pe t s a
-    case "$tier" in easy) f="$MODELS_easy" pe="$PEN_easy" ;; hard) f="$MODELS_hard" pe="$PEN_hard" ;; *) f="$MODELS_mid" pe="$PEN_mid" ;; esac
-    f="$(fit_pool "$f")"; pe="$(fit_pool "$pe")"; t="$(fit_pool "$POOL_TAIL")"; s="$(fit_pool "$POOL_PAID")"; a="$(fit_pool "$POOL_API")"
+    local f p pe t z s a
+    case "$tier" in easy) f="$MODELS_easy" pe="$PEN_easy" z="$ZERO_easy" ;; hard) f="$MODELS_hard" pe="$PEN_hard" z="$ZERO_hard" ;; *) f="$MODELS_mid" pe="$PEN_mid" z="$ZERO_mid" ;; esac
+    f="$(fit_pool "$f")"; pe="$(fit_pool "$pe")"; z="$(fit_pool "$z")"; t="$(fit_pool "$POOL_TAIL")"; s="$(fit_pool "$POOL_PAID")"; a="$(fit_pool "$POOL_API")"
     [ "$order" = free ] && { s=""; a=""; }
     echo "[$n] $(basename "$task")　難度 $tier"
     if [ "$order" = sub ] && [ -n "$s" ]; then echo "  1 訂閱：$s"; echo "  2 免費：$f"; else echo "  1 免費：$f"; fi
     [ -z "$pe" ] || echo "  · 懲罰：$pe"
     [ -z "$t" ] || echo "  · 兜底：$t"
+    [ -z "$z" ] || echo "  · 冷宮（0 PASS）：$z"
     [ "$order" = sub ] || [ -z "$s" ] || echo "  · 訂閱（付費）：$s"
     [ -z "$a" ] || echo "  · API（按量扣錢）：$a"
   done
@@ -463,7 +502,7 @@ cmd_add() {
   # 難度：呼叫端給的優先；沒給就問本機 Laya（bin/triage，零 token），判不出一律 mid
   [ -n "$tier" ] || { [ -x "$ocbin/triage" ] && tier="$("$ocbin/triage" "$task")"; }
   case "$tier" in easy|mid|hard) ;; "") tier=mid ;; *) die "難度只能是 easy／mid／hard：$tier" ;; esac
-  # 層級順序（觸發詞對應：派dr＝default、派drf＝free、派drs＝sub）；沒給一律 default（預設＝派dr，10-21 使用者定）：
+  # 層級順序（觸發詞對應：派o＝default、派of＝free、派os＝sub）；沒給一律 default（預設＝派o，10-21 使用者定）：
   # 免費全敗會升到 opencode-go 訂閱層；只要免費的呼叫端自己帶 DCQ_ORDER=free
   case "$order" in default|free|sub) ;; *) die "DCQ_ORDER 只能是 default／free／sub：$order" ;; esac
   local id="$(date +%s)-$$-$(basename "${task%.md}")"
@@ -603,7 +642,7 @@ watch_oc() {
 
 run_job() {
   local jobfile="$1" id task cwd rc=0 why model slot tried="" n=0 t0 pick sig prevsig prevmodel
-  local pool paid=0 pen=0 tail=0 sub=0 api=0 round=1 left vr=0 pslot pen_pool tail_pool paid_pool api_pool
+  local pool paid=0 pen=0 tail=0 zero=0 sub=0 api=0 round=1 left vr=0 pslot pen_pool tail_pool zero_pool paid_pool api_pool noretry="" ran=0
   id="$(basename "$jobfile" .job)"
   task="$(sed -n 's/^TASK=//p' "$jobfile")"
   cwd="$(sed -n 's/^CWD=//p' "$jobfile")"
@@ -625,9 +664,9 @@ run_job() {
   JOB_MAX="$(sed -n 's/^JOBMAX=//p' "$jobfile")"; JOB_MAX="${JOB_MAX:-$JOB_MAX_G}"
   sat_n="$(sed -n 's/^SAT=//p' "$jobfile")"; sat_n="${sat_n:-0}"
   lastsig="$(tree_sig "$cwd")"
-  case "$JOB_TIER" in easy) pool="$MODELS_easy" pen_pool="$PEN_easy" ;; hard) pool="$MODELS_hard" pen_pool="$PEN_hard" ;;
-    *) JOB_TIER=mid pool="$MODELS_mid" pen_pool="$PEN_mid" ;; esac
-  pool="$(fit_pool "$pool")"; pen_pool="$(fit_pool "$pen_pool")"
+  case "$JOB_TIER" in easy) pool="$MODELS_easy" pen_pool="$PEN_easy" zero_pool="$ZERO_easy" ;; hard) pool="$MODELS_hard" pen_pool="$PEN_hard" zero_pool="$ZERO_hard" ;;
+    *) JOB_TIER=mid pool="$MODELS_mid" pen_pool="$PEN_mid" zero_pool="$ZERO_mid" ;; esac
+  pool="$(fit_pool "$pool")"; pen_pool="$(fit_pool "$pen_pool")"; zero_pool="$(fit_pool "$zero_pool")"
   tail_pool="$(fit_pool "$POOL_TAIL")"; paid_pool="$(fit_pool "$POOL_PAID")"; api_pool="$(fit_pool "$POOL_API")"
   # ORDER：default＝免費→懲罰→兜底→訂閱→API；free＝只用免費的層；sub＝訂閱先，用盡才回免費的層，API 墊底
   local order free_main=""
@@ -653,9 +692,11 @@ run_job() {
     case "$pick" in
       BUSY) sleep 2; continue ;;
       NONE|COOL*)
-        # 免費層整輪試完：還有輪次就清空 tried 再來一輪（冷卻中的那幾隻會自動跳過）
-        if [ "$paid" = 0 ] && [ "$pick" = NONE ] && [ "$round" -lt "$FREE_ROUNDS" ]; then
-          round=$((round + 1)); tried=""
+        # 免費層整輪試完：還有輪次就清空 tried 再來一輪（冷卻中的那幾隻會自動跳過）。
+        # 本單已經真的跑過卻沒交件的（stall／slow／spin／驗收未過）不再試：第 2 輪只給上游失敗的。
+        # 2026-10-22：免費層只剩 minimax 一隻時，wo-r1 同一隻連跑 245s＋1021s 才離開免費層。
+        if [ "$paid" = 0 ] && [ "$pick" = NONE ] && [ "$round" -lt "$FREE_ROUNDS" ] && [ -n "$(not_in "$noretry" "$pool")" ]; then
+          round=$((round + 1)); tried="$noretry"
           echo "dcq[$id] 免費層第 ${round} 輪重試" >&2; continue
         fi
         # 免費輪次用完，或免費模型全在冷卻 → 先把免費的層用完：懲罰層（免費累犯）→ 兜底層，
@@ -671,6 +712,10 @@ run_job() {
         if [ "$tail" = 0 ] && [ -n "$tail_pool" ]; then
           tail=1; paid=1; pool="$tail_pool"; tried=""
           echo "dcq[$id] 免費層用盡（${pick%% *}），fallback 兜底層：${tail_pool}" >&2; continue
+        fi
+        if [ "$zero" = 0 ] && [ -n "$zero_pool" ]; then
+          zero=1; paid=1; pool="$zero_pool"; tried=""
+          echo "dcq[$id] 兜底層用盡（${pick%% *}），fallback 冷宮（0 PASS 的免費模型）：${zero_pool}" >&2; continue
         fi
         if [ "$sub" = 0 ] && [ -n "$paid_pool" ]; then
           sub=1; paid=1; pool="$paid_pool"; tried=""; echo 'PAID=1' >> "$jobfile"
@@ -689,7 +734,7 @@ run_job() {
     set -- $(watch_oc "$id" "$model" "$task" "$cwd" "$t0" "$paid"); rc=$1; why=$2
     rmdir "$slot" ${pslot:+"$pslot"} 2>/dev/null
     # 有跑到驗收的嘗試數：0＝全池都死在上游／卡住，沒有模型真的交件（呼叫端據此分基礎設施失敗與驗收失敗）
-    grep -q '^dc: 驗收 → ' "$Q/logs/$id.$(fk "$model").out" 2>/dev/null && vr=$((vr + 1))
+    ran=0; grep -q '^dc: 驗收 → ' "$Q/logs/$id.$(fk "$model").out" 2>/dev/null && { vr=$((vr + 1)); ran=1; }
     [ -e "$Q/.cancel/$id" ] && { rc=130; break; }
     case "$why:$rc" in
       exit:0) reset_fail "$model"
@@ -705,7 +750,7 @@ run_job() {
          rc=124; break ;;
       upstream:*) rc=124; cool_upstream "$model"
          echo "dcq[$id] $model upstream，換下一個模型" >&2 ;;
-      stall:*|slow:*|spin:*) rc=124; bump_fail "$model"
+      stall:*|slow:*|spin:*) rc=124; bump_fail "$model"; noretry="$noretry $model"
          echo "dcq[$id] $model ${why}，冷卻計數＋1，換下一個模型" >&2 ;;
       exit:2) echo "dcq[$id] FATAL rc=2（工單契約錯，不重試）" >&2
          break ;;
@@ -721,9 +766,11 @@ run_job() {
             break
           fi
           bump_fail "$model"
-          echo "dcq[$id] 上游失敗 rc=${rc}，換下一個模型" >&2
+          # dc 驗收未過也回 rc=1：有跑到驗收＝模型真的交過件，第 2 輪不再給它
+          if [ "$ran" = 1 ]; then noretry="$noretry $model"; echo "dcq[$id] 驗收未過 rc=${rc}，換下一個模型" >&2
+          else echo "dcq[$id] 上游失敗 rc=${rc}，換下一個模型" >&2; fi
           prevsig=$sig prevmodel=$model ;;
-      *) echo "dcq[$id] 驗收未過 rc=${rc}，換下一個模型" >&2 ;;
+      *) noretry="$noretry $model"; echo "dcq[$id] 驗收未過 rc=${rc}，換下一個模型" >&2 ;;
     esac
     # 飽和停損（借鏡 /research「兩次無新證據即關閉缺口」）：模型真的跑了（slow／spin／驗收未過）
     # 但 cwd 跟上一次嘗試結束時一模一樣，連續 SAT 次就停，不再換模型燒時間。上游失敗不算。
@@ -982,7 +1029,7 @@ cmd_status() {
   }
   echo "--- models ---"
   local m left busy
-  for m in $MODELS $POOL_PAID ${POOL_PEN:-} $POOL_TAIL $POOL_API; do
+  for m in $MODELS $POOL_PAID ${POOL_PEN:-} $POOL_TAIL ${POOL_ZERO:-} $POOL_API; do
     left=$(cool_left "$m"); busy=$(ls -1d "$Q/.inuse/$(fk "$m")".* 2>/dev/null | wc -l | tr -d ' ')
     printf '  %-32s busy=%s/%s %s\n' "$m" "$busy" "$MODEL_MAX" "$([ "$left" -gt 0 ] && echo "cooling ${left}s" || echo ok)"
   done
@@ -1042,7 +1089,7 @@ case "${1:-}" in
   start)  shift; [ "${1:-}" = "-j" ] && { JOBS="$2"; shift 2; }; cmd_start ;;
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
-  rank)   shift; rank_free "${MODELS_MANUAL:-$MODELS}" table "${1:-}"; echo "名單同步：${SYNC_NOTE:-無變動}"; echo "兜底層：$POOL_TAIL"; echo "訂閱層：$POOL_PAID"; echo "API 層：${POOL_API:-（關，DCQ_ALLOW_API=1 才開）}"; echo "hard 不派：${EASY_ONLY:-無}"; echo "provider 上限：${PROV_MAX:-無}" ;;
+  rank)   shift; rank_free "${MODELS_MANUAL:-$MODELS}" table "${1:-}"; echo "名單同步：${SYNC_NOTE:-無變動}"; echo "兜底層：$POOL_TAIL"; echo "訂閱層：$POOL_PAID"; echo "API 層：${POOL_API:-（關，DCQ_ALLOW_API=1 才開）}"; echo "hard 不派：${EASY_ONLY:-無}"; echo "mid 不派：${EASY_STRICT:-無}"; echo "provider 上限：${PROV_MAX:-無}" ;;
   sync-catalog) shift; SYNC_ADD_ZEN="$SYNC_ADD_ZEN" SYNC_ADD_SUB="$SYNC_ADD_SUB" SYNC_ADD_GOFREE="$SYNC_ADD_GOFREE" SYNC_RM="$SYNC_RM" \
                 python3 "$(dirname "$(readlink -f "$0")")/catalog-sync" "$CAT/models.tsv" "$@" ;;
   cancel) shift; cmd_cancel "$@" ;;
@@ -1075,8 +1122,9 @@ case "${1:-}" in
                      設空字串＝不用）
   DCQ_ALLOW_API      1＝訂閱層後再接 API 層（清冊 billing=api 有 dc_id 的列，或 DCQ_POOL_API）；預設 0
   DCQ_TIER           dcq add 沒給難度時用這個，不跑 triage
-  DCQ_ORDER          層級順序，入列時記進工單：free＝只用免費（派drf）、default＝免費優先、全敗升訂閱（派dr，未設時的預設）、sub＝訂閱優先（派drs）
+  DCQ_ORDER          層級順序，入列時記進工單：free＝只用免費（派of）、default＝免費優先、全敗升訂閱（派o，未設時的預設）、sub＝訂閱優先（派os）
   DCQ_EASY_ONLY      hard 工單不派的模型（預設＝清冊 fit=easy）
+  DCQ_EASY_STRICT    mid／hard 都不派的模型（預設＝清冊 fit=easy-only）
   DCQ_PROV_MAX       per-provider 併發上限，如 "zen=2 omniroute=3"（預設讀 providers.tsv）
   DCQ_FREE_ROUNDS    免費層整輪重試幾輪才升級訂閱層（預設 2）
   DCQ_MODEL_MAX      單一模型同時最多幾張（預設 3），滿了分給下一隻

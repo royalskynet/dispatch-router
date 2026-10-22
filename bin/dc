@@ -177,8 +177,10 @@ fi
 # Zen 免費閘道判濫用（2026-10-18：opencode 蒸餾攻擊事件後收緊）：被判一次就整個 Zen 免費池停用
 # ZEN_GATE_S，所有佇列共用（同一個出口 IP）。被擋後換模型連打正是濫用特徵，故不換 Zen 模型重試。
 # 10-18 起另一種措辭：IP 判濫用（"detected abusive traffic from this IP address"），連官方客戶端也擋。
+# 10-18 第三種：FreeTierError（"free tier can only be used from within OpenCode"），官方客戶端整個 IP 一起中（fix 10685）。
+# 以前不認，被擋期間 dc 照打：10-18 19 時一小時 74 次請求全 403，正是「被擋後換模型連打」。
 # 只認 opencode 自己的錯誤行（level=ERROR log／終端 Error:），模型輸出的原始碼或文件不算；首字母 [] 防本行比中自己。
-ABUSE_RE='(level=ERROR|Error: ).*([D]etect Abuse Traffic|[d]etected abusive traffic)'
+ABUSE_RE='(level=ERROR|Error: ).*([D]etect Abuse Traffic|[d]etected abusive traffic|[f]ree tier can only be used from within OpenCode)'
 ZEN_GATE="${DC_ZEN_GATE:-$HOME/.dcq/.zen-gate}"
 ZEN_GATE_S="${DC_ZEN_GATE_S:-21600}"
 # 10-19：閘有兩份（本檔與 Jev 的 zen-free-status.json），讀寫一律經 zen-gate 取聯集，見該檔頭

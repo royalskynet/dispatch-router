@@ -6,6 +6,7 @@ set -u
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘（10-19：Jev 閘封鎖時這些測試全掛）
 export DCQ_HOME="$T/q"; mkdir -p "$DCQ_HOME/logs"
+export DCQ_RANK_PRIOR_K=0   # 下面 1)–9) 驗原始 s/pass 規則；平滑另在 10) 驗
 G="$DCQ_HOME/logs/gaps.tsv"; D="$(date +%F)_00:00:00"
 row() { printf '%s\t%s\t10\t%s\t%s\n' "$D" "$1" "$2" "$3" >> "$G"; }
 rep() { local i; for i in $(seq "$1"); do row "$2" "$3" "$4"; done; }
@@ -39,11 +40,11 @@ wk="$(date -v-5d +%F_%T 2>/dev/null || date -d '-5 days' +%F_%T)"   # 週探測�
 : > "$P"; printf '%s\topencode\ty\tTIMEOUT\t60\n' "$wk" > "$P"
 got="$(DCQ_MODELS= DCQ_POOL_ZEN="y a" DCQ_POOL_GO="" dcq rank | sed -n 's/^順序：//p')"
 [ "$got" = "a y" ] || { echo "FAIL weekly probe: got [$got] want [a y]"; fail=1; }
-# 5) 假釋：累犯最近一筆 >7 天 → 回免費層 manual；7 天內 → 留懲罰層
+# 5) 假釋：累犯最近一筆 >7 天 → 回免費層 manual；7 天內 → 留冷宮（0 PASS，2026-10-22 起不放懲罰層）
 : > "$P"; old="$(date -v-10d +%F 2>/dev/null || date -d '-10 days' +%F)_00:00:00"
 for i in 1 2 3; do printf '%s\th\t10\t1\texit\n' "$old" >> "$G"; printf '%s\tk\t10\t1\texit\n' "$D" >> "$G"; done
 out="$(DCQ_MODELS= DCQ_POOL_ZEN="h k a" DCQ_POOL_GO="" dcq rank)"
-got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"; pen="$(printf '%s\n' "$out" | sed -n 's/^懲罰層（免費層之後）：//p')"
+got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"; pen="$(printf '%s\n' "$out" | sed -n 's/^冷宮（兜底層之後、訂閱層之前）：//p')"
 [ "$got" = "h a" ] && [ "$pen" = "k" ] || { echo "FAIL parole: got [$got | $pen] want [h a | k]"; fail=1; }
 # 6) 合格（ranked）但探測掛掉的模型：只能出現一次、排最後，不得佔走另一隻合格者的位置
 #    （2026-10-13 實例：nemotron probe-down 又留在 ranked 名單，順序變 "nemotron mimo ling nemotron"，93% 的 space-bunny 消失）
@@ -98,8 +99,8 @@ got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_GO="" DCQ_POOL_PAID="opencode-go/g1
 # 10) 上游不回：why=upstream 不算模型樣本（5 筆 upstream 不觸發 0 PASS 短路）；5 筆 stall 照樣觸發
 : > "$G"; rep 5 u 124 upstream; rep 5 s 124 stall
 out="$(DCQ_MODELS= DCQ_POOL_ZEN="u s a" DCQ_POOL_GO="" dcq rank)"
-pen="$(printf '%s\n' "$out" | sed -n 's/^懲罰層（免費層之後）：//p')"
-[ "$pen" = "s" ] || { echo "FAIL upstream counted as model fault: pen=[$pen] want [s]"; fail=1; }
+pen="$(printf '%s\n' "$out" | sed -n 's/^冷宮（兜底層之後、訂閱層之前）：//p')"
+[ "$pen" = "s" ] || { echo "FAIL upstream counted as model fault: zero=[$pen] want [s]"; fail=1; }
 # 11) zero_output 分類：全 0 輸出且無 part＝上游不回；有工具 part 或有輸出＝模型卡住
 eval "$(sed -n '/^zero_output()/,/^}/p' "$(command -v dcq)")"
 printf '{"messages":[{"info":{"role":"user"},"parts":[{"type":"text"}]},{"info":{"role":"assistant","tokens":{"output":0}},"parts":[]}]}' > "$T/z1.json"
@@ -139,5 +140,33 @@ got="$(DCQ_MODELS= DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="x/slow x/fast" DCQ_POOL_PAID=
 # DCQ_MODELS 有設 → 不排序（照 DCQ_POOL_TAIL 原順序）
 got="$(DCQ_MODELS="m1" DCQ_POOL_ZEN="a" DCQ_POOL_TAIL="$T1" DCQ_POOL_PAID="" dcq rank | sed -n 's/^兜底層：//p')"
 [ "$got" = "$T1" ] || { echo "FAIL tail DCQ_MODELS: got [$got] want [$T1]"; fail=1; }
+# 12) 2026-10-22 智慧加權：貝氏平滑＋0 PASS 進冷宮＋探測過時＋Go 免費併入主免費層
+#  拿掉任一項修正，這段都會 FAIL：
+#  - 平滑：gb 4 跑 3 過、每張 60s（原始 80 s/pass）vs mm 30 跑 17 過、每張 300s（原始 529）；樣本不足時舊版 gb 留手排位置
+#  - 冷宮：zz 4 跑 0 過不得出現在懲罰層
+#  - 探測過時：dd 探測 down，但探測之後有 PASS → 不得被當 probe-down 排到最後
+: > "$G"; : > "$P"
+old2="$(date -v-2d +%F 2>/dev/null || date -d '-2 days' +%F)_00:00:00"
+printf '%s\topencode\tdd\tTIMEOUT\t60\n' "$old2" > "$P"
+for i in $(seq 17); do rowd mm 0 300; done; for i in $(seq 13); do printf '%s\tmm\t200\t143\tstall\t300\n' "$D" >> "$G"; done
+for i in 1 2 3; do rowd opencode-go/gb-free 0 60; done; rowd opencode-go/gb-free 1 60
+for i in 1 2 3 4; do rowd zz 1 200; done
+for i in 1 2 3; do rowd dd 0 150; done; rowd dd 1 150
+CAT2="$T/cat2"; mkdir -p "$CAT2"
+printf 'free\topencode-run\topencode/mm\tok\t-\t-\tmm\tany\nfree\topencode-run\topencode/zz\tok\t-\t-\tzz\tany\nfree\topencode-run\topencode/dd\tok\t-\t-\tdd\tany\nfree\topencode-run\topencode-go/gb-free\tok\t-\t-\topencode-go/gb-free\tany\nfree\tomniroute\tor\tok\t-\t-\tx/or\teasy-only\n' > "$CAT2/models.tsv"
+out="$(env -u DCQ_POOL_ZEN -u DCQ_POOL_TAIL DCQ_RANK_PRIOR_K=2 DCQ_CATALOG="$CAT2" DCQ_MODELS= DCQ_POOL_GO="" DCQ_POOL_PAID="" dcq rank)"
+got="$(printf '%s\n' "$out" | sed -n 's/^順序：//p')"
+zero="$(printf '%s\n' "$out" | sed -n 's/^冷宮（兜底層之後、訂閱層之前）：//p')"
+pen="$(printf '%s\n' "$out" | sed -n 's/^懲罰層（免費層之後）：//p')"
+tailx="$(printf '%s\n' "$out" | sed -n 's/^兜底層：//p')"
+[ "$got" = "opencode-go/gb-free dd" ] || { echo "FAIL smooth/gofree order: got [$got] want [opencode-go/gb-free dd]"; fail=1; }
+[ "$zero" = "zz" ] || { echo "FAIL zero pool: got [$zero] want [zz]"; fail=1; }
+[ "$pen" = "mm" ] || { echo "FAIL pen keeps demoted only: got [$pen] want [mm]"; fail=1; }
+[ "$tailx" = "x/or" ] || { echo "FAIL tail after gofree move: got [$tailx] want [x/or]"; fail=1; }
+printf '%s\n' "$out" | grep -q '^dd .* stale ' || { echo "FAIL stale probe tag: $(printf '%s\n' "$out" | grep '^dd ')"; fail=1; }
+printf '%s\n' "$out" | grep -q '^mid 不派：x/or$' || { echo "FAIL easy-only: $(printf '%s\n' "$out" | grep '不派')"; fail=1; }
+# DCQ_GOFREE_MAIN=0 → Go 免費留在兜底層
+tailx="$(env -u DCQ_POOL_ZEN -u DCQ_POOL_TAIL DCQ_GOFREE_MAIN=0 DCQ_RANK_PRIOR_K=2 DCQ_CATALOG="$CAT2" DCQ_MODELS= DCQ_POOL_GO="" DCQ_POOL_PAID="" dcq rank | sed -n 's/^兜底層：//p')"
+[ "$tailx" = "opencode-go/gb-free x/or" ] || { echo "FAIL GOFREE_MAIN=0: got [$tailx]"; fail=1; }
 [ "$fail" = 0 ] && echo PASS
 exit "$fail"

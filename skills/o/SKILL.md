@@ -1,11 +1,11 @@
 ---
-name: dr
-description: 派工給 opencode 執行人（走 opencode 客戶端，免認證、無 Anthropic 協定牆、可用整個 Zen 免費池、非免費模型發 TG 警示）：主 session 給計畫或一句任務＋一條驗收，dc 派工後由 wo-verify 機械判定成敗，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（自動 cwd 互斥、模型池＋per-model 冷卻、停滯 watchdog）。說「派dr」「派 dr」「派工」「派工 opencode」時用；「派drf」＝只用免費層、「派drs」＝訂閱優先（底層指令是 dc／dcq）；說「派deep」走 deepclaude 的 deep skill，不是這裡。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時改派deep。
+name: o
+description: Orchestrator：把工單派給本機已知的各種 LLM（Zen 免費、opencode-go 訂閱、OmniRoute 轉接的 NIM／OpenRouter 等、付費 API）當執行人，依實測通過率與耗時智慧加權排序、多層 fallback；opencode CLI 當 agent 外殼，完工由 wo-verify 機械判定，exit code 反映驗收結果而非模型自述；多張工單用 dcq 併發跑（cwd 互斥、per-model 冷卻、停滯 watchdog），非免費模型發 TG 警示。說「派o」「派 o」「派工」時用；「派of」＝只用免費層、「派os」＝訂閱優先（底層指令是 dc／dcq；舊稱派dr／派drf／派drs 同義）；說「派deep」走 deepclaude 的 deep skill，不是這裡。需要沙箱外寫入、GH_TOKEN 或獨立 config 的由主 session 直接做，需 agent 多步自主時改派deep。
 ---
 
-# dc = opencode 執行人（免費優先、訂閱墊底），完成定義＝wo-verify 通過
+# Orchestrator（dc／dcq）＝多 LLM 執行人調度（免費優先、訂閱墊底），完成定義＝wo-verify 通過
 
-**預設派工執行人**（觸發詞「派dr」）。deepclaude 的「派deep」是另一條線，只補 dc 做不到、又需要 agent 多步自主的場景。dc 走 opencode 客戶端路徑，**免認證即可用**，且沒有 Anthropic 協定牆（整個 Zen 免費池都能用）。
+**預設派工執行人**（觸發詞「派o」）。deepclaude 的「派deep」是另一條線，只補 dc 做不到、又需要 agent 多步自主的場景。dc 走 opencode 客戶端路徑，**免認證即可用**，且沒有 Anthropic 協定牆（整個 Zen 免費池都能用）。
 
 ## dc 做不到的部分
 
@@ -34,9 +34,9 @@ dc 在派工前跑同一套閘門：`deep-lint` 不過就不派，`wo-verify <ta
 5. **工單寫成冪等。** 斷言寫「已存在就跳過」而非「建立」。重派不會破壞前一輪成果，這是能無腦重試的前提。
 6. **context 放檔案，不放 prompt。** Zen 免費池沒有 prompt caching，每輪重送 context 都是全價重算（Go lane 有，回應帶 `cached_tokens`；但工單大小本來就該由檔案承載）。工單給絕對路徑讓模型自己讀，禁止把檔案內容貼進任務檔。
 
-判斷式：**主 session 預估 5 分鐘內做得完就自己做，超過才派 drf**（2026-10-20 定，dcq 入列到結束 p50≈8 分鐘，fixindex 11066）。超過門檻不必等使用者說派工，主 session 主動提出，照下方「三種派法」直接派（`dcq plan` 輸出附在回報、不等答覆），走 `dr-worker` subagent。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
+判斷式：**主 session 預估 5 分鐘內做得完就自己做，超過才派 of**（2026-10-20 定，dcq 入列到結束 p50≈8 分鐘，fixindex 11066）。超過門檻不必等使用者說派工，主 session 主動提出，照下方「三種派法」直接派（`dcq plan` 輸出附在回報、不等答覆），走 `dr-worker` subagent。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
 
-**單張也走 dcq**：只有 dcq 有模型 fallback 鏈（免費層 autorank → 懲罰層 → 兜底層 → 訂閱層（付費，墊底））與逾時換手。裸 `dc` 只跑一隻模型，掛了就沒救（fix 10299），只在指定模型做實驗時用。
+**單張也走 dcq**：只有 dcq 有模型 fallback 鏈（免費層 autorank（含 opencode-go/*-free）→ 懲罰層 → 兜底層 → 冷宮（0 PASS）→ 訂閱層（付費，墊底））與逾時換手。裸 `dc` 只跑一隻模型，掛了就沒救（fix 10299），只在指定模型做實驗時用。
 
 ## 派工
 
@@ -59,9 +59,9 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 
 | 觸發詞 | 層級順序 | `DCQ_ORDER` |
 |---|---|---|
-| 派dr／派工 | 免費 → 懲罰 → 兜底 → 訂閱 → API（API 預設關） | `default` |
-| 派drf | 只用免費的層；免費全敗就結案失敗，不升級 | `free` |
-| 派drs | 訂閱先，用盡才回免費的層，API 墊底 | `sub` |
+| 派o／派工 | 免費 → 懲罰 → 兜底 → 訂閱 → API（API 預設關） | `default` |
+| 派of | 只用免費的層；免費全敗就結案失敗，不升級 | `free` |
+| 派os | 訂閱先，用盡才回免費的層，API 墊底 | `sub` |
 
 流程固定三步：
 1. 寫好工單後跑 `DCQ_ORDER=<順序> ~/dev/dispatch-router/bin/dcq plan <task.md>...`。它會用本機 Laya 判每張的難度（easy／mid／hard，零 token），印出會走的層和併發上限，不入列。hard 工單會跳過清冊 `fit=easy` 的模型。
@@ -72,7 +72,7 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 
 ## Zen 與 Go 分清楚（2026-10-20 使用者定，fixindex 11041）
 
-派dr 的順序照上表：免費 → 訂閱 → 付費（API）。這節只管呼叫方式，判準是**端點／前綴，不是模型名**。
+派o 的順序照上表：免費 → 訂閱 → 付費（API）。這節只管呼叫方式，判準是**端點／前綴，不是模型名**。
 
 | 前綴 | 端點 | 能不能走 API |
 |---|---|---|

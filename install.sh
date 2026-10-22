@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 把 dispatch-router 裝到使用者路徑。無 admin 需求，全部 user-level。
+# 把 Orchestrator 裝到使用者路徑。無 admin 需求，全部 user-level。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -14,16 +14,16 @@ ln -sfn "$REPO/bin/wo-verify" ~/.local/bin/wo-verify
 # 週探測（oc-free-check／go-sync／launchd）是選配，在 oc-probe/，由 oc-probe/install.sh 裝；
 # dcq rank 照讀 ~/.dcq/logs/probe.tsv，沒裝就沒有探測資料。
 
-# ~/.claude/skills/dr：若已是實體目錄（非 symlink），先備份進 repo 再連結
-if [ -d ~/.claude/skills/dr ] && [ ! -L ~/.claude/skills/dr ]; then
+# ~/.claude/skills/o：若已是實體目錄（非 symlink），先備份進 repo 再連結
+if [ -d ~/.claude/skills/o ] && [ ! -L ~/.claude/skills/o ]; then
   mkdir -p "$REPO/.bak"
-  mv ~/.claude/skills/dr "$REPO/.bak/dr-$(date +%Y%m%d-%H%M%S)"
+  mv ~/.claude/skills/o "$REPO/.bak/o-$(date +%Y%m%d-%H%M%S)"
 fi
-ln -sfn "$REPO/skills/dr" ~/.claude/skills/dr
+ln -sfn "$REPO/skills/o" ~/.claude/skills/o
 [ -L ~/.claude/skills/dc ] && rm ~/.claude/skills/dc  # 10-16 前舊名
 
 echo "Installed symlinks:"
-for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/zen-gate ~/.local/bin/wo-verify ~/.claude/skills/dr; do
+for t in ~/.local/bin/dc ~/.local/bin/dcq ~/.local/bin/zen-gate ~/.local/bin/wo-verify ~/.claude/skills/o; do
   ls -l "$t"
   [ -e "$t" ] || { echo "DANGLING: $t"; exit 1; }
 done

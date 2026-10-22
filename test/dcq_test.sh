@@ -13,7 +13,7 @@ export DCQ_POLL_S=1
 export DC_ZEN_GATE="$T/zen-gate" JEV_ZEN_STATUS_FILE="$T/jev-zen.json"   # 不讀真的全域閘檔
 # 舊斷言（up1 跑 2 次）假設「免費一輪、無訂閱層」；付費層另在 11)、12) 明確打開
 export DCQ_FREE_ROUNDS=1 DCQ_POOL_PAID="" DCQ_POOL_TAIL=""
-# 本檔測 default 鏈（派dr）；dcq 未設時預設也是 default（10-21 改，原 free 見 fixindex 11106），沒給的預設由 dcq_tier_test 5b 測
+# 本檔測 default 鏈（派o）；dcq 未設時預設也是 default（10-21 改，原 free 見 fixindex 11106），沒給的預設由 dcq_tier_test 5b 測
 export DCQ_ORDER=default
 
 # 假 dc：記下 (cwd, 進出時間, model)，依任務檔名決定 rc
@@ -234,6 +234,17 @@ mk tl1 "$T/wb"
 DCQ_MODELS="m1" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="t/a t/b" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/tail.out" 2>&1
 chk "順序＝免費→懲罰→兜底，兜底過關不碰訂閱" "$(awk '/^IN tl1/{print $4}' "$TRACE" | tr '\n' ' ')" "m1 p/x t/a "
 chk "兜底過關" "$(ls "$DCQ_HOME"/done/ 2>/dev/null | wc -l | tr -d ' ')" "1"
+# 11e) 2026-10-22：第 2 輪只重試上游失敗的；驗收沒過的模型不再跑第二次（wo-r1：minimax 連跑 245s＋1021s）
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk vf2 "$T/wb"
+DCQ_MODELS="m1 m2" DCQ_POOL_PAID="go/px" DCQ_FREE_ROUNDS=2 DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/vf2.out" 2>&1
+chk "驗收沒過的不進第 2 輪" "$(grep -c '^IN vf2 .* m[12] ' "$TRACE")" "2"
+chk "沒印第 2 輪重試" "$(grep -c '免費層第 2 輪重試' "$T/vf2.out")" "0"
+# 11f) 冷宮（0 PASS 的免費模型）排在兜底層之後、訂閱層之前（2026-10-22 使用者定）
+dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
+mk tl3 "$T/wb"
+DCQ_MODELS="m1" DCQ_POOL_PAID="go/px" DCQ_POOL_PEN="p/x" DCQ_POOL_TAIL="n/a" DCQ_POOL_ZERO="z/a" DCQ_ALLOWED_FAILS=99 dcq run -j 1 >"$T/zero.out" 2>&1
+chk "順序＝免費→懲罰→兜底→冷宮→訂閱" "$(awk '/^IN tl3/{print $4}' "$TRACE" | tr '\n' ' ')" "m1 p/x n/a z/a go/px "
 # 11d) Zen 判濫用閘檔有效：無前綴模型（Zen 免費）一隻都不送，直接懲罰→兜底
 dcq clear >/dev/null; rm -rf "$DCQ_HOME/.health"/*; : > "$TRACE"
 echo $(( $(date +%s) + 600 )) > "$DC_ZEN_GATE"

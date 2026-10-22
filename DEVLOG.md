@@ -1,5 +1,25 @@
 # DEVLOG
 
+## 2026-10-22：改名 Orchestrator，觸發詞派o／派of／派os
+
+- **定位**：模型來源早已不限 opencode（Zen 免費、opencode-go 訂閱、OmniRoute 轉接的 NIM／OpenRouter、付費 API 都在 `catalog/models.tsv`），opencode CLI 只當 agent 外殼。README 中英說明改寫成「多 LLM 依實績智慧調配」。
+- **改名**：公開 repo `royalskynet/dispatch-router` → `royalskynet/orchestrator`（GitHub 舊網址自動轉址）。本機路徑 `~/dev/dispatch-router` 與 ether-projects 子目錄不動，避免 launchd、symlink、subtree 歷史斷掉。
+- **觸發詞**：派dr→派o、派drf→派of、派drs→派os；skill `dr`→`o`（`~/.claude/skills/o`）。路由 regex 只認單字 o／of／os，不吃 opus、openai；舊稱派dr 保留為別名。底層 `dc`／`dcq` 不變。
+
+## 2026-10-22：免費層智慧加權、冷宮、FreeTierError 閘
+
+- **起因**：10-21 晚 wo-r1／r8／r9 免費層各卡 20–40 分鐘撞 `JOB_MAX` 2700s。卡在單一模型跑太久＋排序，不是併發（gaps.tsv 221 筆：同模型同時 0 張過關率 12%，1–2 張 41–54%）。
+- **智慧加權**（257419e）：`rank_free` 的每 PASS 秒數加貝氏先驗，`est=(總秒數+K·全池平均秒數)/(PASS+K·全池通過率)`，`DCQ_RANK_PRIOR_K=2`。小樣本往全池平均拉，manual 與 ranked 合排。借鏡 LiteLLM latency-based routing 與 Beta-Bernoulli 先驗；Thompson sampling 等樣本夠再上。
+- **冷宮**：0 PASS（zero）移出懲罰層，排兜底層之後、訂閱層之前。以前 8 隻懲罰層有 5 隻 0 PASS，每隻白等 200–600s，擋住兜底層最好的 `opencode-go/beam-free`。
+- **Go 免費併入主免費層**：`opencode-go/*-free` 走 Go key，跟 Zen 的 per-IP 閘分開，免費併發 zen=2＋opencode-go=4。`DCQ_GOFREE_MAIN=0` 關。mid 工單第一棒變 `go/beam-free`（7/7）。
+- **第 2 輪只重試上游失敗的**：dc 驗收未過也回 rc=1，跟上游失敗同碼；改看 `.out` 有沒有 `dc: 驗收 →`。實例：wo-r1 同一隻 minimax 連跑 245s＋1021s。
+- **`fit=easy-only`**：mid／hard 都不派。`omniroute/or-free` 23 跑 1 過、失敗白等 11262s。
+- **探測過時**：探測批次早於某隻最近一次 PASS 標 `stale`，不當 down（10-19 06:00 整池 403 那批）。清冊 status 依 gaps.tsv 重設。
+- **FreeTierError 閘**（090ad3e）：`ABUSE_RE` 補 "free tier can only be used from within OpenCode"。10-18 整個 IP 中這句，dc 只認 abusive 措辭，19 時一小時照送 74 次全 403。
+- **官方規則核對**：Zen 免費只能經 opencode 客戶端；deny read／bash、自訂 zen baseURL、舊式 `tools:{bash:false}` 會被判非正版（anomalyco/opencode#56324、#56702）。dc 設定合規。速率與濫用判定按 IP（#43786），官方無併發上限，`zen=2` 維持。
+- **Jev 與 Zen 403 無關**：本機第一筆 403 10-18 10:15（opencode 客戶端），Jev 12:41 才中；封鎖前 Jev 每小時 1 次；上游 #56324 10-17 開單 69 留言。細節 fixindex 11236、11240。
+- **測試**：`dcq_rank_test` 12)、`dcq_test` 11e／11f、`dcq_tier_test` 4b、`dc_upstream_test` FreeTierError；11e 與 FreeTierError 改前都 FAIL。全套 15 支 0 失敗。
+
 ## 2026-10-21：慢測試不誤殺、Zen 閘退避、重試只驗一次、推播閘
 
 - **慢測試誤殺**（80184d1）：opencode bash 工具內建 120s 逾時，模型自己跑的慢測試先被砍，再被 watchdog 判 slow／spin 換模型。`dc` 設 `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=300000`；dcq 的 `oc_busy` 看到 opencode 底下有工具子程序就不計停滯與防空轉。

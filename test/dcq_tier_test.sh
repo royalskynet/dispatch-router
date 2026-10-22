@@ -60,9 +60,9 @@ awk -F'\t' '$2=="omniroute/t1" && $7=="hard"' "$DCQ_HOME/logs/gaps.tsv" | grep -
 # 4b) zb 只在 hard 連 3 次 0 PASS：hard 排名降級，easy 不受影響
 : > "$DCQ_HOME/logs/gaps.tsv"
 for i in 1 2 3; do printf '%s\tzb\t1\t1\texit\t5\thard\n' "$(date +%F_%T)" >> "$DCQ_HOME/logs/gaps.tsv"; done
-dcq rank hard 2>&1 | grep -q '^懲罰層（免費層之後）：zb$' && ok "hard 排名把 zb 降到懲罰層" || bad "hard 排名：$(dcq rank hard 2>&1 | grep 懲罰)"
+dcq rank hard 2>&1 | grep -q '^冷宮（兜底層之後、訂閱層之前）：zb$' && ok "hard 排名把 zb（0 PASS）降到冷宮" || bad "hard 排名：$(dcq rank hard 2>&1 | grep 冷宮)"
 dcq rank easy 2>&1 | grep -q '^懲罰層（免費層之後）：$' && ok "easy 排名不吃 hard 的紀錄" || bad "easy 排名：$(dcq rank easy 2>&1 | grep 懲罰)"
-dcq rank 2>&1 | grep -q '^懲罰層（免費層之後）：zb$' && ok "不分難度時照舊全算" || bad "不分難度：$(dcq rank 2>&1 | grep 懲罰)"
+dcq rank 2>&1 | grep -q '^冷宮（兜底層之後、訂閱層之前）：zb$' && ok "不分難度時照舊全算" || bad "不分難度：$(dcq rank 2>&1 | grep 冷宮)"
 : > "$DCQ_HOME/logs/gaps.tsv"
 
 # 3) provider 上限：zen=1 時 za／zb 兩張不同 cwd 工單不重疊；不設上限時會重疊（證明這個斷言抓得到）
@@ -89,7 +89,7 @@ id="$(dcq add "$T/tasks/m1.md" "$T/w1" 2>/dev/null)"; grep -qx 'TIER=mid' "$DCQ_
 dcq add "$T/tasks/m1.md" "$T/w1" huge >/dev/null 2>&1; [ $? = 2 ] && ok "亂給難度拒收 rc=2" || bad "亂給難度沒拒收"
 [ "$(JEV_GATE_DIR="$T/nope" "$R/bin/triage" "$T/tasks/m1.md")" = mid ] && ok "triage 找不到 jev-gate 印 mid" || bad "triage fail-open 不對"
 
-# 5b) 層級順序：drf 只用免費、drs 訂閱先、派dr 預設免費先；plan 與實跑一致
+# 5b) 層級順序：of 只用免費、os 訂閱先、派o 預設免費先；plan 與實跑一致
 : > "$TRACE"; dcq clear >/dev/null 2>&1
 for n in of os od; do echo "# $n" > "$T/tasks/$n.md"; done
 # 免費池只放必敗的 za、關掉兜底層，看各順序走到哪一層
@@ -97,13 +97,13 @@ export DCQ_POOL_ZEN="za" DCQ_POOL_TAIL=""
 DCQ_ORDER=free dcq add "$T/tasks/of.md" "$T/w1" mid >/dev/null 2>&1
 DCQ_ORDER=sub  dcq add "$T/tasks/os.md" "$T/w2" mid >/dev/null 2>&1
 DCQ_AUTORANK=0 DCQ_ALLOWED_FAILS=9 dcq run -j 2 >/dev/null 2>&1
-if grep -q '^IN of opencode-go/' "$TRACE"; then bad "drf 用到了訂閱層"; else ok "drf 不碰訂閱層"; fi
-ls "$DCQ_HOME/failed" | grep -q 'of' && ok "drf 免費全敗就結案失敗" || bad "drf 沒進 failed"
-[ "$(grep '^IN os ' "$TRACE" | head -1 | awk '{print $3}')" = opencode-go/g1 ] && ok "drs 第一棒是訂閱層" || bad "drs 第一棒：$(grep '^IN os ' "$TRACE" | head -1)"
+if grep -q '^IN of opencode-go/' "$TRACE"; then bad "of 用到了訂閱層"; else ok "of 不碰訂閱層"; fi
+ls "$DCQ_HOME/failed" | grep -q 'of' && ok "of 免費全敗就結案失敗" || bad "of 沒進 failed"
+[ "$(grep '^IN os ' "$TRACE" | head -1 | awk '{print $3}')" = opencode-go/g1 ] && ok "os 第一棒是訂閱層" || bad "os 第一棒：$(grep '^IN os ' "$TRACE" | head -1)"
 DCQ_ORDER=default dcq add "$T/tasks/od.md" "$T/w1" mid >/dev/null 2>&1; : > "$TRACE"
 DCQ_AUTORANK=0 DCQ_ALLOWED_FAILS=9 dcq run -j 1 >/dev/null 2>&1
-[ "$(grep '^IN od ' "$TRACE" | awk '{print $3}' | tr '\n' ' ')" = "za opencode-go/g1 " ] && ok "派dr 免費先、訂閱後" || bad "派dr 順序：$(grep '^IN od ' "$TRACE")"
-# 呼叫端漏帶 DCQ_ORDER＝派dr（default），免費全敗可升訂閱層（10-21 使用者定，取代 10-20 的 drf 預設）
+[ "$(grep '^IN od ' "$TRACE" | awk '{print $3}' | tr '\n' ' ')" = "za opencode-go/g1 " ] && ok "派o 免費先、訂閱後" || bad "派o 順序：$(grep '^IN od ' "$TRACE")"
+# 呼叫端漏帶 DCQ_ORDER＝派o（default），免費全敗可升訂閱層（10-21 使用者定，取代 10-20 的 of 預設）
 echo "# on" > "$T/tasks/on.md"
 id="$(env -u DCQ_ORDER dcq add "$T/tasks/on.md" "$T/w1" mid 2>/dev/null)"
 grep -qx 'ORDER=default' "$DCQ_HOME/pending/$id.job" && ok "沒給 DCQ_ORDER 記 default" || bad "沒給 DCQ_ORDER 記成：$(grep ORDER "$DCQ_HOME/pending/$id.job")"

@@ -27,6 +27,7 @@ case "$FAKE" in
   ratelimit) echo '> build · x'; echo "$e Rate limit exceeded\""; sleep 30 ;;
   abuse)    : > "$T/called"; echo '> build · x'; echo "$e Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic\""; sleep 30 ;;
   abuse2)   echo '> build · x'; echo "Error: OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address."; sleep 30 ;;
+  freetier) echo '> build · x'; echo "$e OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.\""; sleep 30 ;;
   ok)       : > "$T/called"; echo '> build · x'; echo done ;;
   selfcat)  echo '> build · x'; cat "$DCSRC"; echo done ;;
   hang)     sleep 30 ;;
@@ -75,6 +76,10 @@ chk "模型印出 dc 原始碼不寫閘"             "$(cat "$T/zen-gate")" 0
 # 10-18 起的新措辭（IP 判濫用，連官方客戶端也擋）同樣要整池停用
 chk "新措辭判濫用提早結束"                 "$(try 8 '判濫用' FAKE=abuse2)" 1:no:fast:key
 chk "新措辭寫閘檔"                         "$([ "$(cat "$T/zen-gate" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] && echo y)" y
+# 10-22：FreeTierError（10-18 整個 IP 中、dc 照打 74 次）也要整池停用
+echo 0 > "$T/zen-gate"; rm -f "$T/jev-zen.json"
+chk "FreeTierError 判濫用提早結束"         "$(try 8 '判濫用' FAKE=freetier)" 1:no:fast:key
+chk "FreeTierError 寫閘檔"                 "$([ "$(cat "$T/zen-gate" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] && echo y)" y
 # 10-19：閘有兩份（dc 秒／Jev 毫秒＋blocked）。06:00 dc 閘已過期、Jev 閘仍封鎖，dc 系仍照打。
 # 任一份封鎖都要擋；Jev 的額度冷卻（blocked=false）不是 IP 封鎖，不擋。
 echo 0 > "$T/zen-gate"; rm -f "$T/called"

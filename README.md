@@ -1,33 +1,41 @@
-# dispatch-router
+# Orchestrator
 
-`dc` — 把 opencode 當執行人派工的最小封裝。一個任務檔進、機械驗收過的成果出。
+把你手上已知的各種 LLM 當成執行人，依實測表現智慧調配的工單調度器。一個任務檔進、機械驗收過的成果出。
 
-與 [`deep-agent`](https://github.com/royalskynet/deep-agent) 平行：deep 走 deepclaude 在沙箱外跑，dc 走 opencode 客戶端路徑。
+- **模型來源不限 opencode**：Zen 免費池、opencode-go 訂閱、經本機 OmniRoute 轉接的 NIM／OpenRouter 等供應商、付費 API，全部登記在 `catalog/models.tsv`，同一套階梯調度。opencode CLI 只當 agent 外殼（工具呼叫、檔案編輯）。
+- **智慧加權**：每隻模型依 `gaps.tsv` 實績算「平均幾秒換到一次通過」，加貝氏平滑（樣本少的先拉向全池平均），層內自動重排。0 PASS 的進冷宮，停滯率高的進懲罰層。
+- **多層 fallback**：免費 → 懲罰 → 兜底 → 冷宮 → 訂閱 → API（API 預設關）。觸發詞：派o＝免費優先、全敗升訂閱；派of＝只用免費；派os＝訂閱優先。
+- **完成由腳本判定**：exit code＝工單自帶驗收腳本（`wo-verify`）的結果，不是模型自述。
+- `dc` 派單張，`dcq` 併發跑多張（cwd 互斥、per-model 冷卻、停滯 watchdog、Zen 與 Go 免費額度分開計）。
+
+舊名 dispatch-router（2026-10-22 改名）；底層指令 `dc`／`dcq` 不變。與 [`deep-agent`](https://github.com/royalskynet/deep-agent) 平行：deep 走 deepclaude 在沙箱外跑多步自主任務。
 
 ## Quick install／快速安裝
 
 ```bash
-git clone https://github.com/royalskynet/dispatch-router && cd dispatch-router && ./install.sh
+git clone https://github.com/royalskynet/orchestrator && cd orchestrator && ./install.sh
 ```
 
-需求：macOS、[opencode](https://opencode.ai) CLI。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`zen-gate` 連到 `~/.local/bin`、把 skill 連到 `~/.claude/skills/dr`。
+需求：macOS、[opencode](https://opencode.ai) CLI；選配 [OmniRoute](https://github.com/cheaper-inference/OmniRoute) 接其他供應商。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`zen-gate` 連到 `~/.local/bin`、把 skill 連到 `~/.claude/skills/o`。
 
 ## English
 
-**dispatch-router** wraps [opencode](https://opencode.ai) as a task executor for coding agents: one task file goes in, and the work comes back only when a machine check says it is done.
+**Orchestrator** dispatches work orders to whatever LLMs you already have access to, and picks among them by measured performance. One task file goes in; the work comes back only when a machine check says it is done.
 
+- **Any model you can reach.** Zen free models, opencode-go subscription models, providers routed through a local OmniRoute (NVIDIA NIM, OpenRouter, and others), and paid APIs are all listed in `catalog/models.tsv` and scheduled by the same ladder. The opencode CLI is used only as the agent harness (tool calls, file edits).
+- **Weighted ranking.** Each model is scored by expected seconds per pass from its own run history (`gaps.tsv`), with a Bayesian prior that pulls low-sample models toward the pool mean. Models with zero passes move to a cold tier; models that stall often move to a penalty tier.
+- **Tier ladder.** free → penalty → fallback → cold → subscription → API (API off by default). Order modes: `default` (free first, then subscription), `free` (free only), `sub` (subscription first).
 - `dc <task.md> [cwd]` dispatches one work order. The exit code is the exit code of the task's own acceptance script (`wo-verify`), not the model's claim of success.
 - Before dispatching, a lint gate refuses tasks without a runnable acceptance block, and a do-nothing control run rejects acceptance checks that would pass without any work.
 - The acceptance script is pinned before the run; if the executor edits it, the run is judged as tampering (rc=3). Acceptance is re-run K times (default 2) to catch flaky results.
-- `dcq` runs many work orders in parallel with per-directory locks, a model pool with per-model cooldown, and a stall watchdog.
+- `dcq` runs many work orders in parallel with per-directory locks, a model pool with per-model cooldown, and a stall watchdog. Zen free and Go free concurrency are counted separately.
+- A second round on the free tier retries only models that failed upstream; a model that delivered work and failed acceptance is not retried on the same order.
 - Model billing tiers are checked before each dispatch; paid models still run but trigger a Telegram warning.
 - The watchdog does not kill an attempt while opencode has a tool subprocess running (usually a slow test), and `dc` raises opencode's bash tool timeout from 120 s to 300 s.
-- `zen-gate` handles Zen free-tier IP blocks: the block lasts 6 h for the first 3 consecutive rounds, then doubles each round up to 48 h. When it expires, one half-open probe decides whether to reopen.
-- When a work order is retried on another model, lint and the do-nothing control run are skipped if the first attempt passed them, and the first pinned grader is reused.
-- The fallback and subscription tiers are ranked by seconds per pass, the same way as the free tier.
+- `zen-gate` handles Zen free-tier IP blocks (including `FreeTierError` 403s): the block lasts 6 h for the first 3 consecutive rounds, then doubles each round up to 48 h. When it expires, one half-open probe decides whether to reopen.
 - Telegram pushes fire only when state lives in the default paths (`~/.dcq`, `~/.jevgate`). Tests that point state at a temp directory stay silent unless `DC_PUSH=1`.
 
-Use plain `opencode run` if you only need a model to try something once. dc is for when "done" has to be decided by a script, not by the model.
+Formerly **dispatch-router** (renamed 2026-10-22); the `dc`/`dcq` commands are unchanged. Use plain `opencode run` if you only need a model to try something once.
 
 The rest of this README is in Traditional Chinese.
 
@@ -89,7 +97,7 @@ The rest of this README is in Traditional Chinese.
 ./install.sh
 ```
 
-連結 `~/.local/bin/dc` 與 `~/.claude/skills/dr`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
+連結 `~/.local/bin/dc` 與 `~/.claude/skills/o`（opencode 與 Claude Code 都讀 `~/.claude/skills/`）。
 
 **相依**：`wo-verify`、`deep-lint` 收在本 repo `bin/`，dc 直接用同目錄那份，不需要裝 `deep-agent`／deepclaude。`DC_BIN=<dir>` 只用來覆寫（測試注入假閘）。
 
@@ -244,8 +252,8 @@ dcq 的停滯判定只看 `.out` 有沒有輸出。模型一直講話卻不改�
 
 `catalog/models.tsv` 是本機確實可調用模型的唯一清冊，每列標 `free`（免費）／`sub`（付費訂閱）／`api`（付費 API）。dcq 依清冊組層，順序固定為免費 → 訂閱 → API：
 
-- 免費層：`free` 且 `dc_id` 無斜線（Zen 免費，只能經 `opencode run`）。
-- 兜底層：`free` 且 `dc_id` 有斜線（`omniroute/or-free`）。
+- 免費層：`free` 且 `dc_id` 無斜線（Zen 免費，只能經 `opencode run`），加上 `opencode-go/*-free`（2026-10-22 起，`DCQ_GOFREE_MAIN=0` 關）。
+- 兜底層：其餘 `free` 且 `dc_id` 有斜線（`omniroute/*`）。`fit=easy-only` 的只派 easy 工單（`or-free` 23 跑 1 過）。
 - 訂閱層：`sub`（`opencode-go/*`）。
 - API 層：`api`，`DCQ_ALLOW_API=1` 才接，預設不用。
 
@@ -268,7 +276,7 @@ Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型
 - 半開：閘到期但還有連敗計數時，dcq 把 zen 的併發上限壓到 1，只放一個探測。
 - 探測的請求被上游正常回應（rc=0、沒有濫用字樣）就 `zen-gate ok` 清掉計數。判準是請求成功，不是驗收通過。
 
-層級順序每張工單入列時記下（`DCQ_ORDER`）：`default` 免費優先（派dr）、`free` 只用免費（派drf）、`sub` 訂閱優先（派drs）。`dcq plan <task.md>...` 在派工前印出每張的難度和會走的層，不入列。
+層級順序每張工單入列時記下（`DCQ_ORDER`）：`default` 免費優先（派o）、`free` 只用免費（派of）、`sub` 訂閱優先（派os）。`dcq plan <task.md>...` 在派工前印出每張的難度和會走的層，不入列。
 
 系統一模型（Laya、Jev）只回結構化判斷，不生成文字，另列在 `catalog/judges.tsv`，dcq 不派。
 
@@ -308,8 +316,13 @@ Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型
 - 樣本不足（manual）的位置依探測秒數排
 - 真實工單的「每 PASS 秒數」仍是主排序——探測量得到活著與快慢，量不到寫碼能力
 
-### 懲罰層（累犯排在免費層之後）
+### 懲罰層與冷宮（累犯排在免費層之後）
 
-自動排名判成 `zero`（≥3 筆 0 PASS）或 `demoted`（停滯率 ≥30%）的免費模型，不再留在免費層尾巴，改進 `POOL_PEN`：
-**免費 → 懲罰層 → 兜底層 → 訂閱（opencode-go，付費，2026-10-13 起墊底）**。免費層會重試 `DCQ_FREE_ROUNDS` 輪，累犯留在裡面等於每張工單白等它卡兩次。
-最近一筆樣本超過 `DCQ_RANK_PAROLE_D`（預設 7）天就假釋回免費層重新給機會。`dcq rank` 最後一行列出目前的懲罰層。
+自動排名判成 `demoted`（停滯率 ≥30%）的免費模型進懲罰層 `POOL_PEN`；判成 `zero`（≥3 筆 0 PASS）的進冷宮 `POOL_ZERO`（2026-10-22 起）：
+**免費 → 懲罰層 → 兜底層 → 冷宮 → 訂閱（opencode-go，付費，2026-10-13 起墊底）**。會過但常卡的還值得試；0 PASS 的排在兜底層前面，等於每張工單替它白等 200–600s。
+最近一筆樣本超過 `DCQ_RANK_PAROLE_D`（預設 7）天就假釋回免費層重新給機會。`dcq rank` 列出目前的懲罰層與冷宮。
+
+免費層第 2 輪（`DCQ_FREE_ROUNDS`）只重試上游失敗的模型；已經跑到驗收、或 stall／slow／spin 的，本單不再給第二次（2026-10-22：wo-r1 同一隻 minimax 連跑 245s＋1021s）。
+
+排序分數＝貝氏平滑後的每 PASS 秒數：`(總秒數＋K×全池平均秒數)／(PASS 數＋K×全池通過率)`，`K=DCQ_RANK_PRIOR_K`（預設 2，0＝原始 s/pass）。樣本少的往全池平均拉，所以不必再靠手排位置保護，manual 與 ranked 一起排。借鏡 LiteLLM latency-based routing 與 Beta-Bernoulli 先驗（arXiv 1707.02038）；Thompson sampling 等樣本夠再上。
+探測批次比某隻最近一次 PASS 還舊時，`probe` 欄標 `stale`，不當 down（10-19 整池 403 那批）。
