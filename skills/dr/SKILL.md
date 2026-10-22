@@ -34,7 +34,7 @@ dc 在派工前跑同一套閘門：`deep-lint` 不過就不派，`wo-verify <ta
 5. **工單寫成冪等。** 斷言寫「已存在就跳過」而非「建立」。重派不會破壞前一輪成果，這是能無腦重試的前提。
 6. **context 放檔案，不放 prompt。** Zen 免費池沒有 prompt caching，每輪重送 context 都是全價重算（Go lane 有，回應帶 `cached_tokens`；但工單大小本來就該由檔案承載）。工單給絕對路徑讓模型自己讀，禁止把檔案內容貼進任務檔。
 
-判斷式：**主 session 預估 5 分鐘內做得完就自己做，超過才派 drf**（2026-10-20 定，dcq 入列到結束 p50≈8 分鐘，fixindex 11066）。超過門檻不必等使用者說派工，主 session 主動提出，派前照下方「三種派法」先貼 `dcq plan` 問一次，確認後走 `dr-worker` subagent。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
+判斷式：**主 session 預估 5 分鐘內做得完就自己做，超過才派 drf**（2026-10-20 定，dcq 入列到結束 p50≈8 分鐘，fixindex 11066）。超過門檻不必等使用者說派工，主 session 主動提出，照下方「三種派法」直接派（`dcq plan` 輸出附在回報、不等答覆），走 `dr-worker` subagent。上面三條（單步、冪等、輸入給路徑）是**寫工單的要求，不是派不派的門檻**：不滿足就拆成多張單步 dcq 工單，不是退回主 session。只有需要判斷力（設計取捨、找根因）或碰禁區（見上表）才主 session 自己做。
 
 **單張也走 dcq**：只有 dcq 有模型 fallback 鏈（免費層 autorank → 懲罰層 → 兜底層 → 訂閱層（付費，墊底））與逾時換手。裸 `dc` 只跑一隻模型，掛了就沒救（fix 10299），只在指定模型做實驗時用。
 
@@ -65,8 +65,8 @@ dc <task.md> [cwd] [-- <opencode run 原生旗標>...]
 
 流程固定三步：
 1. 寫好工單後跑 `DCQ_ORDER=<順序> ~/dev/dispatch-router/bin/dcq plan <task.md>...`。它會用本機 Laya 判每張的難度（easy／mid／hard，零 token），印出會走的層和併發上限，不入列。hard 工單會跳過清冊 `fit=easy` 的模型。
-2. 把 plan 的輸出原樣貼給使用者，問一次「這樣派嗎」。這是使用者定的例外：派工前要確認，不適用「全自動不問」。
-3. 確認後，每張跑 `DCQ_ORDER=<順序> dcq add <task.md> <cwd> <plan 判的難度>`，再跑 `dcq start -j N`。難度照 plan 給的值帶進去，入列時不再判第二次。
+2. 把 plan 的輸出原樣附在回報裡，**不問、不等答覆**（2026-10-22 使用者定，取消 10-20 的「問一次」例外）。只有一種情況要問：要開 API 層（`DCQ_ALLOW_API=1`，按量扣錢）。訂閱層是已付定額，不算花錢。
+3. 緊接著每張跑 `DCQ_ORDER=<順序> dcq add <task.md> <cwd> <plan 判的難度>`，再跑 `dcq start -j N`。難度照 plan 給的值帶進去，入列時不再判第二次。
 
 模型池來源是 `catalog/models.tsv`（free／sub／api 標籤），per-provider 併發上限在 `catalog/providers.tsv`。系統一模型（Laya、Jev）在 `catalog/judges.tsv`，只做判斷題，不能派工。
 
