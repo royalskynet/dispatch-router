@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # oc-probe — dr 選配：偵測 opencode 模型清單變化，自動改 dr 的 OC 模型（catalog/models.tsv）。不碰 OmniRoute。
-#   oc-probe        每日 06:00（launchd local.opencode-probe），兩個各自的週閘：
-#                   1. Zen 免費層探測：距上次滿 PROBE_EVERY_D 天（預設 7）且 zen-gate 閘外，才用 opencode run 實打。
-#                   2. go-sync：距上次滿 7 天才抓 Go 上游 /models（零 token，不實打）。
+#   oc-probe        每日 06:00（launchd local.opencode-probe），全部零 token、不實打模型：
+#                   1. dcq rescan：抓 Zen 上游 /models 清單，上下架回灌名單與清冊。
+#                   2. go-sync：距上次滿 7 天才抓 Go 上游 /models。
 #                   之後跑選配 hook（OC_PROBE_HOOK，預設 ~/.config/oc-probe/hook；不存在就略過）。
+#                   2026-10-24 使用者定：不排程實打探測，出錯才處理——dcq 派工撞錯就冷卻／記 .gone、
+#                   查清單決定恢復或下架；新模型由真實派工測，0 PASS 自動進冷宮。實打只剩手動 oc-probe probe。
 #   oc-probe x      每 4 小時（launchd local.opencode-probe.x）：讀 @opencode 新推文；能讀出的改名／上下架記 x-pool.tsv。
 #   oc-probe probe  強制探測一次；oc-probe sync 強制 go-sync 掃一次。
 # 偵測到變化 → dcq sync-catalog 把增刪回寫清冊（無變動不改檔；清冊乾淨才自動 commit）。
@@ -12,7 +14,6 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 LOGD="$HOME/.dcq/logs"
 STAMP="$LOGD/oc-probe.last"
-PROBE_EVERY_D="${PROBE_EVERY_D:-7}"
 DCQ="${DCQ_BIN:-$HERE/../../bin/dcq}"
 mkdir -p "$LOGD"
 
@@ -42,17 +43,8 @@ hook() {
 }
 
 daily() {
-  local last gap rc=0
-  last=$(cat "$STAMP" 2>/dev/null || stat -f %m "$LOGD/probe.tsv" 2>/dev/null || echo 0)
-  gap=$(( $(date +%s) - last ))
-  # 留 1 小時餘裕，06:00:01 寫的 stamp 下週 06:00 才不會差一秒錯過
-  if [ "$gap" -ge $(( PROBE_EVERY_D * 86400 - 3600 )) ]; then
-    # 閘內不探測也不寫 stamp，隔天閘外再補，不讓一次封鎖吃掉整週
-    if zen-gate check >/dev/null 2>&1; then full || rc=$?
-    else echo "oc-probe: 該做週探測，但 Zen 共用閘冷卻中，改明天再試"; fi
-  else
-    echo "oc-probe: 距上次探測 $((gap / 86400)) 天（每 ${PROBE_EVERY_D} 天一次），今天不探測"
-  fi
+  local rc=0
+  "$DCQ" rescan || { echo "oc-probe: dcq rescan 失敗"; rc=1; }
   "$HERE/go-sync" || { echo "oc-probe: go-sync 失敗"; rc=1; }
   hook
   return $rc

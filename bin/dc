@@ -331,7 +331,32 @@ _wt_snap() {
       "$(git -C "$w" status --porcelain 2>/dev/null | _sha1 | cut -c1-12)"
   done
 }
+# 10-23 I3a：dcq worktree 模式下，同批次的 sibling PASS 後會 merge 回主 checkout（主 checkout 的 HEAD 前進），
+# 而主 checkout 是 `worktree list` 的一員、merge 時才持鎖——本張 dc 跑的幾分鐘內被判「改動了其他 worktree」，
+# 10-22 批次 R7／R10／R11 因此誤判 FATAL。dcq 的 commit／merge 一律用 committer=dcq：
+# HEAD 只是 fast-forward 前進、且新增的 commit 全是 dcq 提交、工作樹 status 摘要沒變 → 視為 sibling 合回，不算越界。
+# 模型自己 commit（committer 不是 dcq）或動了工作樹，照舊判越界。
+_wt_benign_advance() {
+  local w="$1" h0="$2" h1="$3" n
+  [ "$h0" != "$h1" ] && [ -n "$h0" ] && [ -n "$h1" ] || return 1
+  git -C "$w" merge-base --is-ancestor "$h0" "$h1" 2>/dev/null || return 1
+  n="$(git -C "$w" log --format=%cn "$h0..$h1" 2>/dev/null | grep -vc '^dcq$')"
+  [ "$n" = 0 ]
+}
 wt_before="$(_wt_snap)"
+
+# --- 範圍斷言（I3，10-23）：工單可選的 `writes: 路徑1, 路徑2`（行首；路徑相對 cwd 或絕對、目錄用 dir/、可用 glob）---
+# 跑完後 git 看得到的改動檔（相對 ${d}）⊆ writes，否則在 log 印 `SCOPE=over`、dcq 把 SCOPE=over 記進 job 檔。
+# 只標記不判 FAIL（使用者定）：驗收照跑、exit code 不變。沒寫 writes 的工單不檢查。
+# ponytail: 只看 git 追蹤得到／未被 ignore 的檔、跑前就髒的檔不算；路徑含空白會誤判。
+_scope_writes() { sed -n -E 's/^[Ww][Rr][Ii][Tt][Ee][Ss][[:space:]]*[:：][[:space:]]*//p' "$f" | head -1 | tr ',，' '  '; }
+_scope_changed() {
+  { git -C "$d" diff --name-only --relative "$scope_head" -- 2>/dev/null; git -C "$d" ls-files -o --exclude-standard 2>/dev/null; } | sort -u
+}
+scope_w="$(_scope_writes)"; scope_head=""; scope_pre=""
+if [ -n "$scope_w" ] && scope_head="$(git -C "$d" rev-parse HEAD 2>/dev/null)"; then
+  scope_pre="$(git -C "$d" status --porcelain 2>/dev/null | sed 's/^...//')"
+else scope_w=""; fi
 
 # 偵測字串首字母加 []：模型 cat 本檔時，這幾行原始碼不可比中自己（10-21 改 dc 的工單誤判濫用）。
 RL_RE='small=false.*([R]ate limit exceeded|[F]reeUsageLimitError)'
@@ -377,15 +402,37 @@ wait "$teepid"
 rc=$(cat "$rcf" 2>/dev/null || echo 1)
 # 比在所有其他判定之前：越界與成敗無關，PASS 的工單一樣可能寫壞別的 worktree。
 # exit 2 讓 dcq 走 FATAL 不重試——換模型重跑只會再污染一次。
-drift="$(_wt_snap | while read -r w rest; do
+drift="$(_wt_snap | while read -r w h1 s1; do
   b="$(printf '%s\n' "$wt_before" | awk -v w="$w" '$1==w {print $2" "$3}')"
-  [ -n "$b" ] && [ "$b" != "$rest" ] && echo "$w"
+  [ -n "$b" ] || continue
+  [ "$b" = "$h1 $s1" ] && continue
+  h0="${b% *}"; s0="${b#* }"
+  [ "$s0" = "$s1" ] && _wt_benign_advance "$w" "$h0" "$h1" && continue
+  echo "$w"
 done)"
 if [ -n "$drift" ]; then
   echo "dc: 越界——opencode 改動了同 repo 其他 worktree（工單 cwd=${d}）：" >&2
   printf '  %s\n' $drift >&2
   echo "dc: 判 FATAL，不跑驗收；請主 session 檢查並還原上列 worktree" >&2
   exit 2
+fi
+if [ -n "$scope_w" ]; then
+  scope_over=""
+  set -f
+  while IFS= read -r cf; do
+    [ -n "$cf" ] || continue
+    printf '%s\n' "$scope_pre" | grep -qxF -- "$cf" && continue
+    ok=0
+    for e in $scope_w; do
+      e="${e#"$d"/}"; e="${e#./}"
+      case "$cf" in $e|"${e%/}"/*) ok=1; break ;; esac
+    done
+    [ "$ok" = 1 ] || scope_over="$scope_over $cf"
+  done <<EOF_SCOPE
+$(_scope_changed)
+EOF_SCOPE
+  set +f
+  [ -n "$scope_over" ] && echo "dc: SCOPE=over（改動超出工單 writes：${scope_w}）：${scope_over}" >&2
 fi
 [ "$rl" = 1 ] && { echo "dc: 上游限流（429），opencode 會照 retry-after 久等重試，已提早結束" >&2; exit 1; }
 [ "$rl" = 2 ] && { echo "dc: 上游不可用（$(grep -m1 -oE '(Upstream request failed[^"]*|Model [^ ]+ has been deprecated)' "$out")），已提早結束" >&2; exit 1; }

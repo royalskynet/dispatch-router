@@ -19,6 +19,11 @@
 #   3. 模型池 + per-model 冷卻／併發槽（借鏡 LiteLLM Router）
 #   4. watchdog：.out 停滯與總時限（opencode 的 chunkTimeout 不可靠，見 issue #43519）
 set -u
+# I5：runner 啟動時記下自己這份檔的 mtime 與原始 argv；worker 每次 claim 前比對，變了就不再收新單，
+# 跑完手上的 job 後由 cmd_run exec 自己（新碼）。dc 每張工單由 PATH 重新執行，本來就是新碼，不在此列。
+ORIG_ARGS=("$@")
+SELF_REAL="$(readlink -f "$0")"
+SELF_M0="$(stat -f %m "$SELF_REAL" 2>/dev/null || stat -c %Y "$SELF_REAL" 2>/dev/null || echo 0)"
 
 Q="${DCQ_HOME:-$HOME/.dcq}"
 # 2026-10-19 起各層預設名單一律從清冊 catalog/models.tsv 組（第 7 欄 dc_id、第 8 欄 fit），不再寫死在這裡；
@@ -367,13 +372,102 @@ bump_fail() {
     echo "dcq: 冷卻 $m —— 連續 ${ALLOW} 次上游失敗，${COOL_S}s 內不派" >&2
   fi
 }
-reset_fail() { rm -rf "$Q/.health/$(fk "$1").fails" "$Q/.health/$(fk "$1").cool"; }
+reset_fail() { rm -rf "$Q/.health/$(fk "$1").fails" "$Q/.health/$(fk "$1").cool" "$Q/.health/$(fk "$1").gone"; }
 # 上游不回（why=upstream）直接冷卻 UPSTREAM_COOL_S，不等 ALLOW 次：額度用完或排隊時同一隻再試只會再白等
 # STALL_S（10-07 實例 4 隻×2 輪×200s）。冷卻檔是跨工單共用的，併發中的其他工單也會跳過它。
 UPSTREAM_COOL_S="${DCQ_UPSTREAM_COOL_S:-900}"
 cool_upstream() {
   echo $(( $(now) + UPSTREAM_COOL_S )) > "$Q/.health/$(fk "$1").cool"; rm -rf "$Q/.health/$(fk "$1").fails"
   echo "dcq: 冷卻 $1 —— 上游不回，${UPSTREAM_COOL_S}s 內不派" >&2
+}
+# 報錯加掃（10-23）：go-sync 每 7 天才掃一次，下架的 opencode-go 模型會在名單裡留到下次週掃，
+# 每張工單都撞一次（10-23 02:00 r7／r13 撞 minimax-m3.1-flash-free、longcat-2.5-preview-free）。
+# 撞到下架錯誤：冷卻 GONE_COOL_S（1 小時）並記 .gone；冷卻到期、要再派之前先查清單（gone_recheck），
+# 清單有它就恢復，沒有就再停 1 小時。不長冷卻：免費模型會下架又回來（quadseven/loom#1295：
+# minimax-m3.1-flash-free 10-20 not found、10-21 又可用，停一天白停 11 小時；LiteLLM 404 也只短冷卻）。
+# 清單來源：opencode-go/* 用 go-sync 強制掃 Go /models（RESYNC_MIN_S 內只掃一次，併發 worker 共用；順帶更新清冊）；
+# Zen（無前綴）用 `opencode models opencode`（讀 models.dev 快取，不打 Zen 閘道，避開 IP 濫用判定）；
+# 其他（omniroute/*）或清單查不到 → 不擋，照常派（loom：清單查詢失敗不停用）。
+# ponytail: models.dev 比 Zen 實際上架慢（10-23 jev-1.13-free 在 Zen /models 有、models.dev 沒有），只拿來判「還在不在」。
+GONE_RE='[P]roviderModelNotFoundError|has been [d]eprecated'
+GONE_COOL_S="${DCQ_GONE_COOL_S:-3600}"
+RESYNC_MIN_S="${DCQ_RESYNC_MIN_S:-1800}"
+GO_SYNC="${DCQ_GO_SYNC:-$(dirname "$(readlink -f "$0")")/../oc-probe/bin/go-sync}"
+go_resync() {
+  local lk="$Q/.health/.resync.lock" i=0 last
+  until mkdir "$lk" 2>/dev/null; do i=$((i + 1)); [ "$i" -ge 60 ] && break; sleep 1; done
+  last=$(cat "$Q/.health/.resync.at" 2>/dev/null || echo 0)
+  if [ $(( $(now) - last )) -ge "$RESYNC_MIN_S" ]; then
+    now > "$Q/.health/.resync.at"
+    echo "dcq: 加掃 go-sync（$1）" >&2
+    "$GO_SYNC" --scan >> "$Q/logs/resync.log" 2>&1 || echo "dcq: go-sync 加掃失敗（見 $Q/logs/resync.log）" >&2
+  fi
+  rmdir "$lk" 2>/dev/null
+}
+# Zen 上游清單：GET /zen/v1/models（公開、不帶 key、不推論），節流同 go_resync，寫 ZEN_STATE；抓失敗保留舊檔。
+# fix 10194：可用性以上游 /models 為準，CLI 的 models.dev 清單只是公開目錄，上游抓不到才退回它。
+ZEN_STATE="${DCQ_ZEN_STATE:-$Q/logs/zen-models.json}"
+ZEN_MODELS_URL="${DCQ_ZEN_MODELS_URL:-https://opencode.ai/zen/v1/models}"
+zen_resync() {
+  local lk="$Q/.health/.zenresync.lock" i=0 last tmp
+  until mkdir "$lk" 2>/dev/null; do i=$((i + 1)); [ "$i" -ge 60 ] && break; sleep 1; done
+  last=$(cat "$Q/.health/.zenresync.at" 2>/dev/null || echo 0)
+  if [ $(( $(now) - last )) -ge "$RESYNC_MIN_S" ]; then
+    now > "$Q/.health/.zenresync.at"; tmp="$ZEN_STATE.$$"
+    echo "dcq: 加掃 Zen /models（$1）" >&2
+    if curl -s -m 20 "$ZEN_MODELS_URL" | jq -e --arg at "$(date +%FT%T)" '{at: $at, upstream: [.data[].id]} | select(.upstream | length > 0)' > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$ZEN_STATE"; zen_pool_feed
+    else rm -f "$tmp"; echo "dcq: Zen /models 加掃失敗，沿用舊清單" >&2; fi
+  fi
+  rmdir "$lk" 2>/dev/null
+}
+# 加掃結果回灌名單：池內 Zen 模型上游已無 → GONE、上游新的 *-free 不在池 → NEW，追加進 x-pool.tsv
+# （與 @opencode 推文同一條路：下次 dcq 啟動 pool_sync_zen 套用，NEW 當 manual 進 autorank、0 PASS 自動進懲罰層），
+# 再叫 sync-catalog 回寫清冊。同一模型最新一列已是同動作就不重記。
+# ponytail: NEW 只認 -free 結尾；big-pickle／muse-* 這類不帶 -free 的免費模型仍靠週探測收。
+zen_pool_feed() {
+  local xf="$Q/logs/x-pool.tsv" pool="$MODELS ${POOL_PEN:-} ${POOL_ZERO:-}" rows
+  rows="$(jq -r --arg pool "$pool" --arg t "$(date +%F_%T)" '
+      ($pool | split(" ") | map(select(length > 0 and (contains("/") | not)))) as $p | .upstream as $u
+      | ([$p[] | . as $m | select(($u | index($m)) == null) | [$t, "zen-models", "GONE", $m]]
+       + [$u[] | . as $m | select(($m | endswith("-free")) and (($p | index($m)) == null)) | [$t, "zen-models", "NEW", $m]])[] | @tsv' "$ZEN_STATE" 2>/dev/null |
+    awk -F'\t' -v xf="$xf" 'BEGIN { while ((getline l < xf) > 0) { split(l, a, "\t"); last[a[4]] = a[3] } } last[$4] != $3')"
+  [ -n "$rows" ] || return 0
+  printf '%s\n' "$rows" >> "$xf"
+  echo "dcq: Zen /models 加掃改名單 → $(printf '%s\n' "$rows" | awk -F'\t' '{printf "%s%s %s", (NR>1?"；":""), $3, $4}')" >&2
+  [ "${DCQ_FEED_CATALOG:-1}" = 0 ] || env -u DCQ_MODELS "$0" sync-catalog --source "Zen /models 加掃" >> "$Q/logs/resync.log" 2>&1 ||
+    echo "dcq: sync-catalog 失敗（見 $Q/logs/resync.log）" >&2
+}
+# 0＝清單有、1＝清單沒有、2＝查不到（不擋）
+model_listed() {
+  local m="$1" out
+  case "$m" in
+    opencode-go/*) go_resync "$m"; [ -s "$GO_STATE" ] || return 2
+      jq -e '(.upstream | length) > 0' "$GO_STATE" >/dev/null 2>&1 || return 2
+      jq -e --arg m "${m#opencode-go/}" '.upstream | index($m) != null' "$GO_STATE" >/dev/null 2>&1 && return 0; return 1 ;;
+    */*) return 2 ;;
+    *) zen_resync "$m"
+      if [ -s "$ZEN_STATE" ] && jq -e '(.upstream | length) > 0' "$ZEN_STATE" >/dev/null 2>&1; then
+        jq -e --arg m "$m" '.upstream | index($m) != null' "$ZEN_STATE" >/dev/null 2>&1 && return 0; return 1
+      fi
+      out="$(opencode models opencode 2>/dev/null)" && [ -n "$out" ] || return 2
+      printf '%s\n' "$out" | grep -qxF "opencode/$m" && return 0; return 1 ;;
+  esac
+}
+gone_mark() {
+  echo $(( $(now) + GONE_COOL_S )) > "$Q/.health/$(fk "$1").cool"; rm -rf "$Q/.health/$(fk "$1").fails"
+  : > "$Q/.health/$(fk "$1").gone"
+  case "$1" in opencode-go/*) go_resync "$1" ;; */*) ;; *) zen_resync "$1" ;; esac
+  echo "dcq: 下架 $1 —— ${GONE_COOL_S}s 後查清單再決定" >&2
+}
+# 冷卻到期的 .gone 模型：清單有 → 恢復（回 0）；沒有 → 再停 GONE_COOL_S（回 1）
+gone_recheck() {
+  model_listed "$1"
+  case $? in
+    1) echo $(( $(now) + GONE_COOL_S )) > "$Q/.health/$(fk "$1").cool"
+       echo "dcq: $1 清單仍無，再停 ${GONE_COOL_S}s" >&2; return 1 ;;
+    *) rm -f "$Q/.health/$(fk "$1").gone"; echo "dcq: $1 清單已列回（或查不到），恢復派工" >&2; return 0 ;;
+  esac
 }
 # 錯誤簽章：.out 去掉 dc:/dcq 開頭的行後取最後 3 行。真 dc 每次都印
 # "dc: opencode run rc=1"，不排除的話任何上游失敗都會撞成同簽章。
@@ -446,6 +540,7 @@ pick_model() {
     case "$tried" in *" $m "*) continue ;; esac
     any=1
     left=$(cool_left "$m")
+    if [ "$left" = 0 ] && [ -e "$Q/.health/$(fk "$m").gone" ] && ! gone_recheck "$m"; then left=$(cool_left "$m"); fi
     if [ "$left" -gt 0 ]; then
       { [ "$soonest" -eq 0 ] || [ "$left" -lt "$soonest" ]; } && soonest=$left
       continue
@@ -735,7 +830,16 @@ run_job() {
     rmdir "$slot" ${pslot:+"$pslot"} 2>/dev/null
     # 有跑到驗收的嘗試數：0＝全池都死在上游／卡住，沒有模型真的交件（呼叫端據此分基礎設施失敗與驗收失敗）
     ran=0; grep -q '^dc: 驗收 → ' "$Q/logs/$id.$(fk "$model").out" 2>/dev/null && { vr=$((vr + 1)); ran=1; }
+    # I3：dc 在 log 印了 `dc: SCOPE=over` → 記進 job 檔（只標記不影響成敗），一張工單記一次
+    if grep -q '^dc: SCOPE=over' "$Q/logs/$id.$(fk "$model").out" 2>/dev/null && ! grep -q '^SCOPE=over' "$jobfile" 2>/dev/null; then
+      echo 'SCOPE=over' >> "$jobfile"; echo "dcq[$id] SCOPE=over：$model 改動了工單 writes 以外的檔（見 log）" >&2
+    fi
     [ -e "$Q/.cancel/$id" ] && { rc=130; break; }
+    # 模型下架（ProviderModelNotFound／deprecated）：加掃一次上游清單，下架的長冷卻，本單照常換下一隻
+    if [ "$why:$rc" != exit:0 ] && grep -q -E "$GONE_RE" "$Q/logs/$id.$(fk "$model").out" 2>/dev/null; then
+      gone_mark "$model"; rc=1
+      echo "dcq[$id] $model 上游回下架，換下一個模型" >&2; continue
+    fi
     case "$why:$rc" in
       exit:0) reset_fail "$model"
          mv "$jobfile" "$Q/done/$id.job"
@@ -873,7 +977,7 @@ wt_finish() {
     sleep 1; waited=$((waited + 1))
   done
   echo $$ > "$Q/.cwdlock/$h/pid"
-  if git -C "$cwd0" merge -q --no-edit "dcq/$id" >/dev/null 2>&1; then
+  if git -C "$cwd0" -c user.name=dcq -c user.email=dcq@localhost merge -q --no-edit "dcq/$id" >/dev/null 2>&1; then
     echo 'MERGED=1' >> "$job"; wt_drop "$cwd0" "$wt" "$id"
     echo "dcq[$id] 已 merge 回 $cwd0" >&2
   else
@@ -925,8 +1029,14 @@ claim_one() {
 }
 
 worker() {
-  local claim jobfile h rc
+  local claim jobfile h rc cur
   while true; do
+    # claim 前才檢查，job 進行中絕不打斷。新檔語法壞掉就不換（exec 進去 runner 會直接死），警告後以新 mtime 當基準。
+    cur="$(mtime "$SELF_REAL")"
+    if [ "$cur" != "$SELF_M0" ]; then
+      if bash -n "$SELF_REAL" 2>/dev/null; then return 75; fi
+      echo "dcq: 警告——bin/dcq 已更新但語法檢查失敗，繼續以舊碼執行" >&2; SELF_M0="$cur"
+    fi
     claim="$(claim_one)"
     case "$claim" in
       DRAIN) return 0 ;;
@@ -971,8 +1081,13 @@ cmd_run() {
   [ ! -x "$FCK" ] || DCQ_HOME="$Q" "$FCK" $MODELS || die "dcq: 中止——freecheck 警報"
   echo "dcq: 起 $JOBS 個 slot，模型池：${MODELS}（每隻上限 ${MODEL_MAX}、停滯 ${STALL_S}s、總時限 ${JOB_MAX}s）" >&2
   local i
-  for i in $(seq 1 "$JOBS"); do worker & done
-  wait
+  local pids=() reload=0 p
+  for i in $(seq 1 "$JOBS"); do worker & pids+=($!); done
+  for p in "${pids[@]}"; do wait "$p"; [ $? -eq 75 ] && reload=1; done
+  if [ "$reload" = 1 ]; then
+    echo "dcq: 偵測到 bin/dcq 已更新，runner 以新版重啟" >&2
+    exec "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+  fi
   cmd_status
 }
 
@@ -1090,6 +1205,7 @@ case "${1:-}" in
   plan)   shift; cmd_plan "$@" ;;
   status) cmd_status ;;
   rank)   shift; rank_free "${MODELS_MANUAL:-$MODELS}" table "${1:-}"; echo "名單同步：${SYNC_NOTE:-無變動}"; echo "兜底層：$POOL_TAIL"; echo "訂閱層：$POOL_PAID"; echo "API 層：${POOL_API:-（關，DCQ_ALLOW_API=1 才開）}"; echo "hard 不派：${EASY_ONLY:-無}"; echo "mid 不派：${EASY_STRICT:-無}"; echo "provider 上限：${PROV_MAX:-無}" ;;
+  rescan) RESYNC_MIN_S=0 zen_resync "每日清單掃" ;;
   sync-catalog) shift; SYNC_ADD_ZEN="$SYNC_ADD_ZEN" SYNC_ADD_SUB="$SYNC_ADD_SUB" SYNC_ADD_GOFREE="$SYNC_ADD_GOFREE" SYNC_RM="$SYNC_RM" \
                 python3 "$(dirname "$(readlink -f "$0")")/catalog-sync" "$CAT/models.tsv" "$@" ;;
   cancel) shift; cmd_cancel "$@" ;;
@@ -1103,6 +1219,7 @@ case "${1:-}" in
   dcq start [-j N]                   同 run，但放進獨立 tmux 脫離呼叫端（從 agent session 派工用這個）
   dcq status                         各狀態計數與失敗清單
   dcq plan <task.md>...              派工前預覽每張的難度與會走的層（不入列）
+  dcq rescan                         抓 Zen 上游 /models 清單（零 token），上下架回灌名單與清冊
   dcq rank [easy|mid|hard]           免費層排名統計（給難度＝只算該難度＋舊紀錄）
   dcq cancel <job-id>                取消一張工單（殺掉整棵程序樹，階梯不重試，移到 failed）
   dcq wait [id...] [--timeout S]     睡到這些工單結案（不給 id＝等佇列清空）；rc 0 全過／1 有失敗／124 逾時

@@ -24,6 +24,7 @@ cat > "$T/bin/dc" <<'EOF'
 task="$1"; cwd="$2"; n="$(basename "$task" .md)"
 w="$(sed -n 's/^WRITE=//p' "$task")"; c="$(sed -n 's/^CONTENT=//p' "$task")"
 echo "IN $n $cwd $w $(date +%s)" >> "$TRACE"
+say="$(sed -n 's/^SAYS=//p' "$task")"; [ -n "$say" ] && echo "$say" >&2
 [ -n "$w" ] && printf '%s\n' "$c" > "$w"
 sleep 3
 echo "OUT $n $cwd $(date +%s)" >> "$TRACE"
@@ -75,6 +76,16 @@ printf '# e\nWRITE=%s/out-e.txt\nCONTENT=e\n' "$T/off" > "$T/e.md"
 DCQ_WORKTREE=0 DCQ_MODELS="m1" "$REPO/bin/dcq" run -j 2 >"$T/run3.out" 2>&1
 chk "DCQ_WORKTREE=0 直接在 cwd 跑" "$(grep '^IN e ' "$TRACE" | awk '{print $3}')" "$T/off"
 chk "DCQ_WORKTREE=0 沒開 worktree" "$(git -C "$T/off" worktree list | wc -l | tr -d ' ')" "1"
+
+# 6) I3：dc 在 log 印 `dc: SCOPE=over` → job 檔記 SCOPE=over（只標記，工單仍 PASS）；沒印的不記
+mkrepo "$T/sc"
+printf '# s1\nSAYS=dc: SCOPE=over（改動超出工單 writes：x）： stray.txt\n' > "$T/s1.md"
+printf '# s2\n' > "$T/s2.md"
+for n in s1 s2; do "$REPO/bin/dcq" add "$T/$n.md" "$T/sc" >/dev/null 2>&1; done
+DCQ_MODELS="m1" DCQ_MODEL_MAX=2 "$REPO/bin/dcq" run -j 2 >"$T/run4.out" 2>&1
+chk "SCOPE=over 記進該張 job 檔" "$(grep -l '^SCOPE=over' "$DCQ_HOME"/done/*s1*.job 2>/dev/null | wc -l | tr -d ' ')" "1"
+chk "沒印 SCOPE 的工單不記" "$(grep -l '^SCOPE=over' "$DCQ_HOME"/done/*s2*.job 2>/dev/null | wc -l | tr -d ' ')" "0"
+chk "SCOPE=over 的工單仍 PASS（不判 FAIL）" "$(ls "$DCQ_HOME"/done/*s1*.job 2>/dev/null | wc -l | tr -d ' ')" "1"
 
 [ "$fail" = 0 ] || { echo "--- run.out ---"; cat "$T/run.out"; echo "--- trace ---"; cat "$TRACE"; }
 [ "$fail" = 0 ] && echo PASS

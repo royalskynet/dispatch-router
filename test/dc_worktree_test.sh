@@ -5,6 +5,8 @@
 #   1) 改到主 checkout → rc=2 且印出越界路徑
 #   2) 只改自己的 worktree → rc=0
 #   3) 被別的 dc 持鎖的 sibling 有變化 → 不算越界（併發派工本來就會改它）
+#   4) I3a（10-23）：主 checkout 被 dcq 的 sibling merge 前進（新 commit 全是 committer=dcq）→ 不算越界；
+#      模型自己 commit（committer 不是 dcq）或動工作樹 → 仍判越界。10-22 批次 R7／R10／R11 因此誤判 FATAL
 set -u
 OC="$(cd "$(dirname "$0")/.." && pwd)/bin/dc"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
@@ -25,6 +27,7 @@ git -C "$T/main" worktree add -q "$T/wt" -b wo/x
 cat > "$T/bin/opencode" <<'EOF'
 #!/usr/bin/env bash
 [ -n "${FAKE_TARGET:-}" ] && echo x > "$FAKE_TARGET"
+[ -n "${FAKE_COMMIT_AS:-}" ] && git -C "$FAKE_COMMIT_REPO" -c user.email=t@t -c user.name="$FAKE_COMMIT_AS" commit -q --allow-empty -m sib
 exit 0
 EOF
 chmod +x "$T/bin/opencode"
@@ -46,5 +49,12 @@ mkdir -p "$DCQ_HOME/.cwdlock/$(printf '%s' "$T/main" | shasum | cut -c1-12)"
 echo $$ > "$DCQ_HOME/.cwdlock/$(printf '%s' "$T/main" | shasum | cut -c1-12)/pid"
 FAKE_TARGET="$T/main/locked.txt" "$OC" "$T/t.md" "$T/wt" >"$T/o3" 2>&1; rc=$?
 chk "持鎖 sibling 變化不算越界 rc=0" "$rc" "0"
+
+# 4) 主 checkout HEAD 被 dcq 的 sibling 前進（未持鎖）→ rc=0；同樣動作但 committer 不是 dcq → rc=2
+rmdir "$DCQ_HOME/.cwdlock/$(printf '%s' "$T/main" | shasum | cut -c1-12)" 2>/dev/null || rm -rf "$DCQ_HOME/.cwdlock/$(printf '%s' "$T/main" | shasum | cut -c1-12)"
+FAKE_COMMIT_REPO="$T/main" FAKE_COMMIT_AS=dcq "$OC" "$T/t.md" "$T/wt" >"$T/o4" 2>&1; rc=$?
+chk "sibling(dcq) merge 讓主 checkout 前進不算越界 rc=0" "$rc" "0"
+FAKE_COMMIT_REPO="$T/main" FAKE_COMMIT_AS=model "$OC" "$T/t.md" "$T/wt" >"$T/o5" 2>&1; rc=$?
+chk "非 dcq 的 commit 進主 checkout 仍判越界 rc=2" "$rc" "2"
 
 exit "$fail"
