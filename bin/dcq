@@ -827,7 +827,14 @@ run_job() {
     set -- $pick; model=$2; slot=$3; pslot="${4:-}"
     tried="$tried $model"; n=$((n + 1))
     echo "dcq[$id] model=$model tier=$JOB_TIER" >&2
-    set -- $(watch_oc "$id" "$model" "$task" "$cwd" "$t0" "$paid"); rc=$1; why=$2
+    set -- $(watch_oc "$id" "$model" "$task" "$cwd" "$t0" "$paid"); rc=${1:-}; why=${2:-}
+    # watch_oc 中途死掉（dcq 自身腳本錯，10-24 Linux GNU stat 實例）會零輸出：判 FATAL 不換模型（換誰都一樣崩），
+    # 收掉它留下的 dc 程序與 running 標記，免得工單永遠卡 running、拿不到結束碼
+    if [ -z "$rc" ]; then
+      [ -s "$Q/running/$id.pid" ] && killtree "$(cat "$Q/running/$id.pid")"; rm -f "$Q/running/$id.pid"
+      rc=2; why=exit
+      echo "dcq[$id] FATAL rc=2（watch_oc 沒交出結果：dcq 自身腳本錯，看上面的 bash 錯誤）" >&2
+    fi
     rmdir "$slot" ${pslot:+"$pslot"} 2>/dev/null
     # 有跑到驗收的嘗試數：0＝全池都死在上游／卡住，沒有模型真的交件（呼叫端據此分基礎設施失敗與驗收失敗）
     ran=0; grep -q '^dc: 驗收 → ' "$Q/logs/$id.$(fk "$model").out" 2>/dev/null && { vr=$((vr + 1)); ran=1; }
