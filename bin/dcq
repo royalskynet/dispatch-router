@@ -360,6 +360,16 @@ POLL_S="${DCQ_POLL_S:-5}"
 # 遮罩器隨 repo 走（2026-10-24）：原本指 ~/.claude/tools，雲端 clone 沒有那支，遮罩每次失敗、.out 留原文。
 # M4 的 ~/.claude/tools/fi-mask-transcript.mjs 是指向這支的 symlink（/fi 也用），正本只有這一份。
 MASK="${DCQ_MASK-$(dirname "$(readlink -f "$0")")/mask-transcript.mjs}"
+# 沒有 node 改用同目錄的 perl 版（Grok 雲端 opencode 是獨立執行檔、不帶 node，10-24 遮罩仍失敗）。
+# 失敗時印原因，不只說「失敗」。
+mask_file() {
+  local f="$1" pl="${MASK%.mjs}.pl" e
+  [ -r "$MASK" ] || { echo "遮罩器不在（${MASK}）"; return 1; }
+  local nb="${DCQ_NODE_BIN:-node}"   # 測試用：設成不存在的名字＝模擬沒有 node
+  if command -v "$nb" >/dev/null; then e="$("$nb" "$MASK" "$f" "$f" 2>&1 >/dev/null)" || { echo "node 遮罩出錯：${e:0:200}"; return 1; }
+  elif command -v perl >/dev/null && [ -r "$pl" ]; then e="$(perl "$pl" "$f" "$f" 2>&1 >/dev/null)" || { echo "perl 遮罩出錯：${e:0:200}"; return 1; }
+  else echo "node 和 perl 都沒有"; return 1; fi
+}
 LOG_DAYS="${DCQ_LOG_DAYS:-14}"
 
 die() { echo "dcq: $*" >&2; exit 2; }
@@ -685,7 +695,7 @@ stall_dump() {
       ([$m.parts[] | select(.type == "tool") | "\(.tool):\(.state.status)"] | join(",")),
       ([$m.parts[] | select(.type == "reasoning") | (.text // "" | length)] | add // 0)
     ] | @tsv' "$js" 2>/dev/null) || sum="unparsable"
-  node "$MASK" "$js" "$js" >/dev/null 2>&1 || true
+  mask_file "$js" >/dev/null || true
   printf '%s\t%s\t%s\t%s\n' "$(date +%F_%T)" "$model" "$sid" "$sum" >> "$Q/logs/stalls.tsv"
   echo "dcq: stall_dump $model $sid 最後一則[role done tools reasoning字數]=${sum}" >&2
 }
@@ -744,7 +754,7 @@ watch_oc() {
   # 跑完遮罩 .out（issue #5）。遮罩器會 console.log，stdout 必須丟掉——watch_oc 的
   # stdout 被 $(...) 收成 "<rc> <why>"，漏出來會打壞 run_job 的解析。
   # 遮罩不在或失敗只警告不中斷：fail loud，不 fail closed。
-  node "$MASK" "$out" "$out" >/dev/null 2>&1 || echo "dcq[$id] 警告：遮罩失敗，$out 保留原文" >&2
+  local mwhy; mwhy="$(mask_file "$out")" || echo "dcq[$id] 警告：遮罩失敗（${mwhy}），${out} 保留原文" >&2
   echo "$rc $why"
 }
 
