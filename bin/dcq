@@ -23,7 +23,7 @@ set -u
 # 跑完手上的 job 後由 cmd_run exec 自己（新碼）。dc 每張工單由 PATH 重新執行，本來就是新碼，不在此列。
 ORIG_ARGS=("$@")
 SELF_REAL="$(readlink -f "$0")"
-SELF_M0="$(stat -f %m "$SELF_REAL" 2>/dev/null || stat -c %Y "$SELF_REAL" 2>/dev/null || echo 0)"
+SELF_M0="$(stat -c %Y "$SELF_REAL" 2>/dev/null || stat -f %m "$SELF_REAL" 2>/dev/null || echo 0)"
 
 Q="${DCQ_HOME:-$HOME/.dcq}"
 # 2026-10-19 起各層預設名單一律從清冊 catalog/models.tsv 組（第 7 欄 dc_id、第 8 欄 fit），不再寫死在這裡；
@@ -617,7 +617,8 @@ cmd_add() {
 #   2   參數或契約錯 —— 工單本身壞掉，重試無意義
 #   124 逾時 —— 可換模型重試
 #   其他 驗收失敗行的 rc —— 模型做錯了，換模型再給一次機會
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || now; }
+# GNU 在前：GNU `stat -f` 是查檔案系統，失敗前會先把 fs 資訊印到 stdout（BSD `stat -c` 失敗則 stdout 乾淨）
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || now; }
 # $1（dc）底下的 opencode 有子程序＝工具正在跑（多半是測試），rc 0。
 # 2026-10-21 實測：bash 工具是 opencode→/bin/zsh→指令；--pure 閒置時 opencode 沒有任何子程序。
 # comm 可能是完整路徑（macOS），取 basename 比對。

@@ -147,7 +147,7 @@ grep -q 'watchdog: m1 stall' "$T/stall.out" || { echo "FAIL 沒印 watchdog stal
 chk "gaps.tsv 記到 stall" "$(grep -c 'm1.*stall' "$DCQ_HOME/logs/gaps.tsv")" "1"
 # 7b) 停滯殺之前匯出 session：摘要要分得出「tool 卡 running」與 reasoning 字數（fix 10309 兩假設）
 chk "stalls.tsv 摘要 tool 狀態與 reasoning 字數" "$(grep -c $'m1\tses_fake\tassistant\tfalse\tread:completed,read:running\t4$' "$DCQ_HOME/logs/stalls.tsv")" "1"
-chk "stall.json 已存且 600" "$(stat -f %Lp "$DCQ_HOME"/logs/*hang1*.m1.stall.json 2>/dev/null)" "600"
+chk "stall.json 已存且 600" "$(stat -c %a "$DCQ_HOME"/logs/*hang1*.m1.stall.json 2>/dev/null || stat -f %Lp "$DCQ_HOME"/logs/*hang1*.m1.stall.json 2>/dev/null)" "600"
 chk "status 顯示 m1 cooling" "$(DCQ_MODELS="m1 m2" dcq status | grep -c 'm1 .*cooling')" "1"
 
 # 8) 冷卻中的模型直接跳過（不清 .health，沿用上一步的 m1 冷卻）
@@ -337,7 +337,7 @@ mk leak1 "$T/wb"
 DCQ_MODELS="m1" DCQ_POOL_PAID="" dcq run -j 1 >"$T/leak.out" 2>&1
 chk "leak1 進 done" "$(ls -1 "$DCQ_HOME/done" | wc -l | tr -d ' ')" "1"
 leakout="$(ls -1 "$DCQ_HOME"/logs/*leak1*.out 2>/dev/null | head -1)"
-perms=$(stat -f %Lp "$leakout" 2>/dev/null || stat -c %a "$leakout" 2>/dev/null)
+perms=$(stat -c %a "$leakout" 2>/dev/null || stat -f %Lp "$leakout" 2>/dev/null)
 chk "leak1 的 .out 權限 600" "$perms" "600"
 if grep -q "sk-$(printf 'x%.0s' $(seq 16))" "$leakout" 2>/dev/null; then
   echo "FAIL .out 沒遮罩（還找得到假憑證）"; fail=1
@@ -345,7 +345,7 @@ else
   echo "PASS .out 已遮罩（找不到假憑證）"
 fi
 chk "過期 .out 已刪(old.out)" "$([ -e "$DCQ_HOME/logs/old.out" ] && echo yes || echo no)" "no"
-keepperms=$(stat -f %Lp "$DCQ_HOME/logs/keep.out" 2>/dev/null || stat -c %a "$DCQ_HOME/logs/keep.out" 2>/dev/null)
+keepperms=$(stat -c %a "$DCQ_HOME/logs/keep.out" 2>/dev/null || stat -f %Lp "$DCQ_HOME/logs/keep.out" 2>/dev/null)
 chk "既存 644 的 .out 被收成 600" "$keepperms" "600"
 
 # 17) status 的 running 數只算 .job：running/ 同時有 .job 與 .pid，1 張不能顯示成 2

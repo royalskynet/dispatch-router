@@ -16,7 +16,7 @@
 git clone https://github.com/royalskynet/orchestrator && cd orchestrator && ./install.sh
 ```
 
-需求：macOS、[opencode](https://opencode.ai) CLI；選配 [OmniRoute](https://github.com/cheaper-inference/OmniRoute) 接其他供應商。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`zen-gate` 連到 `~/.local/bin`、把 skill 連到 `~/.claude/skills/o`。
+需求：macOS 或 Linux（Linux 下 `oc-probe` 的 launchd 排程不能用，模型名單要手動維護）、[opencode](https://opencode.ai) CLI；選配 [OmniRoute](https://github.com/cheaper-inference/OmniRoute) 接其他供應商。`install.sh` 只做使用者層級安裝：把 `dc`／`dcq`／`zen-gate` 連到 `~/.local/bin`、把 skill 連到 `~/.claude/skills/o`。
 
 ## English
 
