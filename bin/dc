@@ -49,6 +49,8 @@ tier() {
     # nim-pool：NVIDIA NIM 免費 gpt-oss-20b／nemotron-super／glm-5.3-flash／ultra，兩把 key（2026-10-20 查 combos 表；OmniRoute 移除 OC 後的免費主路）。
     # agnes：2026-10-20 上游下架 agnes-2.0-flash／1.5-flash 整代，免費改成 3.0-flash／2.5-flash（pricing 頁現價 $0）。
     omniroute/or-free|omniroute/go-free|omniroute/nim-pool|omniroute/openai-compatible-chat-agnes/agnes-3.0-flash) echo free ;;
+    # 無 OmniRoute 機器的直連兜底（2026-10-24）：openrouter/free 只路由 :free 模型；NIM 免費額度（build.nvidia.com）。
+    openrouter/openrouter/free|nvidia/z-ai/glm-5.3-flash|nvidia/openai/gpt-oss-20b) echo free ;;
     opencode/*|opencode-go/*) if is_free "${1#*/}"; then echo free; elif [ "${1%%/*}" = opencode-go ]; then echo sub; else echo metered; fi ;;
     */*) echo metered ;;
     *) if is_free "$1"; then echo free; else echo metered; fi ;;

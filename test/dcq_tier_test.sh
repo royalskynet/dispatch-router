@@ -88,6 +88,21 @@ id="$(dcq add "$T/tasks/m1.md" "$T/w1" hard 2>/dev/null)"; grep -qx 'TIER=hard' 
 id="$(dcq add "$T/tasks/m1.md" "$T/w1" 2>/dev/null)"; grep -qx 'TIER=mid' "$DCQ_HOME/pending/$id.job" && ok "DC_BIN 沒 triage 時記 mid" || bad "沒 triage 沒記 mid"
 dcq add "$T/tasks/m1.md" "$T/w1" huge >/dev/null 2>&1; [ $? = 2 ] && ok "亂給難度拒收 rc=2" || bad "亂給難度沒拒收"
 [ "$(JEV_GATE_DIR="$T/nope" "$R/bin/triage" "$T/tasks/m1.md")" = mid ] && ok "triage 找不到 jev-gate 印 mid" || bad "triage fail-open 不對"
+# Laya 預設不叫（2026-10-24）：DC_BIN 有 triage 也記 mid，DCQ_TRIAGE=1 才照 triage
+printf '#!/bin/sh\necho hard\n' > "$T/bin/triage"; chmod +x "$T/bin/triage"
+id="$(dcq add "$T/tasks/m1.md" "$T/w1" 2>/dev/null)"; grep -qx 'TIER=mid' "$DCQ_HOME/pending/$id.job" && ok "triage 在但預設不叫，記 mid" || bad "預設仍叫了 triage"
+id="$(DCQ_TRIAGE=1 dcq add "$T/tasks/m1.md" "$T/w1" 2>/dev/null)"; grep -qx 'TIER=hard' "$DCQ_HOME/pending/$id.job" && ok "DCQ_TRIAGE=1 照 triage 記 hard" || bad "DCQ_TRIAGE=1 沒叫 triage"
+rm -f "$T/bin/triage"
+
+# 5a) 直連兜底（無 OmniRoute 機器）：要 key 才進池、enabled_providers 擋掉就剔除
+ORT=openrouter/openrouter/free
+o="$(XDG_DATA_HOME="$T/nodata" DCQ_POOL_TAIL=$ORT DCQ_AUTORANK=0 env -u OPENROUTER_API_KEY "$R/bin/dcq" rank 2>&1)"
+echo "$o" | grep -q "剔出池：$ORT" && ok "直連沒 key 剔出兜底層" || bad "直連沒 key 沒剔：$(echo "$o" | grep -E '兜底|剔出')"
+o="$(XDG_DATA_HOME="$T/nodata" OPENROUTER_API_KEY=x DCQ_POOL_TAIL=$ORT DCQ_AUTORANK=0 "$R/bin/dcq" rank 2>&1)"
+echo "$o" | grep -qx "兜底層：$ORT" && ok "直連有 key 進兜底層" || bad "直連有 key 沒進：$(echo "$o" | grep -E '兜底|剔出')"
+mkdir -p "$T/xdg2/opencode"; echo '{"enabled_providers":["omniroute","opencode"]}' > "$T/xdg2/opencode/opencode.json"
+o="$(XDG_CONFIG_HOME="$T/xdg2" XDG_DATA_HOME="$T/nodata" OPENROUTER_API_KEY=x DCQ_POOL_TAIL=$ORT DCQ_AUTORANK=0 "$R/bin/dcq" rank 2>&1)"
+echo "$o" | grep -q "剔出池：$ORT" && ok "enabled_providers 沒開 openrouter 就剔除（M4 情境）" || bad "enabled_providers 沒擋：$(echo "$o" | grep -E '兜底|剔出')"
 
 # 5b) 層級順序：of 只用免費、os 訂閱先、派o 預設免費先；plan 與實跑一致
 : > "$TRACE"; dcq clear >/dev/null 2>&1

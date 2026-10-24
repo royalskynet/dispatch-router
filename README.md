@@ -253,7 +253,8 @@ dcq 的停滯判定只看 `.out` 有沒有輸出。模型一直講話卻不改�
 `catalog/models.tsv` 是本機確實可調用模型的唯一清冊，每列標 `free`（免費）／`sub`（付費訂閱）／`api`（付費 API）。dcq 依清冊組層，順序固定為免費 → 訂閱 → API：
 
 - 免費層：`free` 且 `dc_id` 無斜線（Zen 免費，只能經 `opencode run`），加上 `opencode-go/*-free`（2026-10-22 起，`DCQ_GOFREE_MAIN=0` 關）。
-- 兜底層：其餘 `free` 且 `dc_id` 有斜線（`omniroute/*`）。`fit=easy-only` 的只派 easy 工單（`or-free` 23 跑 1 過）。
+- 兜底層：其餘 `free` 且 `dc_id` 有斜線（`omniroute/*`，以及無 OmniRoute 機器用的直連 `openrouter/*`、`nvidia/*`）。`fit=easy-only` 的只派 easy 工單（`or-free` 23 跑 1 過）。
+  - 直連模型要有 key（`OPENROUTER_API_KEY`／`NVIDIA_API_KEY`，或 opencode `auth.json`），且 `opencode.json` 的 `enabled_providers` 沒排除該 provider，否則組池時剔除。`omniroute/*` 沒在 `opencode.json` 宣告也剔除，所以沒裝 OmniRoute 的機器不必再設 `DCQ_POOL_TAIL=`。
 - 訂閱層：`sub`（`opencode-go/*`）。
 - API 層：`api`，`DCQ_ALLOW_API=1` 才接，預設不用。
 
@@ -261,7 +262,7 @@ dcq 的停滯判定只看 `.out` 有沒有輸出。模型一直講話卻不改�
 
 Claude Code、Codex 也在清冊裡（`sub`），但它們不是 opencode 模型，dcq 不派；由主 session 的 Agent 工具或 `codex exec` 直接用。
 
-難度在 `dcq add` 時判一次（`bin/triage`，jev-gate 的 Laya 本機分類器，零 token、約 2～3 秒；判不出就 mid），同一張工單中途不換：
+難度在 `dcq add` 時定一次：呼叫端給的優先，沒給一律 mid（2026-10-24 起預設不問 Laya；`DCQ_TRIAGE=1` 才跑 `bin/triage`），同一張工單中途不換：
 
 - `hard` 工單跳過清冊 `fit=easy` 的模型（有改錯、假扮工具、無限迴圈或隨機分配的前科）。
 - `gaps.tsv` 第 7 欄記難度，autorank 依難度各排一份；舊紀錄沒有這欄，算進每個難度。`dcq rank hard` 看 hard 的排名。

@@ -7,7 +7,7 @@
 # status：ok＝7 天內有實際成功紀錄；gated＝目前被 Zen 共用閘封鎖（IP 判濫用，閘外會回來；現況看 ~/.dcq/.zen-gate）；flaky＝成功率低；unverified＝本機沒有成功紀錄
 #        status 是人看的註記，dcq 排序只看 gaps.tsv 實績，不讀這欄（2026-10-22 重設：Zen 10-21 起已在閘外實跑）
 # evidence：probe＝~/.dcq/logs/probe.tsv（opencode run 每日探測）；calllog＝OmniRoute call_logs 7 天 成功/總數；auth＝CLI 登入狀態
-# dc_id：dcq 派工時給 dc 的模型名（空＝dcq 不用）。沒有斜線＝Zen（opencode/ 前綴省略）；opencode-go/、omniroute/ 照寫。
+# dc_id：dcq 派工時給 dc 的模型名（空＝dcq 不用）。沒有斜線＝Zen（opencode/ 前綴省略）；opencode-go/、omniroute/、openrouter/、nvidia/（直連）照寫。
 # fit：any＝任何難度都派；easy＝只派 easy／mid 工單（改錯、假扮工具、無限迴圈、隨機分配的前科），hard 工單跳過；
 #      easy-only＝只派 easy 工單，mid／hard 都跳過（失敗白等時間遠大於通過價值的）。
 # 列的先後＝同層手排順序（dcq autorank 會依實績重排）。dcq 組池：free 無斜線與 opencode-go/*-free＝免費層（2026-10-22 起 Go 免費併入，DCQ_GOFREE_MAIN=0 關）、free omniroute/＝兜底層、sub＝訂閱層、api＝API 層（DCQ_ALLOW_API=1 才用）。
@@ -36,6 +36,9 @@ free	omniroute	nvidia/openai/gpt-oss-20b	flaky	calllog 6/16	NVIDIA NIM 免費；
 free	omniroute	nvidia/nvidia/nemotron-3-super-120b-a12b	flaky	calllog 4/14	NVIDIA NIM 免費		any
 free	omniroute	nvidia/z-ai/glm-5.3-flash	ok	calllog 1/1	NVIDIA NIM 免費；樣本少		any
 free	omniroute	openai-compatible-chat-agnes/agnes-3.0-flash	ok	curl 1/1 2026-10-20	舊 2.0-flash 整代已被上游下架（500 get_channel_failed）；免費改 3.0-flash（pricing 現價 $0、非 reasoning 模型）。免費層仍有未公開 token 額度（fix 10187），不進 combo／鏈中段（fix 10235）		any
+free	opencode-run	openrouter/openrouter/free	unverified		opencode 原生直連，無 OmniRoute 機器用（Grok 雲端）；要 OPENROUTER_API_KEY 且 enabled_providers 不擋；同 or-free 隨機分配前科	openrouter/openrouter/free	easy-only
+free	opencode-run	nvidia/z-ai/glm-5.3-flash	unverified		opencode 原生直連 NIM，無 OmniRoute 機器用；要 NVIDIA_API_KEY	nvidia/z-ai/glm-5.3-flash	any
+free	opencode-run	nvidia/openai/gpt-oss-20b	unverified		opencode 原生直連 NIM；M4 經 nim-pool 是 flaky	nvidia/openai/gpt-oss-20b	easy
 free	gemini-cli	gemini（AI Studio key）	unverified	settings 有 API key	免費層額度官方不再公布，看 AI Studio；本機沒有成功紀錄		any
 sub	claude-code	claude-fable-5-1／claude-opus-5-5／claude-sonnet-5-5／claude-haiku-5-5	ok	auth claude.ai pro	本 session 即是；子 agent 用 Agent 工具 model 參數		any
 sub	codex	gpt-6.1-sol（預設）／gpt-6-sol／gpt-6-luna／gpt-6-astra	ok	auth ChatGPT	codex exec；codex 只接專屬執行位		any
