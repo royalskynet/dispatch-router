@@ -51,6 +51,9 @@ tier() {
     omniroute/or-free|omniroute/go-free|omniroute/nim-pool|omniroute/openai-compatible-chat-agnes/agnes-3.0-flash) echo free ;;
     # 無 OmniRoute 機器的直連兜底（2026-10-24）：openrouter/free 只路由 :free 模型；NIM 免費額度（build.nvidia.com）。
     openrouter/openrouter/free|nvidia/z-ai/glm-5.3-flash|nvidia/openai/gpt-oss-20b) echo free ;;
+    # 2026-10-24：Kilo Gateway 免 key 只放 :free；AI Studio key 的專案沒開 billing（pro 系列一律 429 quota），flash 走免費層。
+    # 那個 Google 專案若開了 billing，google/* 就會按量計費，這行要改回 metered。
+    kilo/*:free|google/gemini-*flash*) echo free ;;
     opencode/*|opencode-go/*) if is_free "${1#*/}"; then echo free; elif [ "${1%%/*}" = opencode-go ]; then echo sub; else echo metered; fi ;;
     */*) echo metered ;;
     *) if is_free "$1"; then echo free; else echo metered; fi ;;

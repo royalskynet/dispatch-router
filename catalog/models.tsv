@@ -39,6 +39,21 @@ free	omniroute	openai-compatible-chat-agnes/agnes-3.0-flash	ok	curl 1/1 2026-10-
 free	opencode-run	openrouter/openrouter/free	unverified		opencode 原生直連，無 OmniRoute 機器用（Grok 雲端）；要 OPENROUTER_API_KEY 且 enabled_providers 不擋；同 or-free 隨機分配前科	openrouter/openrouter/free	easy-only
 free	opencode-run	nvidia/z-ai/glm-5.3-flash	unverified		opencode 原生直連 NIM，無 OmniRoute 機器用；要 NVIDIA_API_KEY	nvidia/z-ai/glm-5.3-flash	any
 free	opencode-run	nvidia/openai/gpt-oss-20b	unverified		opencode 原生直連 NIM；M4 經 nim-pool 是 flaky	nvidia/openai/gpt-oss-20b	easy
+free	opencode-run	google/gemini-3.6-flash	ok	opencode run 1/1 OK 2s；tool_call OK（10-24）	AI Studio 免費層；10-24 加，依能力手排，之後交 autorank	google/gemini-3.6-flash	any
+free	opencode-run	google/gemini-3.5-flash	ok	curl tool_call OK 1.6s（10-24）	AI Studio 免費層；10-24 加，依能力手排，之後交 autorank	google/gemini-3.5-flash	any
+free	opencode-run	kilo/nvidia/nemotron-3-ultra-550b-a55b:free	ok	opencode run 1/1 OK 26s；tool_call OK（10-24）	Kilo 免 key（底層 OpenRouter :free）；10-24 加，依能力手排，之後交 autorank	kilo/nvidia/nemotron-3-ultra-550b-a55b:free	any
+free	opencode-run	google/gemini-3-flash-preview	ok	curl tool_call OK 1.2s（10-24）	AI Studio 免費層；preview；10-24 加，依能力手排，之後交 autorank	google/gemini-3-flash-preview	any
+free	opencode-run	kilo/poolside/laguna-s-2.1:free	ok	curl tool_call OK 3.1s（10-24）	Kilo 免 key；上游 Poolside 忙時 429；10-24 加，依能力手排，之後交 autorank	kilo/poolside/laguna-s-2.1:free	any
+free	opencode-run	kilo/cohere/north-mini-code:free	ok	curl tool_call OK 1.1s（10-24）	Kilo 免 key；10-24 加，依能力手排，之後交 autorank	kilo/cohere/north-mini-code:free	any
+free	opencode-run	google/gemini-2.5-flash	ok	curl tool_call OK 1.0s（10-24）	AI Studio 免費層；10-24 加，依能力手排，之後交 autorank	google/gemini-2.5-flash	any
+free	opencode-run	kilo/dots-studio/dots-3-note-preview:free	ok	curl tool_call OK 1.7s（10-24）	Kilo 免 key；preview；10-24 加，依能力手排，之後交 autorank	kilo/dots-studio/dots-3-note-preview:free	any
+free	opencode-run	kilo/nvidia/nemotron-3.5-super-vl:free	ok	curl tool_call OK 4.6s（10-24）	Kilo 免 key；有視覺；Zen 也有同款；10-24 加，依能力手排，之後交 autorank	kilo/nvidia/nemotron-3.5-super-vl:free	any
+free	opencode-run	google/gemini-3.5-flash-lite	ok	curl tool_call OK 1.0s（10-24）	AI Studio 免費層；lite；10-24 加，依能力手排，之後交 autorank	google/gemini-3.5-flash-lite	any
+free	opencode-run	google/gemini-3.1-flash-lite	ok	curl tool_call OK 4.7s（10-24）	AI Studio 免費層；lite；10-24 加，依能力手排，之後交 autorank	google/gemini-3.1-flash-lite	any
+free	opencode-run	kilo/recursive/flint-v1.0:free	ok	curl tool_call OK 0.7s（10-24）	Kilo 免 key；Zen 有 flint-40b-free；10-24 加，依能力手排，之後交 autorank	kilo/recursive/flint-v1.0:free	any
+free	opencode-run	kilo/poolside/laguna-xs-2.1:free	ok	curl tool_call OK 0.9s（10-24）	Kilo 免 key；上游 Poolside 忙時 429；10-24 加，依能力手排，之後交 autorank	kilo/poolside/laguna-xs-2.1:free	any
+free	opencode-run	google/gemini-3.8-flash	ok	curl tool_call OK 但單次 65s（10-24）	AI Studio 免費層；單次回應慢，交 autorank 判；10-24 加，依能力手排，之後交 autorank	google/gemini-3.8-flash	any
+free	opencode-run	google/gemini-3.7-flash	ok	curl tool_call OK 但單次 110s（10-24）	AI Studio 免費層；單次回應慢，交 autorank 判；10-24 加，依能力手排，之後交 autorank	google/gemini-3.7-flash	any
 free	gemini-cli	gemini（AI Studio key）	unverified	settings 有 API key	免費層額度官方不再公布，看 AI Studio；本機沒有成功紀錄		any
 sub	claude-code	claude-fable-5-1／claude-opus-5-5／claude-sonnet-5-5／claude-haiku-5-5	ok	auth claude.ai pro	本 session 即是；子 agent 用 Agent 工具 model 參數		any
 sub	codex	gpt-6.1-sol（預設）／gpt-6-sol／gpt-6-luna／gpt-6-astra	ok	auth ChatGPT	codex exec；codex 只接專屬執行位		any

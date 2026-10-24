@@ -4,4 +4,6 @@
 # 借鏡 oh-my-opencode background_task.providerConcurrency；上游 RPM／429 退避交給 OmniRoute 自己的限流與冷卻。
 zen	2	Zen 免費池共用同一個 IP 閘，2026-10-19 06:00 被判 abusive traffic 整池 403（fixindex 11041）
 opencode-go	4	Go 額度 per-model 各自計，provider 層只防同時開太多 opencode 進程
+google	2	AI Studio 免費層（opencode 原生直連，key 用 opencode.json {file:}）；同一把 key 的 RPM／RPD 各模型分開但 key 共用，2026-10-24 加
+kilo	2	Kilo Gateway 免 key 免費路由（底層 OpenRouter :free），每 IP 200 req/hr，上游忙會 429；2026-10-24 加
 omniroute	6	nim-pool＋or-free 共用此 key（10-20 起 OmniRoute 只走非 OC API）（2026-10-20 使用者定 6）；or-free 單模型仍受 per-model 上限，OpenRouter :free 20 RPM 撞到由 OmniRoute 退避
