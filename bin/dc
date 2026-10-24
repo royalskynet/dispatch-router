@@ -200,7 +200,7 @@ if [ "$t" != free ]; then
   # 戳記檔記上次發送時 billing.tsv 的行數。
   # ponytail: 併發 dc 讀同一戳記有競態，最壞多發一則，不值得上鎖
   ST="$BL/.billing-tg-last"; now=$(date +%s); n=$(wc -l < "$BL/billing.tsv" | tr -d ' ')
-  last=$(stat -f %m "$ST" 2>/dev/null || echo 0)
+  last=$(stat -f %m "$ST" 2>/dev/null || stat -c %Y "$ST" 2>/dev/null || echo 0)
   if [ $((now - last)) -ge "${DC_TG_EVERY:-600}" ]; then
     prev=$(cat "$ST" 2>/dev/null || echo "$((n - 1))"); skipped=$((n - 1 - prev))
     [ "$skipped" -gt 0 ] && msg="${msg}（另有 ${skipped} 筆被限流，見 billing.tsv）"
