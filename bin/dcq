@@ -621,7 +621,8 @@ cmd_add() {
   # 跟 dc 同一份 repo 自帶閘（bin/ 同目錄），不走 PATH 上 deepclaude 的那份
   local ocbin="${DC_BIN:-$(dirname "$(readlink -f "$0")")}" dl wv
   dl="$ocbin/deep-lint"; wv="$ocbin/wo-verify"
-  [ -x "$dl" ] && { "$dl" "$task" || die "deep-lint 未過，拒絕入列：$task"; }
+  # lint 訊息走 stderr：stdout 只留 job id，id=$(dcq add …) 才拿得到單行 id（fix 10521）
+  [ -x "$dl" ] && { "$dl" "$task" >&2 || die "deep-lint 未過，拒絕入列：$task"; }
   [ -x "$wv" ] && { "$wv" "$task" --dry >/dev/null 2>&1 || die "驗收區塊語法錯，拒絕入列：$task"; }
 
   # 難度：呼叫端給的優先；沒給一律 mid。Laya 判難度（bin/triage）2026-10-24 起預設關（使用者：Laya 沒產能），DCQ_TRIAGE=1 才開

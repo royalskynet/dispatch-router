@@ -11,7 +11,7 @@ my $n = 0;
 $n += ($t =~ s{\b([a-z][a-z0-9+.-]*://)[^\s/:@"'`]+:[^\s/@"'`]*@}{$1<MASKED_USERINFO>\@}gi);
 # 1. 已知 key 前綴
 $n += ($t =~ s/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{12,}/<MASKED_KEY>/g);
-$n += ($t =~ s/\b(?:gh[pousr]_|glpat-|xox[baprs]-|hf_|AIza|AKIA|ASIA)[A-Za-z0-9_-]{10,}/<MASKED_KEY>/g);
+$n += ($t =~ s/\b(?:gh[pousr]_|glpat-|xox[baprs]-|hf_|nvapi-|AIza|AKIA|ASIA)[A-Za-z0-9_-]{10,}/<MASKED_KEY>/g);
 # 2. PEM
 $n += ($t =~ s/-----BEGIN[^-]{0,40}-----[\s\S]*?-----END[^-]{0,40}-----/<MASKED_PEM>/g);
 # 3. VAR=值（鍵名含憑證字樣）

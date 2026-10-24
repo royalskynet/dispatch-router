@@ -22,7 +22,7 @@ let t = readFileSync(inPath, "utf8");
 t = sub(t, /\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/:@"'`]+:[^\s\/@"'`]*@/gi, (_m, s) => `${s}<MASKED_USERINFO>@`);
 // 1. 已知 key 前綴（sk-/ghp_/gho_/xoxb-/AIza/AKIA/glpat-/hf_/pk_/rk_ + 後續不透明串）
 t = sub(t, /\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{12,}/g, "<MASKED_KEY>");
-t = sub(t, /\b(?:gh[pousr]_|glpat-|xox[baprs]-|hf_|AIza|AKIA|ASIA)[A-Za-z0-9_-]{10,}/g, "<MASKED_KEY>");
+t = sub(t, /\b(?:gh[pousr]_|glpat-|xox[baprs]-|hf_|nvapi-|AIza|AKIA|ASIA)[A-Za-z0-9_-]{10,}/g, "<MASKED_KEY>");
 // 2. PEM / private key 區塊
 t = sub(t, /-----BEGIN[^-]{0,40}-----[\s\S]*?-----END[^-]{0,40}-----/g, "<MASKED_PEM>");
 // 3. VAR=值 / "VAR": 值 —— 鍵名含憑證字樣時連值一起遮

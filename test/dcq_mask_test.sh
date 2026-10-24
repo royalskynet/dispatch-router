@@ -35,7 +35,9 @@ P="$T/fx.txt"
 { echo "url https://u:p""w@host.example/x"; echo "OPENROUTER_API_KEY=$FAKEKEY"; echo "gh""p_$(printf 'Ab12%.0s' 1 2 3 4)";
   B="BEG""IN"; E="EN""D"; K="PRIV""ATE KEY"; echo "-----$B $K-----"; echo abc; echo "-----$E $K-----";
   echo "op Zx9$(printf 'Qw3e%.0s' 1 2 3 4 5 6 7)"; echo "h $(printf '0f%.0s' $(seq 20))";
+  echo "nv nva""pi-$(printf 'abcdefgh%.0s' 1 2 3 4)";
   echo "mail a.b""@ex.com ip 8.8.""4.4 lan 192.168.""1.2 port 20128 v1.20128"; echo "correct""horsebatterystaple"; } > "$P"
 node "$REPO/bin/mask-transcript.mjs" "$P" "$T/a" >/dev/null; perl "$REPO/bin/mask-transcript.pl" "$P" "$T/b" >/dev/null
 if cmp -s "$T/a" "$T/b"; then echo "PASS node 版與 perl 版輸出相同（$(grep -o MASKED "$T/a" | wc -l | tr -d ' ') 處遮罩）"; else echo "FAIL 兩版輸出不同"; diff "$T/a" "$T/b"; fail=1; fi
+grep -q '^nv <MASKED_KEY>$' "$T/a" && echo "PASS nvapi- 金鑰遮成 MASKED_KEY" || { echo "FAIL nvapi- 沒遮：$(grep '^nv ' "$T/a")"; fail=1; }
 exit $fail

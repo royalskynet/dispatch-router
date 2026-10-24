@@ -456,4 +456,11 @@ chk "上游提早結束三隻都試" "$(grep -h '^TRIED=' "$DCQ_HOME"/failed/*.j
 grep -q 'FATAL rc=2' "$T/ux.out" && { echo "FAIL ux1 被誤判同錯"; fail=1; }
 dcq clear >/dev/null
 
+# 27) id=$(dcq add …) 只拿到 job id：deep-lint 印「LINT OK」不能混進 stdout（fix 10521，Grok bot 派o 回 1）
+printf '#!/bin/sh\necho "LINT OK"\nexit 0\n' > "$T/bin/deep-lint"
+printf '# idl\n' > "$T/idl.md"; idl="$(dcq add "$T/idl.md" "$T/wb" 2>/dev/null)"
+chk "add 的 stdout 只有一行" "$(printf '%s\n' "$idl" | wc -l | tr -d ' ')" "1"
+chk "add 的 stdout 就是 pending 的 job id" "$([ -e "$DCQ_HOME/pending/$idl.job" ] && echo yes || echo no)" "yes"
+dcq clear >/dev/null
+
 exit $fail
