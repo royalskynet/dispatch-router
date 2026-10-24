@@ -357,7 +357,9 @@ PROGRESS_S="${DCQ_PROGRESS_S:-300}"
 SPIN_S="${DCQ_SPIN_S:-420}"
 POLL_S="${DCQ_POLL_S:-5}"
 # .out 是模型 transcript 原文，可能有憑證：先建 600 空檔、跑完遮罩、過期刪除（issue #5）
-MASK="${DCQ_MASK-$HOME/.claude/tools/fi-mask-transcript.mjs}"
+# 遮罩器隨 repo 走（2026-10-24）：原本指 ~/.claude/tools，雲端 clone 沒有那支，遮罩每次失敗、.out 留原文。
+# M4 的 ~/.claude/tools/fi-mask-transcript.mjs 是指向這支的 symlink（/fi 也用），正本只有這一份。
+MASK="${DCQ_MASK-$(dirname "$(readlink -f "$0")")/mask-transcript.mjs}"
 LOG_DAYS="${DCQ_LOG_DAYS:-14}"
 
 die() { echo "dcq: $*" >&2; exit 2; }
@@ -1275,7 +1277,7 @@ case "${1:-}" in
   DCQ_ATTEMPT_MAX    單隻模型一次嘗試的上限秒數，撞到就換下一隻（預設 600）
   DCQ_SPIN_S         防空轉：git cwd 的工作樹幾秒沒變就殺這次嘗試換下一隻（預設 420；進驗收後不看；0＝關。
                      入列時有設會記進工單，唯讀工單 dcq add 前帶 DCQ_SPIN_S=0）
-  DCQ_MASK           .out 遮罩器（預設 ~/.claude/tools/fi-mask-transcript.mjs）
+  DCQ_MASK           .out 遮罩器（預設 repo 的 bin/mask-transcript.mjs）
   DCQ_LOG_DAYS       .out 保留幾天，過期刪（預設 14）
 EOF
      exit 2 ;;
